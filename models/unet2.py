@@ -308,5 +308,3 @@ def pad_ice(x,   size): # NxCxHxW
 			x = torch.cat([torch.flip(west_pad,dims = [-1]) , x, torch.flip(east_pad,dims = [-1])], dim = -1 )
 		
 		return x
-
-

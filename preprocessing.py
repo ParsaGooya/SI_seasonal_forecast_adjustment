@@ -588,13 +588,13 @@ class Detrender:
 
 class Standardizer:
 
-    def __init__(self, axis = None) -> None:
+    def __init__(self, axis = None, VAE = False) -> None:
         self.mean = None
         self.std = None
         self.axis = axis
-
+        self.VAE = VAE
     def fit(self, data, mask=None):
-
+        
         if mask is not None:
             marray = np.ma.array(data, mask=mask)
         else:
@@ -616,12 +616,49 @@ class Standardizer:
         return self
 
     def transform(self, data):
-        data_standardized = (data - self.mean) / self.std
+        if self.axis is not None:
+            if type(data) == np.ndarray:
+                self.transpose = (*self.axis, *np.delete(np.arange(len(data.shape)), self.axis))
+                self.transpose_back = self.transpose
+            else:
+                self.transpose = tuple([data.dims[i] for i in (*self.axis, *np.delete(np.arange(len(data.shape)), self.axis))])
+                self.transpose_back = data.dims
+        else:
+            if type(data) == np.ndarray:
+                self.transpose =  tuple(np.arange(len(data.shape)))
+                self.transpose_back = self.transpose
+            else:
+                self.transpose = data.dims
+                self.transpose_back =  data.dims
+
+        data_transposed = data.transpose(*self.transpose)
+        data_standardized = (data_transposed - self.mean) / self.std
+
+        if self.axis is None:
+            if type(data) == np.ndarray:
+                data_standardized[np.isinf(data_standardized)] = 0
+            else:
+                # data_standardized = data_standardized.where(~np.isnan(self.mean)  & (self.std != 0) , 0).where(~np.isnan(self.mean)) 
+                data_standardized = data_standardized.where(~np.isinf(data_standardized) , 0)
+        data_standardized = data_standardized.transpose(*self.transpose_back)
+            
         return data_standardized
 
     def inverse_transform(self, data):
-        data_raw = data * self.std + self.mean
-        return data_raw
+        if self.VAE:
+            data_ = data[0]
+        else:
+            data_ = data
+        if self.axis is None:
+            transpose_ =  np.arange(len(data_.shape))
+        else:
+            transpose_ =  (*self.axis, *np.delete(np.arange(len(data_.shape)), self.axis))
+        if self.VAE:
+            transpose_ = (0, *transpose_)
+        data_transposed = data.transpose(*transpose_)
+        data_raw = data_transposed * self.std + self.mean
+
+        return data_raw.transpose(*transpose_)
 
 
 class Normalizer:

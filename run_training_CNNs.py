@@ -10,9 +10,8 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 from torch.optim import lr_scheduler
-from models.autoencoder import Autoencoder
 from models.unet import UNet, UNetLCL,UNet_NPS
-from models.unet2 import UNet2,UNet2_NPS
+from models.unetconvnext import UNet2,UNet2_NPS
 from models.cnn import CNN, RegCNN
 from losses import WeightedMSE, WeightedMSEGlobalLoss
 from losses import WeightedMSELowRess , WeightedMSEGlobalLossLowRess
@@ -34,10 +33,10 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
     if lead_time is not None:
         assert lead_time <=lead_months, f"{lead_time} can not be greater than {lead_months}"
 
-    if params["model"] != Autoencoder:
-        params["append_mode"] = None
-    else:   
-        params["obs_clim"] = False
+    if params['subset_dims'] == 'Global':
+        params['subset_dimensions'] = None
+    else:
+        params['subset_dimensions'] = params['subset_dims']
 
     if params['model'] in [UNet, UNetLCL,UNet2]:
         params['kernel_size'] = None
@@ -59,19 +58,14 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
     else:
         data_dir_obs = glob.glob(LOC_OBSERVATIONS_SI+ '/uws*.nc')[0]
 
-    assert params['version'] in [1,2,3, 'PatternsOnly', 'IceExtent']
+    assert params['version'] in [1,2,3, 'IceExtent']
 
-    if params['version'] == 'PatternsOnly':
-        params["obs_clim"] = False
-        params['forecast_preprocessing_steps'] = []
-        params['observations_preprocessing_steps'] = []
-    
-    elif params['version'] == 3:
+  
+    if params['version'] == 2:
 
         params['forecast_preprocessing_steps'] = [
             ('anomalies', AnomaliesScaler_v1_seasonal())]
-        params['observations_preprocessing_steps'] = [
-            ('anomalies', AnomaliesScaler_v2_seasonal()) ]
+        params['observations_preprocessing_steps'] = []
         
     else:
         params['forecast_preprocessing_steps'] = []
@@ -102,13 +96,13 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
     ensemble_mode = params['ensemble_mode'] ##
     ensemble_features = params['ensemble_features']
 
-    if params['version'] == 2:
+    if params['version'] == 3:
 
         params['forecast_preprocessing_steps'] = []
         params['observations_preprocessing_steps'] = []
         ds_in = xr.open_dataset('/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/NASA/Bias_Adjusted/bias_adjusted_North_1983-2020.nc')['SICN']
         if ensemble_list is not None:
-            raise RuntimeError('With version 2 you are reading the bias adjusted ensemble mean as input. Set ensemble_list to None to proceed.')
+            raise RuntimeError('With version 3 you are reading the bias adjusted ensemble mean as input. Set ensemble_list to None to proceed.')
 
     else:
 
@@ -201,21 +195,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
         zeros_mask_full = zeros_mask_full.expand_dims('channels', axis=-3)
         if 'ensembles' in ds_raw.dims:
              zeros_mask_full = zeros_mask_full.expand_dims('ensembles', axis=2)
-
-    if params['version'] == 'PatternsOnly':
-
-            if NPSProj:
-                weights = (np.ones_like(ds_raw_ensemble_mean.lon) * (np.ones_like(ds_raw_ensemble_mean.lat.to_numpy()))[..., None])  # Moved this up
-            else:    
-                weights = np.cos(np.ones_like(ds_raw_ensemble_mean.lon) * (np.deg2rad(ds_raw_ensemble_mean.lat.to_numpy()))[..., None])  # Moved this up
-            weights = xr.DataArray(weights, dims = ds_raw_ensemble_mean.dims[-2:], name = 'weights').assign_coords({'lat': ds_raw_ensemble_mean.lat, 'lon' : ds_raw_ensemble_mean.lon}) 
-            weights = weights * land_mask
-            ds_raw_mean = ((ds_raw_ensemble_mean * weights).sum(['lat','lon'])/weights.sum(['lat','lon']))
-            obs_raw_mean = ((obs_raw * weights).sum(['lat','lon'])/weights.sum(['lat','lon']))
-            ds_raw_ensemble_mean = ds_raw_ensemble_mean - ((ds_raw_ensemble_mean * weights).sum(['lat','lon'])/weights.sum(['lat','lon']))
-            obs_raw = obs_raw - ((obs_raw * weights).sum(['lat','lon'])/weights.sum(['lat','lon']))
-
-        
+   
     reg_scale = params["reg_scale"]
     model = params["model"]
     hidden_dims = params["hidden_dims"]
@@ -256,11 +236,17 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
     if params['version'] == 'IceExtent':
         obs_raw = obs_raw.where(obs_raw>=0.15,0)
         obs_raw = obs_raw.where(obs_raw ==0 , 1)
-        # ds_raw_ensemble_mean = ds_raw_ensemble_mean.where(ds_raw_ensemble_mean>=0.15,0)
-        # ds_raw_ensemble_mean = ds_raw_ensemble_mean.where(ds_raw_ensemble_mean ==0 , 1)
         params['loss_function'] = 'BCELoss'
-        if params['model'] == Autoencoder:
-            raise RuntimeError('Autoencoder can not be used for classification.')
+
+        
+    if params['combined_prediction']:
+        obs_raw_ = obs_raw.where(obs_raw>=0.15,0)
+        obs_raw_ = obs_raw_.where(obs_raw_ ==0 , 1)
+        obs_raw = xr.concat([obs_raw, obs_raw_], dim = 'channels')
+        params['loss_function'] = 'combined'
+        del obs_raw_
+
+    
     if NPSProj is False:
         if model in [UNet,UNetLCL, CNN,UNet2]:
             ds_raw_ensemble_mean = pole_centric(ds_raw_ensemble_mean, subset_dimensions)
@@ -299,6 +285,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
             f"time_features\t{time_features}\n" +
             f"obs_clim\t{obs_clim}\n" +
             f"ensemble_list\t{ensemble_list}\n" + ## PG: Ensemble list
+            f"ensemble_mode\t{ensemble_mode}\n" + ## PG: Ensemble list
             f"ensemble_features\t{ensemble_features}\n" + ## PG: Ensemble features
             f"epochs\t{epochs}\n" +
             f"batch_size\t{batch_size}\n" +
@@ -348,11 +335,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                 train_mask = create_mask(ds_raw_ensemble_mean[:n_train,...]) if lead_time is None else create_mask(full_shape[:n_train,...])[:, lead_time - 1][..., None] ############
 
                 ds_baseline = ds_raw_ensemble_mean[:n_train - month + 1,...]
-                obs_baseline = obs_raw[:n_train - month + 1 ,...]
-                if params['version'] == 'PatternsOnly':
-                        ds_baseline_mean = ds_raw_mean[:n_train - month + 1 ,...]
-                        obs_baseline_mean = obs_raw_mean[:n_train - month + 1,...]
-
+                obs_baseline = obs_raw[:n_train - month + 1 ,...].isel(channels = slice(0,1))
 
                 if 'ensembles' in ds_raw_ensemble_mean.dims: ## PG: Broadcast the mask to the correct shape if you have an ensembles dim.
                     preprocessing_mask_fct = np.broadcast_to(train_mask[:n_train - month + 1,...,None,None,None,None], ds_baseline.shape)
@@ -374,12 +357,16 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                 obs_pipeline = PreprocessingPipeline(observations_preprocessing_steps).fit(obs_baseline, mask=preprocessing_mask_obs)
                 # if 'standardize' in ds_pipeline.steps:
                 #     obs_pipeline.add_fitted_preprocessor(ds_pipeline.get_preprocessors('standardize'), 'standardize')
-                obs = obs_pipeline.transform(obs_raw)
+                obs = obs_pipeline.transform(obs_raw.isel(channels = slice(0,1)))
+
+                if params['combined_prediction']:
+                    obs = xr.concat([obs, obs_raw.isel(channels = slice(1,2))], dim  = 'channels')    
+
                 step_arguments = {'anomalies' : [lead_time, month]} if 'anomalies' in obs_pipeline.steps else None
                 del ds_baseline, obs_baseline, preprocessing_mask_obs, preprocessing_mask_fct
                 gc.collect()
 
-                if params['version']  in [3, 'PatternsOnly']:
+                if params['version']  in [3]:
                     sigmoid_activation = False
                 else:
                     sigmoid_activation = True
@@ -398,18 +385,6 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                 if test_year*100 + month <= ds_raw_ensemble_mean.time[-1]:
                         ds_test = ds[n_train:n_train + params['forecast_range_months'],...]
                         obs_test = obs[n_train:n_train + params['forecast_range_months'],...]
-
-                if params['version'] == 'PatternsOnly':
-                        if 'ensembles' in ds_baseline_mean.dims:  
-                            mask_bias_adj = train_mask[:n_train - month + 1,...,None, None]
-                        else:
-                            mask_bias_adj = train_mask[:n_train - month + 1,...,None]
-
-                        fct_climatology = calculate_climatology(ds_baseline_mean.where(~np.broadcast_to(mask_bias_adj, ds_baseline_mean.shape)))
-                        obs_climatology = calculate_climatology(obs_baseline_mean.where(~np.broadcast_to(train_mask[:n_train - month + 1,...,None], obs_baseline_mean.shape)))
-                        target_forecasts = ds_raw_mean[n_train:n_train + params['forecast_range_months'],...]
-                        fct_bias_adjusted = xr.concat([target_forecasts[i] - fct_climatology.sel(init_month = month + i) + obs_climatology.sel(init_month = month + i) for i in range(target_forecasts.shape[0])], dim = 'time')
-                        del fct_climatology, obs_climatology, target_forecasts, mask_bias_adj
                 
                 if NPSProj:
                     weights = (np.ones_like(ds_train.lon) * (np.ones_like(ds_train.lat.to_numpy()))[..., None])  # Moved this up
@@ -426,29 +401,12 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                     if any(['land_mask' not in time_features, model not in [UNet2]]):
                         weights = weights * land_mask
 
-                if model not in [Autoencoder] : ## PG: If the model starts with a nn.Conv2d write back the flattened data to maps.
-
-                    if loss_region is not None:
-                        loss_region_indices, loss_area = get_coordinate_indices(ds_raw_ensemble_mean, loss_region, flat = False)  ### the function has to be editted for flat opeion!!!!! 
-                    
-                    else:
-                        loss_region_indices = None
-
+                if loss_region is not None:
+                    loss_region_indices, loss_area = get_coordinate_indices(ds_raw_ensemble_mean, loss_region, flat = False)  ### the function has to be editted for flat opeion!!!!! 
                 
-                else: ## PG: If you have a dense first layer keep the data flattened.
-                    
-                    ds_train = ds_train.stack(ref = ['lat','lon']) # PG: flatten and sample training data at those locations
-                    obs_train = obs_train.stack(ref = ['lat','lon']) ## PG: flatten and sample obs data at those locations
-                    weights = weights.stack(ref = ['lat','lon']) ## PG: flatten and sample weighs at those locations
-                    weights_ = weights_.stack(ref = ['lat','lon'])
+                else:
+                    loss_region_indices = None
 
-                    img_dim = ds_train.shape[-1] ## PG: The input dim is now the length of the flattened dimention.
-
-                    if loss_region is not None:
-                        loss_region_indices, loss_area = get_coordinate_indices(ds_raw_ensemble_mean, loss_region, flat = True) ### the function has to be editted for flat opeion!!!!!
-                    
-                    else:
-                        loss_region_indices = None
 
                 del ds, obs
                 gc.collect()
@@ -474,13 +432,11 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                 n_channels_x = len(ds_train.channels)
 
 
-                if model == Autoencoder:
-                    net = model(img_dim, hidden_dims[0], hidden_dims[1], added_features_dim=add_feature_dim, append_mode=params['append_mode'], batch_normalization=batch_normalization, dropout_rate=dropout_rate)
-                elif model in [UNet,UNetLCL,UNet2, UNet_NPS, UNet2_NPS]:
-                    net = model(n_channels_x= n_channels_x+ add_feature_dim , bilinear = params['bilinear'], sigmoid = sigmoid_activation, skip_conv = params['skip_conv'])
-                elif model in [ CNN]: ## PG: Combining CNN encoder with dense decoder  
+                if model in [UNet,UNetLCL,UNet2, UNet_NPS, UNet2_NPS]:
+                    net = model(n_channels_x= n_channels_x+ add_feature_dim , bilinear = params['bilinear'], sigmoid = sigmoid_activation, skip_conv = params['skip_conv'], combined_prediction = params['combined_prediction'])
+                elif model in [ CNN]:
                     net = model(n_channels_x + add_feature_dim ,hidden_dims, kernel_size = kernel_size, decoder_kernel_size = decoder_kernel_size, DSC = DSC, sigmoid = sigmoid_activation )
-                elif model in [ RegCNN]: ## PG: Combining CNN encoder with dense decoder  
+                elif model in [ RegCNN]: 
                     net = model(n_channels_x , add_feature_dim ,hidden_dimensions =hidden_dims,  kernel_size = kernel_size, decoder_kernel_size = decoder_kernel_size, DSC = DSC, sigmoid = sigmoid_activation )
 
                 net.to(device)
@@ -497,12 +453,9 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                 train_set = XArrayDataset(ds_train, obs_train, mask=mask, zeros_mask = zeros_mask, in_memory=True, lead_time=lead_time, time_features=time_features,ensemble_features =ensemble_features, aligned = True, month_min_max = month_min_max, model = model.__name__) 
                 dataloader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
 
-                if params['version'] == 'IceExtent':
-                        
+                if params['version'] == 'IceExtent':  
                         criterion = nn.BCELoss()
-                
                 else:
-
                     if reg_scale is None: ## PG: if no penalizing for negative anomalies
                         if low_ress_loss:
                             criterion = WeightedMSELowRess(weights=weights, device=device, hyperparam=1, reduction='mean', loss_area=loss_region_indices)
@@ -513,6 +466,9 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                             criterion = WeightedMSEGlobalLossLowRess(weights=weights, device=device, hyperparam=1, reduction='mean', loss_area=loss_region_indices, scale=reg_scale, map = True)
                         else:
                             criterion = WeightedMSEGlobalLoss(weights=weights, device=device, hyperparam=1, reduction='mean', loss_area=loss_region_indices, scale=reg_scale, map = True)
+                
+                if params['combined_prediction']:
+                    criterion_extent = nn.BCELoss()
 
                 epoch_loss = []
                 net.train()
@@ -534,12 +490,19 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                             adjusted_forecast = net(x, torch.from_numpy(model_mask.to_numpy()).to(device))
                         else:
                             adjusted_forecast = net(x)
-                        if params['version'] == 'IceExtent':
-                            loss = criterion(adjusted_forecast, y)
-                        else:
+
+                        if params['combined_prediction']:
+                            (y, y_extent) = (y[:,0].unsqueeze(1), y[:,1].unsqueeze(1))
+                            (adjusted_forecast, adjusted_forecast_extent) = adjusted_forecast
+                            loss_extent = criterion_extent(adjusted_forecast_extent, y_extent)
                             loss = criterion(adjusted_forecast, y, mask = m)
-                        if params['loss_function'] == 'RMSE': 
-                            loss = torch.sqrt(loss)
+                            loss = loss + loss_extent
+                        else:
+                            if params['version'] == 'IceExtent':
+                                loss = criterion(adjusted_forecast, y)
+                            else:
+                                loss = criterion(adjusted_forecast, y, mask = m)
+
                         batch_loss += loss.item()
                         loss.backward()
                         optimizer.step()
@@ -548,15 +511,15 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                     if params['lr_scheduler']:
                         scheduler.step()
                 del train_set, dataloader, ds_train, obs_train, adjusted_forecast, x, y , m
+                try:
+                    del y_extent, adjusted_forecast_extent
+                except:
+                    pass
                 gc.collect()
                 # EVALUATE MODEL
                 ##################################################################################################################################
                 if test_year*100 + month <= ds_raw_ensemble_mean.time[-1]:
 
-                    if model == Autoencoder:
-                        ds_test = ds_test.stack(ref = ['lat','lon'])  ## PG: Sample the test data at the common locations
-                        obs_test = obs_test.stack(ref = ['lat','lon'])
-                    ##################################################################################################################################
                     test_years_list = np.arange(1, ds_test.shape[0] + 1)
                     test_lead_time_list = np.arange(1, ds_test.shape[1] + 1)
 
@@ -584,9 +547,12 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                             test_time_list =  np.arange(1, results_shape.shape[0] + 1)
                     else:
                         test_loss = np.zeros(shape=(test_set.target.shape[0]))
-                        test_results = np.zeros_like(test_set.target)
-                        results_shape = xr.full_like(test_set.target, fill_value = np.nan)
-                    
+                        test_results = np.zeros_like(test_set.target.isel(channels = slice(0,1)))
+                        results_shape = xr.full_like(test_set.target.isel(channels = slice(0,1)), fill_value = np.nan)
+
+                    if params['combined_prediction']:
+                        test_results_extent = test_results.copy()
+                        results_shape_extent = results_shape.copy()
 
                     if active_grid:
                         zeros_mask_test = results_shape.copy()
@@ -594,112 +560,82 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                         zeros_mask_test = zeros_mask_test.unstack('flattened').transpose('time','lead_time',...)
 
                     for i, (x, target) in enumerate(test_set): 
-                        if 'ensembles' in ds_test.dims:  ## PG: If we have large ensembles:
+                        net.eval()
 
-                            ensemble_idx, j = np.divmod(i, len(test_time_list))  ## PG: find out ensemble index
-                            net.eval()
-                            with torch.no_grad():
-                                if (type(x) == list) or (type(x) == tuple):
-                                    test_raw = (x[0].unsqueeze(0).to(device), x[1].unsqueeze(0).to(device))
+                        if 'ensembles' in ds_test.dims:  ## PG: If we have large ensembles:
+                                ensemble_idx, j = np.divmod(i, len(test_time_list))  ## PG: find out ensemble index
+                        
+                        with torch.no_grad():
+                            if (type(x) == list) or (type(x) == tuple):
+                                test_raw = (x[0].unsqueeze(0).to(device), x[1].unsqueeze(0).to(device))
+                            else:
+                                test_raw = x.unsqueeze(0).to(device)
+                            if (type(target) == list) or (type(target) == tuple):
+                                test_obs, m = (target[0].unsqueeze(0).to(device), target[1].unsqueeze(0).to(device))
+                            else:
+                                test_obs = target.unsqueeze(0).to(device)
+                                m = None
+                            if model in [UNet2, UNet2_NPS]:
+                                test_adjusted = net(test_raw, torch.from_numpy(model_mask.to_numpy()).to(device))
+                            else:
+                                test_adjusted = net(test_raw)
+                            if m is not None:
+                                m[m != 0] = 1
+
+                            if params['combined_prediction']:
+                                (test_obs, test_obs_extent) = (test_obs[:,0].unsqueeze(1), test_obs[:,1].unsqueeze(1))
+                                (test_adjusted, test_adjusted_extent) = test_adjusted
+                                loss_extent = criterion_extent(test_adjusted_extent, test_obs_extent)
+                                loss = criterion(test_adjusted, test_obs, mask = m)
+                                loss = loss + loss_extent
+                                if 'ensembles' in ds_test.dims: 
+                                    test_results_extent[j,ensemble_idx,] = test_adjusted_extent.to(torch.device('cpu')).numpy()  ## PG: write back to test_results
                                 else:
-                                    test_raw = x.unsqueeze(0).to(device)
-                                if (type(target) == list) or (type(target) == tuple):
-                                    test_obs, m = (target[0].unsqueeze(0).to(device), target[1].unsqueeze(0).to(device))
-                                else:
-                                    test_obs = target.unsqueeze(0).to(device)
-                                    m = None
-                                if model in [UNet2, UNet2_NPS]:
-                                    test_adjusted = net(test_raw, model_mask.to_numpy().to(device))
-                                else:
-                                    test_adjusted = net(test_raw)
-                                if m is not None:
-                                    m[m != 0] = 1
+                                    test_results_extent[i,] = test_adjusted.to(torch.device('cpu')).numpy()
+                            else:
                                 if params['version'] == 'IceExtent':
-                                    loss = criterion_test(test_adjusted, test_obs)
+                                    loss = criterion(test_adjusted, test_obs)
                                 else:
-                                    loss = criterion_test(test_adjusted, test_obs, mask = m)
-                                if params['loss_function'] == 'RMSE': 
-                                    loss = torch.sqrt(loss)
+                                    loss = criterion(test_adjusted, test_obs, mask = m)  
+
+                            if 'ensembles' in ds_test.dims:     
                                 test_results[j,ensemble_idx,] = test_adjusted.to(torch.device('cpu')).numpy()  ## PG: write back to test_results
                                 test_loss[j,ensemble_idx] = loss.item()
-                        else:
-
-                            net.eval()
-                            with torch.no_grad():
-                                if (type(x) == list) or (type(x) == tuple):
-                                    test_raw = (x[0].unsqueeze(0).to(device), x[1].unsqueeze(0).to(device))
-                                else:
-                                    test_raw = x.unsqueeze(0).to(device)
-                                if (type(target) == list) or (type(target) == tuple):
-                                    test_obs, m = (target[0].unsqueeze(0).to(device), target[1].unsqueeze(0).to(device))
-                                else:
-                                    test_obs = target.unsqueeze(0).to(device)
-                                    m = None
-                                if model in [UNet2, UNet2_NPS]:
-                                    test_adjusted = net(test_raw, torch.from_numpy(model_mask.to_numpy()).to(device))
-                                else:
-                                    test_adjusted = net(test_raw)
-                                if m is not None:
-                                    m[m != 0] = 1
-                                if params['version'] == 'IceExtent':
-                                    loss = criterion_test(test_adjusted, test_obs)
-                                else:
-                                    loss = criterion_test(test_adjusted, test_obs, mask = m)
-                                if params['loss_function'] == 'RMSE': 
-                                    loss = torch.sqrt(loss)
+                            else:
                                 test_results[i,] = test_adjusted.to(torch.device('cpu')).numpy()
                                 test_loss[i] = loss.item()
-                    del  test_set , test_raw, test_obs, x, target, m,  test_adjusted , ds_test, obs_test,
+
+                    del  test_set , test_raw, test_obs, x, target, m,  test_adjusted , ds_test, obs_test,loss
+                    try:
+                        del  test_obs_extent, test_adjusted_extent, loss_extent
+                    except:
+                        pass
                     gc.collect()
                     ###################################################### has to be eddited for large ensembles!! #####################################################################
                     results_shape[:] = test_results[:]
-                    
-                    if model in [UNet,UNetLCL,CNN, RegCNN,UNet2, UNet_NPS, UNet2_NPS]:  ## PG: if the output is already a map
+                    test_results = results_shape.unstack('flattened').transpose('time','lead_time',...)
+                    test_results_untransformed = obs_pipeline.inverse_transform(test_results.values, step_arguments)
+                    result = xr.DataArray(test_results_untransformed, test_results.coords, test_results.dims, name='nn_adjusted')
 
-                        test_results = results_shape.unstack('flattened').transpose('time','lead_time',...)
-                        test_results_untransformed = obs_pipeline.inverse_transform(test_results.values, step_arguments)
-                        result = xr.DataArray(test_results_untransformed, test_results.coords, test_results.dims, name='nn_adjusted')
-                    else:  
-                        test_results = results_shape.unstack('flattened').transpose('time','lead_time',...,'ref').unstack('ref')
-                        test_results_untransformed = obs_pipeline.inverse_transform(test_results.values, step_arguments) ## PG: Check preprocessing.AnomaliesScaler for changes
-                        result = xr.DataArray(test_results_untransformed, test_results.coords, test_results.dims, name='nn_adjusted')
+                    if params['combined_prediction']:
+                        results_shape_extent[:] = test_results_extent[:]
+                        result_extent = results_shape_extent.unstack('flattened').transpose('time','lead_time',...)
+
 
                     if obs_clim:
                         result = result.isel(channels = 0).expand_dims('channels', axis=2)
 
-                    del  results_shape, test_results, test_results_untransformed
+                    del  results_shape,results_shape_extent, test_results, test_results_untransformed
                     gc.collect()
-                    result = (result * land_mask)
+
+                    result = (result * land_mask) 
                     if not NPSProj:
                         if model in [UNet,UNetLCL, CNN,UNet2]:
                                 result = reverse_pole_centric(result, subset_dimensions)
                         if model in [RegCNN]:
                                 result = reverse_segment(result)
+                    result = result.to_dataset(name = 'nn_adjusted')
                     ##############################################################################################################################################################
-                    # Store results as NetCDF   
-                    # if NPSProj:
-                    #     result = result.rename({'lon':'x', 'lat':'y'}) 
-                    #     land_mask = land_mask.rename({'lon':'x', 'lat':'y'})
-
-                    result = result.to_dataset(name = 'nn_adjusted')  
-
-                    if params['version'] == 'PatternsOnly':
-                    
-                        result = result + fct_bias_adjusted.to_dataset(name = 'nn_adjusted')
-                        if not NPSProj:
-                            if model in [UNet,UNetLCL, CNN,UNet2]:
-                                result = result * reverse_pole_centric(land_mask, subset_dimensions)
-                            elif model in [RegCNN]:
-                                result = result * reverse_segment(land_mask)
-                        else:
-                            result = result * land_mask
-                        result = xr.combine_by_coords([result, fct_bias_adjusted.to_dataset(name = 'bias_adjusted')])
-
-                    if params['version'] == 'IceExtent':
-                        
-                        result = result.where(result >= 0.5, 0)
-                        result = result.where(result ==0, 1)
-
                     if active_grid:
                         if not NPSProj:
                             if model in [UNet,  CNN,UNet2]:
@@ -709,6 +645,24 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                         else:
                             zeros_mask_test = zeros_mask_test.rename({'lon':'x', 'lat':'y'})
                         result = xr.combine_by_coords([result * zeros_mask_test, zeros_mask_test.to_dataset(name = 'active_grid')])
+
+                    if params['version'] == 'IceExtent':
+                        result = result.where(result >= 0.5, 0)
+                        result = result.where(result ==0, 1)
+
+
+                    if params['combined_prediction']:
+                        result_extent = (result_extent * land_mask)
+                        if not NPSProj:
+                            if model in [UNet,UNetLCL, CNN,UNet2]:
+                                    result_extent = reverse_pole_centric(result_extent, subset_dimensions)
+                            if model in [RegCNN]:
+                                    result_extent = reverse_segment(result_extent)
+                        result_extent = result_extent.to_dataset(name = 'nn_adjusted_extent')
+                        result_extent = result_extent.where(result_extent >= 0.5, 0)
+                        result_extent = result_extent.where(result_extent ==0, 1)
+                        result = xr.combine_by_coords([result , result_extent])
+
                     
                     monthly_results.append(result)
                     
@@ -727,6 +681,10 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                         torch.save( net.state_dict(),results_dir + '/' + nameSave)
                     
                     del result, net, optimizer
+                    try:
+                         del result_extent
+                    except:
+                        pass
                     gc.collect()
                     torch.cuda.empty_cache() 
                     torch.cuda.synchronize() 
@@ -755,7 +713,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
 if __name__ == "__main__":
 
   
-    n_years =  15 # last n years to test consecutively
+    n_years =  5 # last n years to test consecutively
     lead_months = 12
     lead_time = None ## None for training using all available lead_times as indicated ny lead_months
     n_runs = 1  # number of training runs
@@ -773,7 +731,7 @@ if __name__ == "__main__":
         "reg_scale" : None,
         "optimizer": torch.optim.Adam,
         "lr": 0.001 ,
-        "loss_function" :'RMSE',
+        "loss_function" :'MSE',
         "loss_region": None,
         "subset_dims": 'North',   ## North or South or Global
         'active_grid' : False,
@@ -782,77 +740,54 @@ if __name__ == "__main__":
         "DSC" : False,  ## only for (Reg)CNN 
         "kernel_size" : 5, ## only for(Reg)CNN
         "decoder_kernel_size" : 1, ## only for (Reg)CNN
-        "bilinear" : False, ## only for UNet
+        "bilinear" : True, ## only for UNet
         "L2_reg": 0,
         'lr_scheduler' : False,
-        'skip_conv' : True
+        'skip_conv' : False,
+        'combined_prediction' : True
     }
 
 
 
-    params['version'] =  1  ### 1 , 2 ,3, 'PatternsOnly' , 'IceExtent'
-    params['reg_scale'] = None
-    params["loss_function"] = 'MSE'
+    params['version'] =  1  ### 1 , 2 ,3, 'IceExtent'
     params['forecast_range_months'] = 12
 
     obs_ref = 'NASA'
-    NPSProj = True
+    NPSProj = False
     
-    out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_9'
+    out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_2_convnext'
     if lead_time is None:
         out_dir    = f'{out_dir_x}/N{n_years}_M{lead_months}_F{params["forecast_range_months"]}_v{params["version"]}'
     else:
         out_dir    = f'{out_dir_x}/N{n_years}_LT{lead_time}_F{params["forecast_range_months"]}_v{params["version"]}'
     
     out_dir = out_dir + '_NPSproj' if NPSProj else out_dir + '_1x1'
+    out_dir  = out_dir + f'_{params["subset_dims"]}_lr{params["lr"]}_batch{params["batch_size"]}_e{params["epochs"]}_L{params["reg_scale"]}'
+
 
     if params['lr_scheduler']:
         out_dir = out_dir + '_lr_scheduler'
         params['start_factor'] = 1.0
         params['end_factor'] = 0.1
-        params['total_iters'] = 100
+        params['total_iters'] = params['epochs']
 
     if params['model'] in  [CNN, RegCNN]:
         out_dir = out_dir + f'_{params["kernel_size"]}{params["decoder_kernel_size"]}'
         params['skip_conv'] = False
+ 
+    if params['active_grid']:
+        out_dir = out_dir + '_active_grid'
+    if params['bilinear']:
+        out_dir = out_dir + '_bilinear'
+    if params['skip_conv']:
+        out_dir = out_dir + '_skip_conv'   
+    if params['combined_prediction']:
+        out_dir = out_dir + '_combined'  
+                    
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    Path(out_dir + '/Figures').mkdir(parents=True, exist_ok=True)
 
-
-    if type(params['subset_dims']) == list:
-        for element in params['subset_dims']:
-
-            params['subset_dimensions'] = element
-            out_dir  = out_dir + f'_{element}_lr{params["lr"]}_batch{params["batch_size"]}_e{params["epochs"]}_L{params["reg_scale"]}'
-            if params['active_grid']:
-                out_dir = out_dir + '_active_grid'
-            if params['_bilinear']:
-                out_dir = out_dir + '_bilinear'
-            if params['skip_conv']:
-                out_dir = out_dir + '_skip_conv'   
-
-            Path(out_dir).mkdir(parents=True, exist_ok=True)
-            Path(out_dir + '/Figures').mkdir(parents=True, exist_ok=True)
-
-            run_training(params, n_years=n_years, lead_months=lead_months, n_runs=n_runs, results_dir=out_dir, numpy_seed=1, torch_seed=1)
-         
-    else:
-            
-            out_dir  = out_dir + f'_{params["subset_dims"]}_lr{params["lr"]}_batch{params["batch_size"]}_e{params["epochs"]}_L{params["reg_scale"]}'
-
-            if params['subset_dims'] == 'Global':
-                params['subset_dimensions'] = None
-            else:
-                params['subset_dimensions'] = params['subset_dims']
-
-            if params['active_grid']:
-                out_dir = out_dir + '_active_grid'
-            if params['bilinear']:
-                out_dir = out_dir + '_bilinear'
-            if params['skip_conv']:
-                out_dir = out_dir + '_skip_conv'                
-            Path(out_dir).mkdir(parents=True, exist_ok=True)
-            Path(out_dir + '/Figures').mkdir(parents=True, exist_ok=True)
-
-            run_training(params, n_years=n_years, lead_months=lead_months,lead_time = lead_time, NPSProj  = NPSProj, test_years = None, n_runs=n_runs, results_dir=out_dir, numpy_seed=1, torch_seed=1)
+    run_training(params, n_years=n_years, lead_months=lead_months,lead_time = lead_time, NPSProj  = NPSProj, test_years = None, n_runs=n_runs, results_dir=out_dir, numpy_seed=1, torch_seed=1)
 
     print(f'Output dir: {out_dir}')
     print('Training done.')

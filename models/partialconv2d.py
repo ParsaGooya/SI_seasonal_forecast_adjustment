@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn, cuda
 from torch.autograd import Variable
+from timm.models.layers import trunc_normal_
 
 class PartialConv2d(nn.Conv2d):
     def __init__(self, *args, **kwargs):
@@ -39,6 +40,7 @@ class PartialConv2d(nn.Conv2d):
         self.last_size = (None, None, None, None)
         self.update_mask = None
         self.mask_ratio = None
+
 
     def forward(self, input, mask_in=None):
         assert len(input.shape) == 4
@@ -81,3 +83,4 @@ class PartialConv2d(nn.Conv2d):
             return output, self.update_mask
         else:
             return output
+        
