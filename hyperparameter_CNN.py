@@ -717,6 +717,7 @@ def run_hp_tunning( ds_raw_ensemble_mean: XArrayDataset ,obs_raw: XArrayDataset,
                 f"ensemble_features\t{params['ensemble_features']}\n" + ## PG: Ensemble features
                 f"lr\t{params['lr']}\n" +
                 f"lr_scheduler\t{params['lr_scheduler']}: {start_factor} --> {end_factor} in {total_iters} epochs\n" + 
+                f"decoder_kernel_size\t{params['decoder_kernel_size']}\n" +
                 f"L2_reg\t{params['L2_reg']}\n" +
                 f"skip_conv\t{params['skip_conv']}\n" +
                 f"low_ress_loss\t{params['low_ress_loss']}\n" +

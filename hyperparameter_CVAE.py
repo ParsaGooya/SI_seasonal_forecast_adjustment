@@ -464,22 +464,26 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
         batch_loss = 0
         batch_MSE = 0
         batch_KLD = 0
+
+        model_mask_ = torch.from_numpy(model_mask.to_numpy()).unsqueeze(0).expand(n_channels_x + add_feature_dim,*model_mask.shape)
+        obs_mask = torch.from_numpy(land_mask.to_numpy()).unsqueeze(0)
+
         for batch, (x, y) in enumerate(dataloader):
             if (type(x) == list) or (type(x) == tuple):
                 x = (x[0].to(device), x[1].to(device)) 
-                model_mask_ = torch.from_numpy(model_mask.to_numpy()).to(x[0]).unsqueeze(0).expand(n_channels_x + add_feature_dim,*model_mask.shape)
+                model_mask_ = model_mask_.to(x[0])
             else:
                 x = x.to(device)
-                model_mask_ = torch.from_numpy(model_mask.to_numpy()).to(x).unsqueeze(0).expand(n_channels_x + add_feature_dim,*model_mask.shape)
+                model_mask_ = model_mask_.to(x)
 
             if (type(y) == list) or (type(y) == tuple):
                 y, m = (y[0].to(device), y[1].to(device))
             else:
                 y = y.to(device)
                 m  = None
-            obs_mask = torch.from_numpy(land_mask.to_numpy()).to(y).unsqueeze(0).expand_as(y[0])
-            optimizer.zero_grad()
 
+            optimizer.zero_grad()
+            obs_mask = obs_mask.to(y).expand_as(y[0])
             generated_output, deterministic_output, mu, log_var , cond_mu, cond_log_var = net(y, obs_mask, x, model_mask_, sample_size = params['training_sample_size'] )
             if params['combined_prediction']:
                 (y, y_extent) = (y[:,0].unsqueeze(1), y[:,1].unsqueeze(1))
@@ -517,17 +521,14 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
             with torch.no_grad():            
                 if (type(x) == list) or (type(x) == tuple):
                     test_raw = (x[0].to(device), x[1].to(device))
-                    model_mask_ = torch.from_numpy(model_mask.to_numpy()).to(test_raw[0]).unsqueeze(0).expand(n_channels_x + add_feature_dim,*model_mask.shape)
                 else:
                     test_raw = x.to(device)
-                    model_mask_ = torch.from_numpy(model_mask.to_numpy()).to(test_raw).unsqueeze(0).expand(n_channels_x + add_feature_dim,*model_mask.shape)
 
                 if (type(target) == list) or (type(target) == tuple):
                     test_obs, m = (target[0].to(device), target[1].to(device))
                 else:
                     test_obs = target.to(device)
                     m = None
-                obs_mask = torch.from_numpy(land_mask.to_numpy()).to(test_obs).unsqueeze(0).expand_as(test_obs[0])
 
                 generated_output, deterministic_output, mu, log_var , cond_mu, cond_log_var = net(test_obs, obs_mask, test_raw, model_mask_, sample_size = params['training_sample_size'] )
 
@@ -668,10 +669,13 @@ def run_hp_tunning( ds_raw_ensemble_mean: XArrayDataset ,obs_raw: XArrayDataset,
                 f"ensemble_features\t{params['ensemble_features']}\n" + ## PG: Ensemble features
                 f"lr\t{params['lr']}\n" +
                 f"lr_scheduler\t{params['lr_scheduler']}: {start_factor} --> {end_factor} in {total_iters} epochs\n" + 
+                f"decoder_kernel_size\t{params['decoder_kernel_size']}\n" +
                 f"L2_reg\t{params['L2_reg']}\n" +
                 f"low_ress_loss\t{params['low_ress_loss']}\n" +
                 f"equal_weights\t{params['equal_weights']}\n" +
-                f"active_grid\t{params['active_grid']}\n\n\n" +
+                f"active_grid\t{params['active_grid']}\n" + 
+                f"VAE_latent_size\t{params['VAE_latent_size']}\n" + 
+                f"training_sample_size\t{params['training_sample_size']}\n\n\n" +
                 ' ----------------------------------------------------------------------------------\n'
             )
         

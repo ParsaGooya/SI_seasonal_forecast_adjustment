@@ -277,7 +277,9 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
             f"equal_weights\t{params['equal_weights']}\n" + 
             f"subset_dimensions\t{subset_dimensions}\n" + 
             f"L2_reg\t{l2_reg}\n" + 
-            f"loss_reduction\t{params['loss_reduction']}\n" 
+            f"loss_reduction\t{params['loss_reduction']}\n" + 
+            f"VAE_latent_size\t{params['VAE_latent_size']}\n"  + 
+            f"training_sample_size\t{params['training_sample_size']}\n" 
         )
     del ds_raw
     gc.collect()
@@ -443,6 +445,10 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                 net.train()
                 num_batches = len(dataloader)
                 step = 0
+
+                model_mask_ = torch.from_numpy(model_mask.to_numpy()).unsqueeze(0).expand(n_channels_x + add_feature_dim,*model_mask.shape)
+                obs_mask = torch.from_numpy(land_mask.to_numpy()).unsqueeze(0)
+
                 for epoch in tqdm.tqdm(range(epochs)):
                     batch_loss = 0
                     batch_loss_MSE = 0
@@ -463,19 +469,19 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
 
                         if (type(x) == list) or (type(x) == tuple):
                             x = (x[0].to(device), x[1].to(device))
-                            model_mask_ = torch.from_numpy(model_mask.to_numpy()).to(x[0]).unsqueeze(0).expand(n_channels_x + add_feature_dim,*model_mask.shape)
+                            model_mask_ = model_mask_.to(x[0])
                         else:
                             x = x.to(device)
-                            model_mask_ = torch.from_numpy(model_mask.to_numpy()).to(x).unsqueeze(0).expand(n_channels_x + add_feature_dim,*model_mask.shape)
+                            model_mask_ = model_mask_.to(x)
                         
                         if (type(y) == list) or (type(y) == tuple):
                             y, m = (y[0].to(device), y[1].to(device))
                         else:
                             y = y.to(device)
                             m  = None
-                        obs_mask = torch.from_numpy(land_mask.to_numpy()).to(y).unsqueeze(0).expand_as(y[0])
-                        optimizer.zero_grad()
 
+                        optimizer.zero_grad()
+                        obs_mask = obs_mask.to(y).expand_as(y[0])
                         generated_output, deterministic_output, mu, log_var , cond_mu, cond_log_var = net(y, obs_mask, x, model_mask_, sample_size = params['training_sample_size'] )
                         if params['combined_prediction']:
                             (y, y_extent) = (y[:,0].unsqueeze(1), y[:,1].unsqueeze(1))

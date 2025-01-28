@@ -289,7 +289,7 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
     if NPSProj:
         weights = (np.ones_like(ds_train.lon) * (np.ones_like(ds_train.lat.to_numpy()))[..., None])  # Moved this up
         weights = xr.DataArray(weights, dims = ds_train.dims[-2:], name = 'weights').assign_coords({'lat': ds_train.lat, 'lon' : ds_train.lon})
-        weights = weights * mask_projection
+        weights = weights * land_mask
         # weights_ = weights * land_mask
     else:
         weights = np.cos(np.ones_like(ds_train.lon) * (np.deg2rad(ds_train.lat.to_numpy()))[..., None])  # Moved this up
@@ -298,8 +298,8 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
         # weights_ = weights * land_mask
         if params['equal_weights']:
             weights = xr.ones_like(weights)
-        if any(['land_mask' not in time_features, model not in [UNet2]]):
-            weights = weights * land_mask
+        # if any(['land_mask' not in time_features, model not in [UNet2]]):
+        weights = weights * land_mask
 
     del ds, obs
     gc.collect()
