@@ -100,7 +100,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
 
         params['forecast_preprocessing_steps'] = []
         params['observations_preprocessing_steps'] = []
-        ds_in = xr.open_dataset('/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/NASA/Bias_Adjusted/bias_adjusted_North_1983-2020.nc')['SICN']
+        ds_in = xr.open_dataset('/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/NASA/Bias_Adjusted/bias_adjusted_North_1983-2020_1x1.nc')['SICN'].clip(0,1)
         if ensemble_list is not None:
             raise RuntimeError('With version 3 you are reading the bias adjusted ensemble mean as input. Set ensemble_list to None to proceed.')
 
@@ -120,7 +120,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
             print("Load forecasts") 
             ls = [xr.open_dataset(glob.glob(LOC_FORECASTS_SI + f'/*_initial_month_{intial_month}_*{crs}*.nc')[0])['SICN'].mean('ensembles').load() for intial_month in range(1,13) ]
             ds_in = xr.concat(ls, dim = 'time').sortby('time')
-    del ls
+        del ls
     gc.collect()
     ###### handle nan and inf over land ############
      ### land is masked in model data with a large number
@@ -360,7 +360,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                 obs = obs_pipeline.transform(obs_raw.isel(channels = slice(0,1)))
 
                 if params['combined_prediction']:
-                    obs = xr.concat([obs, obs_raw.isel(channels = slice(1,2))], dim  = 'channels')    
+                    obs = xr.concat([obs, obs_raw.isel(channels = slice(1,2))], dim  = 'channels')  
 
                 step_arguments = {'anomalies' : [lead_time, month]} if 'anomalies' in obs_pipeline.steps else None
                 del ds_baseline, obs_baseline, preprocessing_mask_obs, preprocessing_mask_fct
@@ -389,7 +389,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                 if NPSProj:
                     weights = (np.ones_like(ds_train.lon) * (np.ones_like(ds_train.lat.to_numpy()))[..., None])  # Moved this up
                     weights = xr.DataArray(weights, dims = ds_train.dims[-2:], name = 'weights').assign_coords({'lat': ds_train.lat, 'lon' : ds_train.lon})
-                    weights = weights * mask_projection
+                    weights = weights * land_mask
                     weights_ = weights * land_mask
                 else:
                     weights = np.cos(np.ones_like(ds_train.lon) * (np.deg2rad(ds_train.lat.to_numpy()))[..., None])  # Moved this up
@@ -398,8 +398,8 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                     weights_ = weights * land_mask
                     if params['equal_weights']:
                         weights = xr.ones_like(weights)
-                    if any(['land_mask' not in time_features, model not in [UNet2]]):
-                        weights = weights * land_mask
+                    # if any(['land_mask' not in time_features, model not in [UNet2]]):
+                    weights = weights * land_mask
 
                 if loss_region is not None:
                     loss_region_indices, loss_area = get_coordinate_indices(ds_raw_ensemble_mean, loss_region, flat = False)  ### the function has to be editted for flat opeion!!!!! 
@@ -450,7 +450,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                 else:
                     mask = train_mask
                 
-                train_set = XArrayDataset(ds_train, obs_train, mask=mask, zeros_mask = zeros_mask, in_memory=True, lead_time=lead_time, time_features=time_features,ensemble_features =ensemble_features, aligned = True, month_min_max = month_min_max, model = model.__name__) 
+                train_set = XArrayDataset(ds_train, obs_train, mask=mask, zeros_mask = zeros_mask, in_memory=False, lead_time=lead_time, time_features=time_features,ensemble_features =ensemble_features, aligned = True, month_min_max = month_min_max, model = model.__name__) 
                 dataloader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
 
                 if params['version'] == 'IceExtent':  
@@ -487,7 +487,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                             m  = None
                         optimizer.zero_grad()
                         if model in [UNet2, UNet2_NPS]:
-                            adjusted_forecast = net(x, torch.from_numpy(model_mask.to_numpy()).to(device))
+                            adjusted_forecast = net(x, torch.from_numpy(model_mask.to_numpy()).to(y))               
                         else:
                             adjusted_forecast = net(x)
 
@@ -576,7 +576,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                                 test_obs = target.unsqueeze(0).to(device)
                                 m = None
                             if model in [UNet2, UNet2_NPS]:
-                                test_adjusted = net(test_raw, torch.from_numpy(model_mask.to_numpy()).to(device))
+                                test_adjusted = net(test_raw, torch.from_numpy(model_mask.to_numpy()).to(test_obs))
                             else:
                                 test_adjusted = net(test_raw)
                             if m is not None:
@@ -625,7 +625,11 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                     if obs_clim:
                         result = result.isel(channels = 0).expand_dims('channels', axis=2)
 
-                    del  results_shape,results_shape_extent, test_results, test_results_untransformed
+                    del  results_shape, test_results, test_results_untransformed
+                    try:
+                        del results_shape_extent
+                    except:
+                        pass
                     gc.collect()
 
                     result = (result * land_mask) 
@@ -726,8 +730,8 @@ if __name__ == "__main__":
         "ensemble_features": False, ## PG
         'ensemble_list' : None, ## PG
         'ensemble_mode' : 'Mean',
-        "epochs": 45,
-        "batch_size": 25,
+        "epochs": 100,
+        "batch_size": 10,
         "reg_scale" : None,
         "optimizer": torch.optim.Adam,
         "lr": 0.001 ,
@@ -744,7 +748,7 @@ if __name__ == "__main__":
         "L2_reg": 0,
         'lr_scheduler' : False,
         'skip_conv' : False,
-        'combined_prediction' : True
+        'combined_prediction' : False
     }
 
 
@@ -753,9 +757,11 @@ if __name__ == "__main__":
     params['forecast_range_months'] = 12
 
     obs_ref = 'NASA'
-    NPSProj = False
+    NPSProj = True
     
     out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_2_convnext'
+
+    # for lead_time in np.arange(10,13):
     if lead_time is None:
         out_dir    = f'{out_dir_x}/N{n_years}_M{lead_months}_F{params["forecast_range_months"]}_v{params["version"]}'
     else:
@@ -774,7 +780,7 @@ if __name__ == "__main__":
     if params['model'] in  [CNN, RegCNN]:
         out_dir = out_dir + f'_{params["kernel_size"]}{params["decoder_kernel_size"]}'
         params['skip_conv'] = False
- 
+
     if params['active_grid']:
         out_dir = out_dir + '_active_grid'
     if params['bilinear']:
@@ -787,7 +793,7 @@ if __name__ == "__main__":
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     Path(out_dir + '/Figures').mkdir(parents=True, exist_ok=True)
 
-    run_training(params, n_years=n_years, lead_months=lead_months,lead_time = lead_time, NPSProj  = NPSProj, test_years = None, n_runs=n_runs, results_dir=out_dir, numpy_seed=1, torch_seed=1)
+    run_training(params, n_years=n_years, lead_months=lead_months,lead_time = lead_time, NPSProj  = NPSProj, test_years = None, n_runs=n_runs, results_dir=out_dir, numpy_seed=1, torch_seed=1, save = True)
 
     print(f'Output dir: {out_dir}')
     print('Training done.')

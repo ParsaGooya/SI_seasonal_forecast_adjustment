@@ -272,27 +272,26 @@ class OutConv(nn.Module):
 					padding = 1
 				else:
 					padding= [1,0]
+				self.conv1 = PartialConv2d(in_channels, in_channels, kernel_size=3, padding= padding)
 				if sigmoid:
-					self.conv1 = PartialConv2d(in_channels, in_channels, kernel_size=3, padding= padding)
 					self.conv2 = nn.Sequential(
-								nn.BatchNorm2d(in_channels),
+								LayerNorm(in_channels, eps=1e-6, data_format='channels_first'),
 								nn.ReLU(inplace=True),
 								nn.Conv2d(in_channels, out_channels, kernel_size=1), nn.Sigmoid())
 					
 				else:
-					self.conv1 = PartialConv2d(in_channels, in_channels, kernel_size=3, padding= padding)
 					self.conv2 = nn.Sequential(
-								nn.BatchNorm2d(in_channels),
+								LayerNorm(in_channels, eps=1e-6, data_format='channels_first'),
 								nn.ReLU(inplace=True),
 								nn.Conv2d(in_channels, out_channels, kernel_size=1))
 					
 				self.conv2.apply(weights_init)
 
 		def forward(self, x):
-				if not self.NPS_proj:
-					x = pad_ice(x, [0,1])
-				x1 = self.conv1(x)
-				return self.conv2(x1)
+				# if not self.NPS_proj:
+				# 	x = pad_ice(x, [0,1])
+				# x = self.conv1(x)
+				return self.conv2(x)
 			
 class DoubleConvNext(nn.Module):
 	

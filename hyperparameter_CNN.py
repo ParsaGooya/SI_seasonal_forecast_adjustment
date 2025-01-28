@@ -11,15 +11,14 @@ import random
 import torch
 from torch.utils.data import DataLoader
 from torch.optim import lr_scheduler
-from models.autoencoder import Autoencoder
 from models.unet import UNet, UNetLCL,UNet_NPS
-from models.unet2 import UNet2,UNet2_NPS
+from models.unetconvnext import UNet2,UNet2_NPS
 from models.convlstm import UNetLSTM, PNet, CNNLSTM, CNNLSTM_monthly, UNetLSTM_monthly
 from models.cnn import CNN, RegCNN
-from losses import WeightedMSE, WeightedMSEGlobalLoss, GlobalLoss, IceextentlLoss
-from losses import WeightedMSELowRess, WeightedMSEGlobalLossLowRess, GlobalLoss
-from preprocessing import align_data_and_targets, create_mask, config_grid, pole_centric, reverse_pole_centric, segment
-from preprocessing import AnomaliesScaler_v1_seasonal, AnomaliesScaler_v2_seasonal, Standardizer, PreprocessingPipeline, calculate_climatology, zeros_mask_gen, Normalizer
+from losses import WeightedMSE, WeightedMSEGlobalLoss
+from losses import WeightedMSELowRess , WeightedMSEGlobalLossLowRess, GlobalLoss, IceextentlLoss
+from preprocessing import align_data_and_targets, create_mask, config_grid, pole_centric, reverse_pole_centric, segment, reverse_segment, pad_xarray
+from preprocessing import AnomaliesScaler_v1_seasonal, AnomaliesScaler_v2_seasonal, Standardizer, PreprocessingPipeline, calculate_climatology,bias_adj, zeros_mask_gen, Normalizer
 from torch_datasets import XArrayDataset, ConvLSTMDataset
 import torch.nn as nn
 # from subregions import subregions
@@ -38,11 +37,6 @@ def HP_congif(params, obs_ref, lead_months, y_start, y_end, NPSProj = False):
         if 'CNNLSTM' in params["model"].__name__:
             params['model'] = CNNLSTM_monthly
             print('Lead_time is on, using CNNLSTM_monthly ...')
-
-    if params["model"] != Autoencoder:
-        params["append_mode"] = None
-    else:   
-        params["obs_clim"] = False
 
     if params['model'] in [UNet,UNetLCL, UNetLSTM, PNet,UNet2, UNetLSTM_monthly]:
         params['kernel_size'] = None
@@ -71,13 +65,13 @@ def HP_congif(params, obs_ref, lead_months, y_start, y_end, NPSProj = False):
     print("Load observations")
     obs_in = xr.open_dataset(data_dir_obs)['SICN']
     
-    if params['version'] == 2:
+    if params['version'] == 3:
 
         params['forecast_preprocessing_steps'] = []
         params['observations_preprocessing_steps'] = []
         ds_in = xr.open_dataset('/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/NASA/Bias_Adjusted/global_mean_bias_adjusted_1983-2020.nc')['SICN']
         if params['ensemble_list'] is not None:
-            raise RuntimeError('With version 2 you are reading the bias adjusted ensemble mean as input. Set ensemble_list to None to proceed.')
+            raise RuntimeError('With version 3 you are reading the bias adjusted ensemble mean as input. Set ensemble_list to None to proceed.')
 
     else:
         if params['ensemble_list'] is not None: ## PG: calculate the mean if ensemble mean is none
@@ -92,8 +86,8 @@ def HP_congif(params, obs_ref, lead_months, y_start, y_end, NPSProj = False):
 
         else:    ## Load specified members
             print("Load forecasts") 
-            ls = [xr.open_dataset(glob.glob(LOC_FORECASTS_SI + f'/*_initial_month_{intial_month}_*{crs}*.nc')[0])['SICN'] for intial_month in range(1,13) ]
-            ds_in = xr.concat(ls, dim = 'time').mean('ensembles').sortby('time')
+            ls = [xr.open_dataset(glob.glob(LOC_FORECASTS_SI + f'/*_initial_month_{intial_month}_*{crs}*.nc')[0])['SICN'].mean('ensembles') for intial_month in range(1,13) ]
+            ds_in = xr.concat(ls, dim = 'time').sortby('time')
     del ls
     gc.collect()
     ###### handle nan and inf over land ############
@@ -124,6 +118,7 @@ def HP_congif(params, obs_ref, lead_months, y_start, y_end, NPSProj = False):
     ds_raw, obs_raw = align_data_and_targets(ds_in, obs_in, lead_months)  # extract valid lead times and usable years
     del ds_in, obs_in
     gc.collect()
+
     if not ds_raw.time.equals(obs_raw.time):
             
             ds_raw = ds_raw.sel(time = obs_raw.time)
@@ -156,28 +151,6 @@ def HP_congif(params, obs_ref, lead_months, y_start, y_end, NPSProj = False):
     zeros_mask_full = zeros_mask_full.expand_dims('channels', axis=-3)          
     if 'ensembles' in ds_raw.dims:
         zeros_mask_full = zeros_mask_full.expand_dims('ensembles', axis=2)
-
-    if params['version'] == 'PatternsOnly':
-
-            if NPSProj:
-                weights = (np.ones_like(ds_raw_ensemble_mean.lon) * (np.ones_like(ds_raw_ensemble_mean.lat.to_numpy()))[..., None])  # Moved this up
-            else:    
-                weights = np.cos(np.ones_like(ds_raw_ensemble_mean.lon) * (np.deg2rad(ds_raw_ensemble_mean.lat.to_numpy()))[..., None])  # Moved this up
-            weights = xr.DataArray(weights, dims = ds_raw_ensemble_mean.dims[-2:], name = 'weights').assign_coords({'lat': ds_raw_ensemble_mean.lat, 'lon' : ds_raw_ensemble_mean.lon}) 
-            weights = weights * land_mask
-            ds_raw_mean = ((ds_raw_ensemble_mean * weights).sum(['lat','lon'])/weights.sum(['lat','lon']))
-            obs_raw_mean = ((obs_raw * weights).sum(['lat','lon'])/weights.sum(['lat','lon']))
-            ds_raw_ensemble_mean = ds_raw_ensemble_mean - ((ds_raw_ensemble_mean * weights).sum(['lat','lon'])/weights.sum(['lat','lon']))
-            obs_raw = obs_raw - ((obs_raw * weights).sum(['lat','lon'])/weights.sum(['lat','lon']))
-            params["obs_clim"] = None
-    
-    if params['version'] == 'IceExtent':
-        obs_raw = obs_raw.where(obs_raw>=0.15,0)
-        obs_raw = obs_raw.where(obs_raw ==0 , 1)
-        ds_raw_ensemble_mean = ds_raw_ensemble_mean.where(ds_raw_ensemble_mean>=0.15,0)
-        ds_raw_ensemble_mean = ds_raw_ensemble_mean.where(ds_raw_ensemble_mean ==0 , 1)
-        if params['model'] == Autoencoder:
-            raise RuntimeError('Autoencoder can not be used for classification.')
     
     obs_clim = params["obs_clim"]
 
@@ -196,11 +169,25 @@ def HP_congif(params, obs_ref, lead_months, y_start, y_end, NPSProj = False):
             obs_raw = obs_raw.sel(time = clim.time)
             ds_raw_ensemble_mean = ds_raw_ensemble_mean.sel(time = clim.time)
             ds_raw_ensemble_mean = xr.concat([ds_raw_ensemble_mean, clim], dim = 'channels')
+
+    if params['version'] == 'IceExtent':
+        obs_raw = obs_raw.where(obs_raw>=0.15,0)
+        obs_raw = obs_raw.where(obs_raw ==0 , 1)
+        # ds_raw_ensemble_mean = ds_raw_ensemble_mean.where(ds_raw_ensemble_mean>=0.15,0)
+        # ds_raw_ensemble_mean = ds_raw_ensemble_mean.where(ds_raw_ensemble_mean ==0 , 1)
+        
+    if params['combined_prediction']:
+        obs_raw_ = obs_raw.where(obs_raw>=0.15,0)
+        obs_raw_ = obs_raw_.where(obs_raw_ ==0 , 1)
+        obs_raw = xr.concat([obs_raw, obs_raw_], dim = 'channels')
+        params['loss_function'] = 'combined'
+        del obs_raw_
+
     if NPSProj is False:
         if params['model'] in [RegCNN, CNNLSTM]:
             ds_raw_ensemble_mean = segment(ds_raw_ensemble_mean,  9)
             obs_raw =  segment(obs_raw,  9)
-            land_mask = segment(land_mask,0)
+            land_mask = segment(land_mask,9)
             model_mask = segment(model_mask,9)
             if any(['active_mask' in params["time_features"], 'full_ice_mask' in params["time_features"]]):
                 raise RuntimeError('You cannot add mask data in chennels with RegCNN model where you have regions stacked as channels!')
@@ -241,20 +228,15 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
     if params['NPSProj']:
         mask_projection = land_masks[2]
 
-    assert params['version'] in [1,2,3, 'PatternsOnly', 'IceExtent']
+    assert params['version'] in [1,2,3, 'IceExtent']
 
     
-    if params['version'] == 'PatternsOnly':
-        
-        params['forecast_preprocessing_steps'] = []
-        params['observations_preprocessing_steps'] = []
 
-    elif params['version'] == 3:
+    if params['version'] == 2:
 
         params['forecast_preprocessing_steps'] = [
             ('anomalies', AnomaliesScaler_v1_seasonal())]
-        params['observations_preprocessing_steps'] = [
-            ('anomalies', AnomaliesScaler_v2_seasonal()) ]  
+        params['observations_preprocessing_steps'] = []  
     else:
         params['forecast_preprocessing_steps'] = []
         params['observations_preprocessing_steps'] = []
@@ -308,7 +290,7 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
         full_shape = xr.full_like(ds_raw_ensemble_mean, np.nan).isel(lat = slice(1,2), lon = slice(1,2))
         ds_raw_ensemble_mean = ds_raw_ensemble_mean.sel(lead_time = slice(lead_time,lead_time))
         obs_raw = obs_raw.sel(lead_time = slice(lead_time,lead_time))
-
+    ###################################################################################
     if n_runs > 1:
         numpy_seed = None
         torch_seed = None
@@ -336,7 +318,7 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
     train_mask = create_mask(ds_raw_ensemble_mean[:n_train,...]) if lead_time is None else create_mask(full_shape[:n_train,...])[:, lead_time - 1][..., None] ############
 
     ds_baseline = ds_raw_ensemble_mean[:n_train,...]
-    obs_baseline = obs_raw[:n_train,...]
+    obs_baseline = obs_raw[:n_train,...].isel(channels = slice(0,1))
 
     if 'ensembles' in ds_raw_ensemble_mean.dims: ## PG: Broadcast the mask to the correct shape if you have an ensembles dim.
         preprocessing_mask_fct = np.broadcast_to(train_mask[...,None,None,None,None], ds_baseline.shape)
@@ -359,11 +341,14 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
     obs_pipeline = PreprocessingPipeline(observations_preprocessing_steps).fit(obs_baseline, mask=preprocessing_mask_obs)
     # if 'standardize' in ds_pipeline.steps:
     #     obs_pipeline.add_fitted_preprocessor(ds_pipeline.get_preprocessors('standardize'), 'standardize')
-    obs = obs_pipeline.transform(obs_raw) 
+    obs = obs_pipeline.transform(obs_raw.isel(channels = slice(0,1))) 
+    if params['combined_prediction']:
+        obs = xr.concat([obs, obs_raw.isel(channels = slice(1,2))], dim  = 'channels')    
+
     del ds_baseline, obs_baseline, preprocessing_mask_obs, preprocessing_mask_fct
     gc.collect()
 
-    if params['version']  in [3, 'PatternsOnly']:
+    if params['version']  in [3]:
         sigmoid_activation = False
     else:
         sigmoid_activation = True
@@ -389,7 +374,7 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
     if params['NPSProj']:
         weights = (np.ones_like(ds_train.lon) * (np.ones_like(ds_train.lat.to_numpy()))[..., None])  # Moved this up
         weights = xr.DataArray(weights, dims = ds_train.dims[-2:], name = 'weights').assign_coords({'lat': ds_train.lat, 'lon' : ds_train.lon})
-        weights = weights * mask_projection
+        weights = weights * land_mask
         weights_val = weights.copy() * land_mask
     else:       
         weights = np.cos(np.ones_like(ds_train.lon) * (np.deg2rad(ds_train.lat.to_numpy()))[..., None])  # Moved this up
@@ -398,31 +383,14 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
         weights_val = weights.copy() * land_mask
         if params['equal_weights']:
             weights = xr.ones_like(weights)
-        if any(['land_mask' not in time_features, model not in [UNet2]]):
-            weights = weights * land_mask
+        # if any(['land_mask' not in time_features, model not in [UNet2]]):
+        weights = weights * land_mask
 
-
-    if model not in [Autoencoder] : ## PG: If the model starts with a nn.Conv2d write back the flattened data to maps.
-
-        if loss_region is not None:
-            loss_region_indices, loss_area = get_coordinate_indices(ds_raw_ensemble_mean, loss_region)
-        
-        else:
-            loss_region_indices = None
+    if loss_region is not None:
+        loss_region_indices, loss_area = get_coordinate_indices(ds_raw_ensemble_mean, loss_region)
     
-    else: ## PG: If you have a dense first layer keep the data flattened.
-
-        ds_train = ds_train.stack(ref = ['lat','lon']) # PG: flatten and sample training data at those locations
-        obs_train = obs_train.stack(ref = ['lat','lon']) ## PG: flatten and sample obs data at those locations
-        weights = weights.stack(ref = ['lat','lon']) ## PG: flatten and sample weighs at those locations
-        weights_val = weights_val.stack(ref = ['lat','lon'])
-        img_dim = ds_train.shape[-1] ## PG: The input dim is now the length of the flattened dimention.
-        if loss_region is not None:
-    
-                    loss_region_indices, loss_area = get_coordinate_indices(ds_raw_ensemble_mean, loss_region, flat = True) ### the function has to be editted for flat opeion!!!!!
-
-        else:
-            loss_region_indices = None
+    else:
+        loss_region_indices = None
 
     del ds, obs
     gc.collect()
@@ -447,14 +415,12 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
     n_channels_x = len(ds_train.channels)
 
 
-    if model == Autoencoder:
-        net = model(img_dim, hidden_dims[0], hidden_dims[1], added_features_dim=add_feature_dim, append_mode=params['append_mode'], batch_normalization=batch_normalization, dropout_rate=dropout_rate)
-    elif model in [UNetLSTM, PNet,]:
+    if model in [UNetLSTM, PNet,]:
         net = model(  n_channels_x= n_channels_x+ add_feature_dim ,seq_length = lead_months, bilinear=params['bilinear'], sigmoid = sigmoid_activation, device =  device)
     elif model in [CNNLSTM]:
         net = model(  n_channels_x= n_channels_x, add_features = add_feature_dim , seq_length = lead_months, kernel_size = kernel_size, decoder_kernel_size = decoder_kernel_size, sigmoid = sigmoid_activation, device =  device)
     elif model in [UNet,UNetLCL,UNet2, UNet_NPS, UNet2_NPS]:
-        net = model(n_channels_x= n_channels_x+ add_feature_dim , bilinear = params['bilinear'], sigmoid = sigmoid_activation, skip_conv = params['skip_conv'])
+        net = model(n_channels_x= n_channels_x+ add_feature_dim , bilinear = params['bilinear'], sigmoid = sigmoid_activation, skip_conv = params['skip_conv'], combined_prediction = params['combined_prediction'])
     elif model in [CNN]: ## PG: Combining CNN encoder with dense decoder  
         net = model(n_channels_x + add_feature_dim ,hidden_dims, kernel_size = kernel_size, decoder_kernel_size = decoder_kernel_size,DSC = params['DSC'], sigmoid = sigmoid_activation  )
     elif model in [ RegCNN]: ## PG: Combining CNN encoder with dense decoder  
@@ -478,7 +444,7 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
     if model in [UNetLSTM_monthly, CNNLSTM_monthly]:
         train_set = ConvLSTMDataset(ds_train, obs_train, mask=mask, zeros_mask = zeros_mask, in_memory=True, lead_time=lead_time, time_features=time_features,ensemble_features =ensemble_features,  month_min_max = month_min_max) 
     else:
-        train_set = XArrayDataset(ds_train, obs_train, mask=mask, zeros_mask = zeros_mask, in_memory=True, lead_time=lead_time, time_features=time_features,ensemble_features =ensemble_features, aligned = True, month_min_max = month_min_max, model = model.__name__) 
+        train_set = XArrayDataset(ds_train, obs_train, mask=mask, zeros_mask = zeros_mask, in_memory=False, lead_time=lead_time, time_features=time_features,ensemble_features =ensemble_features, aligned = True, month_min_max = month_min_max, model = model.__name__) 
     dataloader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
     if params['version'] == 'IceExtent':
 
@@ -496,16 +462,16 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
         else:
             if low_ress_loss:
                 criterion = WeightedMSEGlobalLossLowRess(weights=weights, device=device, hyperparam=1, reduction='mean', loss_area=loss_region_indices, scale=reg_scale, map = True)
+                criterion_MSE = WeightedMSELowRess(weights=weights, device=device, hyperparam=1, reduction='mean', loss_area=loss_region_indices)
             else:
                 criterion = WeightedMSEGlobalLoss(weights=weights, device=device, hyperparam=1, reduction='mean', loss_area=loss_region_indices, scale=reg_scale, map = True)
-     
+                criterion_MSE = WeightedMSE(weights=weights, device=device, hyperparam=1, reduction='mean', loss_area=loss_region_indices)
 
+        if params['combined_prediction']:
+                criterion_extent = nn.BCELoss()
     # EVALUATE MODEL
     ##################################################################################################################################
 
-    if model == Autoencoder:
-        ds_validation = ds_validation.stack(ref = ['lat','lon'])
-        obs_validation = obs_validation.stack(ref = ['lat','lon'])
     if lead_time is not None:
         if model in [UNetLSTM_monthly, CNNLSTM_monthly]:
             val_mask = create_mask(full_shape[n_train - 11:n_train + num_val_years*12] )[:, lead_time - 1][..., None] ####create_mask(ds_raw_ensemble_mean)[n_train - 11:n_train + num_val_years*12] 
@@ -533,7 +499,7 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
             else:
                 criterion_eval = WeightedMSEGlobalLoss(weights=weights_val, device=device, hyperparam=1, reduction='mean', loss_area=loss_region_indices, scale=reg_scale, map = True)
     
-    criterion_eval_mean =   WeightedMSE(weights=weights_val, device=device, hyperparam=1, reduction='mean', loss_area=loss_region_indices)
+    criterion_eval_MSE =   WeightedMSE(weights=weights_val, device=device, hyperparam=1, reduction='mean', loss_area=loss_region_indices)
     # WeightedMSEGlobalLoss(weights=weights, device=device, hyperparam=1, reduction='mean', loss_area=loss_region_indices, scale=10, map  =True)
     criterion_eval_area = GlobalLoss( device=device, scale=1, weights=weights_val, loss_area=None, map = True)
     criterion_eval_extent = IceextentlLoss( device=device, scale=1, weights=weights_val, loss_area=None, map = True)
@@ -546,7 +512,7 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
     epoch_loss_val = []
     epoch_loss_val_extent = []
     epoch_loss_val_area = []
-    epoch_loss_val_mean = []
+    epoch_loss_val_MSE = []
 
     for epoch in tqdm.tqdm(range(epochs)):
         net.train()
@@ -569,17 +535,24 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
                 m  = None
             optimizer.zero_grad()
             if model in [UNet2, UNet2_NPS]:
-                adjusted_forecast = net(x, torch.from_numpy(model_mask.to_numpy()).to(device))
+                adjusted_forecast = net(x, torch.from_numpy(model_mask.to_numpy()).to(y))
             else:
                 adjusted_forecast = net(x, ind = ind)
-            if params['version'] == 'IceExtent':
-                loss = criterion(adjusted_forecast, y)
-                MSE = 0
+            if params['combined_prediction']:
+                    (y, y_extent) = (y[:,0].unsqueeze(1), y[:,1].unsqueeze(1))
+                    (adjusted_forecast, adjusted_forecast_extent) = adjusted_forecast
+                    loss_extent = criterion_extent(adjusted_forecast_extent, y_extent)
+                    loss = criterion(adjusted_forecast, y, mask = m)
+                    MSE = criterion_MSE(adjusted_forecast, y, mask =m)
+                    loss = loss + loss_extent
             else:
-                loss = criterion(adjusted_forecast, y, mask =m)
-                MSE = criterion_MSE(adjusted_forecast, y, mask =m)
-            if params['loss_function'] == 'RMSE': 
-                        loss = torch.sqrt(loss)
+                if params['version'] == 'IceExtent':
+                    loss = criterion(adjusted_forecast, y)
+                    MSE = 0
+                else:
+                    loss = criterion(adjusted_forecast, y, mask = m)
+                    MSE = criterion_MSE(adjusted_forecast, y, mask =m)
+
             batch_loss += loss.item()
             batch_MSE  += MSE.item()
             loss.backward()
@@ -596,7 +569,7 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
         val_loss = 0
         val_loss_extent = 0
         val_loss_area = 0
-        val_loss_mean = 0
+        val_loss_MSE = 0
         
         for batch, (x, target) in enumerate(dataloader_val):         
             with torch.no_grad():            
@@ -618,12 +591,18 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
                     test_adjusted = net(test_raw, torch.from_numpy(model_mask.to_numpy()).to(device))
                 else:
                     test_adjusted = net(test_raw, ind = ind)
-                if params['version'] == 'IceExtent':
-                    loss_ = criterion_eval(test_adjusted, test_obs)
+                if params['combined_prediction']:
+                    (test_obs, test_obs_extent) = (test_obs[:,0].unsqueeze(1), test_obs[:,1].unsqueeze(1))
+                    (test_adjusted, test_adjusted_extent) = test_adjusted
+                    loss_extent_ = criterion_extent(test_adjusted_extent, test_obs_extent)
+                    loss_ = criterion_eval(test_adjusted, test_obs, mask = m)
+                    loss_ = loss_ + loss_extent_
                 else:
-                    loss_ = criterion_eval(test_adjusted, test_obs,  mask =m)
-                if params['loss_function'] == 'RMSE': 
-                        loss_ = torch.sqrt(loss_)
+                    if params['version'] == 'IceExtent':
+                        loss_ = criterion_eval(test_adjusted, test_obs)
+                    else:
+                        loss_ = criterion_eval(test_adjusted, test_obs,  mask =m)
+
                 val_loss += loss_.item()
                 if m is not None:
                     m[m != 0] = 1
@@ -641,34 +620,37 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
                 val_loss_extent += loss_extent.item()
                 loss_area = criterion_eval_area(test_adjusted, test_obs, mask =  m_)
                 val_loss_area += loss_area.item()
-                loss_mean = criterion_eval_mean(test_adjusted , test_obs, mask =  m_)
-                if params['loss_function'] == 'RMSE': 
-                    loss_mean = torch.sqrt(loss_mean)
-                val_loss_mean += loss_mean.item()
+                loss_MSE = criterion_eval_MSE(test_adjusted , test_obs, mask =  m_)
+
+                val_loss_MSE += loss_MSE.item()
 
 
         epoch_loss_val.append(val_loss / len(dataloader_val))
         epoch_loss_val_extent.append(val_loss_extent / len(dataloader_val))
         epoch_loss_val_area.append(val_loss_area / len(dataloader_val))
-        epoch_loss_val_mean.append(val_loss_mean / len(dataloader_val))
+        epoch_loss_val_MSE.append(val_loss_MSE / len(dataloader_val))
         # Store results as NetCDF            
     del train_set,validation_set, dataloader, dataloader_val, x , m, test_raw, test_obs,  target, test_adjusted, net
+    try:
+        del test_obs_extent, test_adjusted_extent, adjusted_forecast_extent, y_extent
+    except:
+        pass
     gc.collect()
     torch.cuda.empty_cache() 
     torch.cuda.synchronize() 
     epoch_loss_val = smooth_curve(epoch_loss_val)
     epoch_loss_val_extent = smooth_curve(epoch_loss_val_extent)
     epoch_loss_val_area = smooth_curve(epoch_loss_val_area)
-    epoch_loss_val_mean = smooth_curve(epoch_loss_val_mean)
+    epoch_loss_val_MSE = smooth_curve(epoch_loss_val_MSE)
     if params["version"] in ['IceExtent']:
         epoch_loss_val_area = np.zeros_like(epoch_loss_val_area)
         epoch_loss_val_extent = np.zeros_like(epoch_loss_val_extent)
 
     plt.figure(figsize = (8,5))
-    plt.plot(np.arange(2,epochs+1), epoch_loss_train[1:], color = 'b', label = 'Train')
-    plt.plot(np.arange(2,epochs+1), epoch_loss_val[1:], color = 'darkorange', label = 'Validation')
+    plt.plot(np.arange(2,epochs+1), epoch_loss_train[1:], color = 'b', label = 'Train Loss Total')
+    plt.plot(np.arange(2,epochs+1), epoch_loss_val[1:], color = 'darkorange', label = 'Validation Loss Total')
     plt.plot(np.arange(2,epochs+1), epoch_loss_train_MSE[1:], color = 'b', label = 'Train MSE', linestyle = 'dashed', alpha = 0.5)
-    plt.plot(np.arange(2,epochs+1), epoch_loss_val_mean[1:], color = 'darkorange', label = 'Val MSE', linestyle = 'dashed', alpha = 0.5)
+    plt.plot(np.arange(2,epochs+1), epoch_loss_val_MSE[1:], color = 'darkorange', label = 'Val MSE', linestyle = 'dashed', alpha = 0.5)
     plt.title(f'{hyperparamater_grid}')
     plt.legend()
     plt.ylabel(params['loss_function'])
@@ -687,10 +669,10 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
     with open(Path(results_dir, "Hyperparameter_training.txt"), 'a') as f:
         f.write(
   
-            f"{hyperparamater_grid} ---> val_loss at best epoch: {min(epoch_loss_val)} at {np.argmin(epoch_loss_val)+1}  (MSE : {epoch_loss_val_mean[np.argmin(epoch_loss_val)]})\n" +  ## PG: The scale to be passed to Signloss regularization
+            f"{hyperparamater_grid} ---> val_loss at best epoch: {min(epoch_loss_val)} at {np.argmin(epoch_loss_val)+1}  (MSE : {epoch_loss_val_MSE[np.argmin(epoch_loss_val)]})\n" +  ## PG: The scale to be passed to Signloss regularization
             f"-------------------------------------------------------------------------------------------------------------------------------------------------------------------------\n" 
         )
-    return epoch_loss_val_mean[np.argmin(epoch_loss_val)], epoch_loss_val, epoch_loss_train ,epoch_loss_val_area, epoch_loss_val_extent, epoch_loss_val_mean, epoch_loss_train_MSE
+    return epoch_loss_val_MSE[np.argmin(epoch_loss_val)], epoch_loss_val, epoch_loss_train ,epoch_loss_val_area, epoch_loss_val_extent, epoch_loss_val_MSE, epoch_loss_train_MSE
 
                                  #########         ##########
 
@@ -813,7 +795,7 @@ if __name__ == "__main__":
         "reg_scale" : None,
         "optimizer": torch.optim.Adam,
         "lr": 0.001,
-        "loss_function" :'RMSE',
+        "loss_function" :'MSE',
         "loss_region": None,
         "subset_dimensions": 'North' , ##  North or South or Global
         'active_grid' : False,
@@ -822,10 +804,11 @@ if __name__ == "__main__":
         "kernel_size" : 5,
         "decoder_kernel_size" : 1,
         'DSC' : False,
-        "bilinear" : False, ## only for UNet
+        "bilinear" : True, ## only for UNet
         "L2_reg": 0,
         'lr_scheduler' : True,
-        'skip_conv' : False
+        'skip_conv' : False,
+        'combined_prediction' : False
     }
 
 
@@ -835,7 +818,6 @@ if __name__ == "__main__":
     lead_time = None
     n_runs = 1  # number of training runs
     params['version'] = 1 ### 1 , 2 ,3, 'PatternsOnly' , 'IceExtent'
-    params["loss_function"] = 'MSE'
     
     ### load data
 
@@ -855,20 +837,24 @@ if __name__ == "__main__":
     hyperparameterspace = config_grid(config_dict).full_grid()
 
     ##################################################################  Adjust the path if necessary #############3##############################################
-    out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_9/Model_tunning/'
+    out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_2_convnext/Model_tunning/'
     if lead_time is None:
-        out_dir = out_dir_x + f'NV{params["num_val_years"]}_M{lead_months}_batch_lr_{params["subset_dimensions"]}_v{params["version"]}_3'
+        out_dir = out_dir_x + f'NV{params["num_val_years"]}_M{lead_months}_{params["subset_dimensions"]}_v{params["version"]}'
     else:
-        out_dir = out_dir_x + f'NV{params["num_val_years"]}_LT{lead_time}_batch_lr_{params["subset_dimensions"]}_v{params["version"]}'
+        out_dir = out_dir_x + f'NV{params["num_val_years"]}_LT{lead_time}_{params["subset_dimensions"]}_v{params["version"]}'
     
     out_dir = out_dir + '_NPSproj' if NPSProj else out_dir + '_1x1'
 
     if params['active_grid']:
         out_dir = out_dir + '_active_grid'
     if params['bilinear']:
-            out_dir = out_dir + '_bilinear'
+        out_dir = out_dir + '_bilinear'
+    if params['skip_conv']:
+        out_dir = out_dir + '_skip_conv'   
+    if params['combined_prediction']:
+        out_dir = out_dir + '_combined'  
     if params['lr_scheduler']:
-        out_dir = out_dir + '_lr_scheduler_wave1'
+        out_dir = out_dir + '_lr_scheduler'
         params['start_factor'] = 1.0
         params['end_factor'] = 0.1
         params['total_iters'] = 100

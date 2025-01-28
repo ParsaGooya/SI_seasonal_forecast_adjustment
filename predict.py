@@ -30,7 +30,7 @@ data_dir_forecast = LOC_FORECASTS_SI
 
 
 
-def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, model_dir,  test_years,  model_year = None, ensemble_list = None, ensemble_mode = 'Mean', btstrp_it = 200, save=True):
+def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, model_dir,  test_years, NPSProj  = False,  model_year = None, ensemble_list = None, ensemble_mode = 'Mean', btstrp_it = 200, save=True):
 
 
     if model_year is None:
@@ -67,9 +67,6 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
     if params['version'] == 'IceExtent':
         params['reg_scale'] = None
 
-        params['forecast_preprocessing_steps'] = []
-        params['observations_preprocessing_steps'] = []
-        ds_in = xr.open_dataset('/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/NASA/Bias_Adjusted/bias_adjusted_North_1983-2020.nc')['SICN']
 
     print(f"Start run for test year {test_years}...")
 
@@ -81,7 +78,10 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
     hidden_dims = params['hidden_dims']
     forecast_preprocessing_steps = params["forecast_preprocessing_steps"]
     observations_preprocessing_steps = params["observations_preprocessing_steps"]
-
+    try:
+        ensemble_mode = params['ensemble_mode']
+    except:
+        params['ensemble_mode'] = 'Mean'
     try:
         batch_normalization = params["batch_normalization"]
         dropout_rate = params["dropout_rate"]
@@ -91,18 +91,21 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
         decoder_kernel_size = params["decoder_kernel_size"]
 
     print("Load forecasts")
-    if ensemble_list is not None: ## PG: calculate the mean if ensemble mean is none
-        ds_in = fct.sel(ensembles = ensemble_list)['SICN']
-            
-    else:    ## Load specified members
-        ds_in = fct['SICN']
-
-    if params['ensemble_mode'] == 'Mean': ##
-        ensemble_features = False
-        ds_in = ds_in.mean('ensembles').load() ##
+    if params['version'] == 3:
+        ds_in = xr.open_dataset('/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/NASA/Bias_Adjusted/bias_adjusted_North_1983-2020_1x1.nc')['SICN']
     else:
-        ds_in = ds_in.load().transpose('time','lead_time','ensembles',...)
-        print('Warning: ensemble_mode is None. Predicting for large ensemble ...')
+        if ensemble_list is not None: ## PG: calculate the mean if ensemble mean is none
+            ds_in = fct.sel(ensembles = ensemble_list)['SICN']
+                
+        else:    ## Load specified members
+            ds_in = fct['SICN']
+
+        if params['ensemble_mode'] == 'Mean': ##
+            ensemble_features = False
+            ds_in = ds_in.mean('ensembles').load() ##
+        else:
+            ds_in = ds_in.load().transpose('time','lead_time','ensembles',...)
+            print('Warning: ensemble_mode is None. Predicting for large ensemble ...')
         
     ###### handle nan and inf over land ############
     if not NPSProj:
@@ -131,6 +134,8 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
     ds_in_ = ds_in.where((ds_in.time >= min_year)&(ds_in.time <= max_year) , drop = True).isel(lead_time = np.arange(0,lead_months ))
 
     ds_raw, obs_raw = align_data_and_targets(ds_in.where(ds_in.time <= (model_year_ + 1)*100, drop = True), obs_in, lead_months)  # extract valid lead times and usable years ## used to be np.min(test_years)
+    del ds_in, obs_in
+    gc.collect()
 
     if not ds_raw.time.equals(obs_raw.time):
             
@@ -147,6 +152,8 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
     train_years = ds_raw_ensemble_mean.time[ds_raw_ensemble_mean.time <= (model_year_ + 1)*100].to_numpy()    
     ds_raw_ensemble_mean = xr.concat([ds_raw_ensemble_mean,ds_in_ ], dim = 'time')
     subset_dimensions = params["subset_dimensions"]
+    del ds_in_
+    gc.collect()
 
     if all([subset_dimensions is not None, NPSProj is False]):
         if subset_dimensions == 'North':
@@ -225,6 +232,8 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
         obs_raw = obs_raw.sel(lead_time = slice(lead_time,lead_time))
 
 
+    del ds_raw
+    gc.collect()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     if any([params['active_grid'],'active_mask' in params["time_features"], 'full_ice_mask' in params["time_features"]]):
@@ -258,6 +267,8 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
     #     obs_pipeline.add_fitted_preprocessor(ds_pipeline.get_preprocessors('standardize'), 'standardize')
     obs = obs_pipeline.transform(obs_raw.isel(channels = slice(0,1)))
 
+    del ds_baseline, obs_baseline, preprocessing_mask_obs, preprocessing_mask_fct
+    gc.collect()
     if params['version']  in [3]:
         sigmoid_activation = False
     else:
@@ -290,6 +301,8 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
         if any(['land_mask' not in time_features, model not in [UNet2]]):
             weights = weights * land_mask
 
+    del ds, obs
+    gc.collect()
     weights = weights.values
     if time_features is None:
         if ensemble_features: ## PG: We can choose to add an ensemble feature.
@@ -336,7 +349,7 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
     if lead_time is None:
         lead_times = ds_test.lead_time.values
     else:
-        lead_times = lead_time
+        lead_times = [lead_time]
     if 'ensembles' in ds_test.dims:
         # if model == UNetLSTM:
         #     test_loss = np.zeros(shape=(ds_test.sel(lead_time = lead_times).transpose('time','ensembles','channels',...).shape[:2]))
@@ -373,7 +386,7 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
 
     for time_id, (x, target) in enumerate(dataloader): 
         if 'ensembles' in ds_test.dims:  ## PG: If we have large ensembles:
-                ens_id, j = np.divmod(time_id, len(test_time_list))  ## PG: find out ensemble index
+                ens_id, time_id = np.divmod(time_id, len(test_time_list))  ## PG: find out ensemble index
         with torch.no_grad():
             if (type(x) == list) or (type(x) == tuple):
                 # ind = x[2] if model == PNet else None    
@@ -389,21 +402,21 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
             if params['combined_prediction']:
                 (test_adjusted, test_adjusted_extent) = test_adjusted
                 if 'ensembles' in ds_test.dims: 
-                    test_results_extent[ens_id,j * len(lead_times) : (j+1) * len(lead_times)] = test_adjusted_extent.to(torch.device('cpu')).numpy()  ## PG: write back to test_results
+                    test_results_extent[ens_id,time_id * len(lead_times) : (time_id+1) * len(lead_times)] = test_adjusted_extent.to(torch.device('cpu')).numpy()  ## PG: write back to test_results
                 else:
-                    test_results_extent[j * len(lead_times) : (j+1) * len(lead_times)] = test_adjusted.to(torch.device('cpu')).numpy()
+                    test_results_extent[time_id * len(lead_times) : (time_id+1) * len(lead_times)] = test_adjusted.to(torch.device('cpu')).numpy()
             
             if 'ensembles' in ds_test.dims:   
-                test_results[ens_id, j * len(lead_times) : (j+1) * len(lead_times)] = test_adjusted.to(torch.device('cpu')).numpy()  ## PG: write back to test_results
+                test_results[ens_id, time_id * len(lead_times) : (time_id+1) * len(lead_times)] = test_adjusted.to(torch.device('cpu')).numpy()  ## PG: write back to test_results
             else:
-                test_results[j * len(lead_times) : (j+1) * len(lead_times)] = test_adjusted.to(torch.device('cpu')).numpy()
+                test_results[time_id * len(lead_times) : (time_id+1) * len(lead_times)] = test_adjusted.to(torch.device('cpu')).numpy()
 
-            del  test_set , test_raw, test_obs, x, target, m,  test_adjusted , ds_test, obs_test,loss
-            try:
-                del  test_obs_extent, test_adjusted_extent, loss_extent
-            except:
-                pass
-            gc.collect()
+    del  test_raw,  x, target, test_adjusted, test_set, ds_test
+    try:
+        del  test_adjusted_extent
+    except:
+        pass
+    gc.collect()
     ###################################################### has to be eddited for large ensembles!! #####################################################################
     results_shape[:] = test_results[:]
 
@@ -423,7 +436,11 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
     if obs_clim:
         result = result.isel(channels = 0).expand_dims('channels', axis=2)
 
-    del  results_shape,results_shape_extent, test_results, test_results_untransformed
+    del  results_shape, test_results, test_results_untransformed
+    try:
+        results_shape_extent
+    except:
+        pass
     gc.collect()
 
     result = (result * land_mask)
@@ -512,20 +529,21 @@ if __name__ == "__main__":
     ############################################## Set_up ############################################
 
     out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/NASA/UNet2/run_set_2_convnext'
-    out_dir    = f'{out_dir_x}/N5_M12_F12_v1_1x1_North_lr0.001_batch25_e45_LNone_bilinear_combined' 
+    out_dir    = f'{out_dir_x}/N5_LT1_F12_v1_1x1_North_lr0.001_batch25_e100_LNone_bilinear' 
 
     lead_months = 12
     bootstrap = False
-    test_years = np.arange(2005,2020)
+    test_years = np.arange(2016,2022)
 
     #################################################################################################
     obs_ref = out_dir_x.split('/')[-3]
-    if '1x1' in out_dir_x:
+    if '1x1' in out_dir:
         NPSProj = False
         crs = '1x1'  
     else:
         NPSProj = True
         crs = 'NPS'
+
 
     if obs_ref == 'NASA':
         data_dir_obs = glob.glob(LOC_OBSERVATIONS_SI+ f'/NASA*{crs}*.nc')[0] 
@@ -536,42 +554,44 @@ if __name__ == "__main__":
     ls = [xr.open_dataset(glob.glob(LOC_FORECASTS_SI + f'/*_initial_month_{intial_month}_*{crs}*.nc')[0]) for intial_month in range(1,13) ]
     fct = xr.concat(ls, dim = 'time').sortby('time')
 
+    del ls
+    gc.collect()
     ##################################################################################################
-    
-    params = extract_params(out_dir)
-    print(f'loaded configuration: \n')
-    for key, values in params.items():
-        print(f'{key} : {values} \n')
-    
-    try:
-        version = int(out_dir.split('/')[-1].split('_')[2][1])
-    except:
-        version = (out_dir.split('/')[-1].split('_')[2][1:])
-      
-    params["version"] = version
-    print( f'Version: {version}')
-
-    
-    if bootstrap:
-
-        result_list = []
-        ensembles = np.arange(1,11)#[f'r{i}i1p2f1' for i in range(1,11)]
-
-        for it in tqdm(range(200)):
-
-            ensemble_list = [random.choice(ensembles) for _ in range(len(ensembles))]
-            result_list.append(predict(fct, observation, params, lead_months, out_dir,  test_years, ensemble_list = ensemble_list,  save=False))
+    for i in range(1,13):
+        out_dir    = f'{out_dir_x}/N5_LT{i}_F12_v3_1x1_North_lr0.001_batch25_e100_LNone_bilinear_combined'  
+        params = extract_params(out_dir)
+        print(f'loaded configuration: \n')
+        for key, values in params.items():
+            print(f'{key} : {values} \n')
         
-        output = xr.concat(result_list, dim = 'iteration')
 
-        if np.min(test_years) != np.max(test_years):
-            output.to_netcdf(path=Path(out_dir, f'saved_model_nn_adjusted_{np.min(test_years)}-{np.max(test_years)}_bootstrap.nc', mode='w'))
+        version = int(out_dir.split('/')[-1].split('_')[3][1])
+
+        
+        params["version"] = version
+        print( f'Version: {version}')
+
+        
+        if bootstrap:
+
+            result_list = []
+            ensembles = np.arange(1,11)#[f'r{i}i1p2f1' for i in range(1,11)]
+
+            for it in tqdm(range(200)):
+
+                ensemble_list = [random.choice(ensembles) for _ in range(len(ensembles))]
+                result_list.append(predict(fct, observation, params, lead_months, out_dir,  test_years, ensemble_list = ensemble_list,  save=False))
+            
+            output = xr.concat(result_list, dim = 'iteration')
+
+            if np.min(test_years) != np.max(test_years):
+                output.to_netcdf(path=Path(out_dir, f'saved_model_nn_adjusted_{np.min(test_years)}-{np.max(test_years)}_bootstrap.nc', mode='w'))
+            else:
+                output.to_netcdf(path=Path(out_dir, f'saved_model_nn_adjusted_{np.min(test_years)}_bootstrap.nc', mode='w'))
+        
         else:
-            output.to_netcdf(path=Path(out_dir, f'saved_model_nn_adjusted_{np.min(test_years)}_bootstrap.nc', mode='w'))
-    
-    else:
-        predict(fct, observation, params, lead_months, out_dir,  test_years, model_year = 2020, ensemble_mode='Mean',  save=True)
+            predict(fct, observation, params, lead_months, out_dir,  test_years, NPSProj  = NPSProj, model_year = 2016, ensemble_mode='Mean',  save=True)
 
-    print(f'Output dir: {out_dir}')
-    print('Saved!')
+        print(f'Output dir: {out_dir}')
+        print('Saved!')
 

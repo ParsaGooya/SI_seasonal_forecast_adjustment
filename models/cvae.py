@@ -6,10 +6,11 @@ from models.partialconv2d import PartialConv2d
 
 class cVAE(nn.Module):
 	
-    def __init__( self, VAE_latent_size, n_channels_x=1 ,  sigmoid = True, NPS_proj = False, device = 'cpu'):
+    def __init__( self, VAE_latent_size, n_channels_x=1 ,  sigmoid = True, NPS_proj = False, device = 'cpu', combined_prediction = False):
         super().__init__()
-        if NPS_proj:
-            self.unet = prediction(n_channels_x, sigmoid)
+        self.combined_prediction = combined_prediction
+        if not NPS_proj:
+            self.unet = prediction(n_channels_x, sigmoid, )
             self.recognition = prior_recognition(n_channels_x + 1, sigmoid, VAE_latent_size = VAE_latent_size)
             self.prior = prior_recognition(n_channels_x + 1, sigmoid, VAE_latent_size = VAE_latent_size)
             self.generation = generation(sigmoid = sigmoid, VAE_latent_size = VAE_latent_size)
@@ -20,6 +21,9 @@ class cVAE(nn.Module):
             self.generation = generation_NPS(sigmoid = sigmoid, VAE_latent_size = VAE_latent_size)	
 				
         self.last_conv = OutConv(16, 1, sigmoid = sigmoid, NPS_proj= NPS_proj)
+        if combined_prediction:
+            self.last_conv2 = OutConv(32, 1, sigmoid = True, NPS_proj = True)
+                  
         self.N = torch.distributions.Normal(0, 1)
             # Get sampling working on GPU
         if device.type == 'cuda':
@@ -30,6 +34,9 @@ class cVAE(nn.Module):
             
         basic_unet = self.unet(model, model_mask)
         deterministic_output = self.last_conv(basic_unet)
+        if self.combined_prediction:
+            deterministic_output_extent = self.last_conv2(basic_unet)
+            deterministic_output = (deterministic_output, deterministic_output_extent)
 
         mask_recognition = torch.concat([obs_mask, model_mask], dim = 0)
         mu, log_var = self.recognition(obs, cond = model, mask = mask_recognition)
@@ -46,6 +53,10 @@ class cVAE(nn.Module):
         out = torch.flatten(out, start_dim = 0, end_dim = 1)
         generated_output = self.last_conv(out)
         generated_output = torch.unflatten(generated_output, dim = 0 , sizes = out_shape[0:2])
+        if self.combined_prediction:
+            generated_output_extent = self.last_conv2(out)
+            generated_output_extent = torch.unflatten(generated_output_extent, dim = 0 , sizes = out_shape[0:2])
+            generated_output = (generated_output, generated_output_extent)
 
         return generated_output, deterministic_output, mu, log_var , cond_mu, cond_log_var
 
@@ -86,7 +97,7 @@ class generation(nn.Module):
         # Upsampling
         x = self.combine(z)
         x = self.up1(x)  # (batch, 128, 12, 22)
-        x = self.up2(x)  # (batch, 64, 25, 45)
+        x = self.up2(x, pad = (0,1,0,1))  # (batch, 64, 25, 45)
         x = self.up3(x)  # (batch, 32, 50, 90)
         x = self.up4(x)  # (batch, 16, 100, 180)      
         return x
@@ -107,7 +118,7 @@ class generation_NPS(nn.Module):
     def forward(self, z):
         # Upsampling
         x = self.combine(z)
-        x = self.up1(x, pad = 1)  # (batch, 256, 27, 27)
+        x = self.up1(x, pad = (0,1,0,1))  # (batch, 256, 27, 27)
         x = self.up2(x)  # (batch, 128, 54, 54)
         x = self.up3(x)  # (batch, 64, 108, 108)
         x = self.up4(x)  # (batch, 32, 216, 216)
@@ -185,7 +196,11 @@ class prior_recognition_NPS(nn.Module):
         else:
             x_in = x
         if cond is not None:
-            x_in = torch.cat([x_in, cond], dim=1)
+            if (type(cond) == list) or (type(cond) == tuple):    
+                cond_in = torch.cat([cond[0], cond[1]], dim=1)
+            else:
+                cond_in = cond
+            x_in = torch.cat([x_in, cond_in], dim=1)
         if len(mask.shape) == 2:
             mask = mask.unsqueeze(0).expand_as(x_in[0])
         x1, mask1 = self.initial_conv(x_in, mask)  # (batch, 16, 100, 180)
@@ -244,7 +259,7 @@ class prediction(nn.Module):
         
         # Upsampling
         x = self.up1(x6)  # (batch, 128, 12, 22)
-        x = self.up2(x)  # (batch, 64, 25, 45)
+        x = self.up2(x, pad = (0,1,0,1))  # (batch, 64, 25, 45)
         x = self.up3(x)  # (batch, 32, 50, 90)
         x = self.up4(x)  # (batch, 16, 100, 180)
         
@@ -292,10 +307,9 @@ class prediction_NPS(nn.Module):
         if len(mask.shape) == 2:
             mask = mask.unsqueeze(0).expand_as(x_in[0])
         x1, mask1 = self.initial_conv(x_in, mask)  # (batch, 16, 432, 432)
-        print(mask1.shape)
+
     # Downsampling
         x2, mask2  = self.d1(x1, mask1)  # (batch, 32, 216, 216)
-        print(mask2.shape)
         x3, mask3  = self.d2(x2, mask2)  # (batch, 64, 108, 108)
         x4, mask4  = self.d3(x3, mask3)  # (batch, 128, 54, 54)
         x5, mask5  = self.d4(x4, mask4)  # (batch, 256, 27, 27)
@@ -304,7 +318,7 @@ class prediction_NPS(nn.Module):
         x7 = self.last_conv_down(x6, mask6)  # (batch, 1024, 13, 13)
 
         # Upsampling
-        x = self.up1(x7, pad = 1)  # (batch, 512, 27, 27)
+        x = self.up1(x7, pad = (0,1,0,1))  # (batch, 512, 27, 27)
         x = self.up2(x)  # (batch, 256, 54, 54)
         x = self.up3(x)  # (batch, 128, 108, 108)
         x = self.up4(x)  # (batch, 64, 216, 216)
@@ -433,33 +447,32 @@ class InitialConv(nn.Module):
 				return x1, mask1
 
 class OutConv(nn.Module):
-		def __init__(self, in_channels, out_channels, sigmoid = True, NPS_proj = False):
-				super().__init__()
-				self.NPS_proj = NPS_proj
-				if NPS_proj:
-					padding = 1
-				else:
-					padding= [1,0]
-				if sigmoid:
-					self.conv1 = PartialConv2d(in_channels, in_channels, kernel_size=3, padding= padding)
-					self.conv2 = nn.Sequential(
-								nn.BatchNorm2d(in_channels),
-								nn.ReLU(inplace=True),
-								nn.Conv2d(in_channels, out_channels, kernel_size=1), nn.Sigmoid())
-						
-				else:
-					self.conv1 = PartialConv2d(in_channels, in_channels, kernel_size=3, padding= padding)
-					self.conv2 = nn.Sequential(
-								nn.BatchNorm2d(in_channels),
-								nn.ReLU(inplace=True),
-								nn.Conv2d(in_channels, out_channels, kernel_size=1))
-			
-		def forward(self, x):
-				if not self.NPS_proj:
-					x = pad_ice(x, [0,1])
-				x1 = self.conv1(x)
-				return self.conv2(x1)
-		
+    def __init__(self, in_channels, out_channels, sigmoid = True, NPS_proj = False):
+            super().__init__()
+            self.NPS_proj = NPS_proj
+            if NPS_proj:
+                padding = 1
+            else:
+                padding= [1,0]
+            # self.conv1 = PartialConv2d(in_channels, in_channels, kernel_size=3, padding= padding)
+            if sigmoid:
+                self.conv2 = nn.Sequential(
+                            nn.BatchNorm2d(in_channels),
+                            nn.ReLU(inplace=True),
+                            nn.Conv2d(in_channels, out_channels, kernel_size=1), nn.Sigmoid())
+                    
+            else:
+                self.conv2 = nn.Sequential(
+                            nn.BatchNorm2d(in_channels),
+                            nn.ReLU(inplace=True),
+                            nn.Conv2d(in_channels, out_channels, kernel_size=1))
+        
+    def forward(self, x):
+            # if not self.NPS_proj:
+            # 	x = pad_ice(x, [0,1])
+            # x1 = self.conv1(x)
+            return self.conv2(x)
+        
 
 
 
