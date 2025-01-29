@@ -292,9 +292,10 @@ class OutConv(nn.Module):
 				# 	x = pad_ice(x, [0,1])
 				# x = self.conv1(x)
 				return self.conv2(x)
-			
+		
+		
 class DoubleConvNext(nn.Module):
-	
+		r""" Adopted from https://github.com/facebookresearch/ConvNeXt/blob/main/models/convnext.py"""	
 		def __init__(self, in_channels,  multi_channel=False, return_mask=False):
 				super().__init__()
 				self.return_mask = return_mask
@@ -355,7 +356,8 @@ class Block(nn.Module):
 
 
 class LayerNorm(nn.Module):
-    r""" LayerNorm that supports two data formats: channels_last (default) or channels_first. 
+	r""" Adopted from https://github.com/facebookresearch/ConvNeXt/blob/main/models/convnext.py
+    LayerNorm that supports two data formats: channels_last (default) or channels_first. 
     The ordering of the dimensions in the inputs. channels_last corresponds to inputs with 
     shape (batch_size, height, width, channels) while channels_first corresponds to inputs 
     with shape (batch_size, channels, height, width).
@@ -381,7 +383,34 @@ class LayerNorm(nn.Module):
             return x
 		
 
+class LocallyConnected2d(nn.Module):
+    def __init__(self, in_channels, out_channels, output_size, kernel_size, stride = 1, bias=False):
+        super(LocallyConnected2d, self).__init__()
+        output_size = _pair(output_size)
+        self.weight = nn.Parameter(
+            torch.randn(1, out_channels, in_channels, output_size[0], output_size[1], kernel_size**2)
+        )
+        if bias:
+            self.bias = nn.Parameter(
+                torch.randn(1, out_channels, output_size[0], output_size[1])
+            )
+        else:
+            self.register_parameter('bias', None)
+        self.kernel_size = _pair(kernel_size)
+        self.stride = _pair(stride)
 
+    def forward(self, x):
+        _, c, h, w = x.size()
+        kh, kw = self.kernel_size
+        dh, dw = self.stride
+        x = x.unfold(2, kh, dh).unfold(3, kw, dw)
+        x = x.contiguous().view(*x.size()[:-2], -1)
+        # Sum in in_channel and kernel_size dims
+        out = (x.unsqueeze(1) * self.weight).sum([2, -1])
+        if self.bias is not None:
+            out += self.bias
+        return out
+	
 def pad_ice(x,   size): # NxCxHxW
 
 		if type(size) in [list, tuple]:

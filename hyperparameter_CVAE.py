@@ -382,7 +382,7 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
     n_channels_x = len(ds_train.channels)
 
 
-    net = cVAE(VAE_latent_size = params['VAE_latent_size'], n_channels_x= n_channels_x+ add_feature_dim , sigmoid = sigmoid_activation, NPS_proj = NPSProj, device=device, combined_prediction = params['combined_prediction'])
+    net = cVAE(VAE_latent_size = params['VAE_latent_size'], n_channels_x= n_channels_x+ add_feature_dim , sigmoid = sigmoid_activation, NPS_proj = NPSProj, device=device, combined_prediction = params['combined_prediction'], VAE_MLP_encoder = params['VAE_MLP_encoder'])
 
     net.to(device)
     optimizer = torch.optim.Adam(net.parameters(), lr=lr, weight_decay = l2_reg)
@@ -675,6 +675,7 @@ def run_hp_tunning( ds_raw_ensemble_mean: XArrayDataset ,obs_raw: XArrayDataset,
                 f"equal_weights\t{params['equal_weights']}\n" +
                 f"active_grid\t{params['active_grid']}\n" + 
                 f"VAE_latent_size\t{params['VAE_latent_size']}\n" + 
+                f"VAE_MLP_encoder\t{params['VAE_MLP_encoder']}\n"  + 
                 f"training_sample_size\t{params['training_sample_size']}\n\n\n" +
                 ' ----------------------------------------------------------------------------------\n'
             )
@@ -756,6 +757,7 @@ if __name__ == "__main__":
         "L2_reg": 0,
         'lr_scheduler' : True,
         'VAE_latent_size' : 50,
+        'VAE_MLP_encoder' : False,
         'training_sample_size' : 1,
         'BVAE' : 50,
         'loss_reduction' : 'mean' , # mean or sum
@@ -788,12 +790,15 @@ if __name__ == "__main__":
     hyperparameterspace = config_grid(config_dict).full_grid()
 
     ##################################################################  Adjust the path if necessary #############3##############################################
-    out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_1_convnext/Model_tunning/'
+    out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_2_convnext/Model_tunning/'
     if lead_time is None:
-        out_dir = out_dir_x + f'NV{params["num_val_years"]}_M{lead_months}_{params["subset_dimensions"]}_v{params["version"]}'
+        out_dir = out_dir_x + f'NV{params["num_val_years"]}_M{lead_months}_{params["subset_dimensions"]}_v{params["version"]}_cVAE'
     else:
-        out_dir = out_dir_x + f'NV{params["num_val_years"]}_LT{lead_time}_{params["subset_dimensions"]}_v{params["version"]}'
-    
+        out_dir = out_dir_x + f'NV{params["num_val_years"]}_LT{lead_time}_{params["subset_dimensions"]}_v{params["version"]}_cVAE'
+
+    if params['VAE_MLP_encoder']:
+        out_dir = out_dir + '_Linear'
+
     out_dir = out_dir + '_NPSproj' if NPSProj else out_dir + '_1x1'
 
     if params['active_grid']:

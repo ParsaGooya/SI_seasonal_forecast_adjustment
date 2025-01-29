@@ -725,7 +725,7 @@ if __name__ == "__main__":
         "ensemble_features": False, ## PG
         'ensemble_list' : None, ## PG
         'ensemble_mode' : 'Mean',
-        "epochs": 100,
+        "epochs": 50,
         "batch_size": 10,
         "reg_scale" : None,
         "beta" : 1,
@@ -743,7 +743,7 @@ if __name__ == "__main__":
         'VAE_latent_size' : 50,
         'VAE_MLP_encoder' : False,
         'BVAE' : 50,
-        'training_sample_size' : 10, 
+        'training_sample_size' : 1, 
         'loss_reduction' : 'mean' , # mean or sum
         'combined_prediction' : False
     }
@@ -757,7 +757,7 @@ if __name__ == "__main__":
     obs_ref = 'NASA'
     NPSProj = True
     
-    out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_2_convnext'
+    out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_1_convnext'
     if type(params['beta']) == dict:
         beta_arg = 'Banealing'
     else:

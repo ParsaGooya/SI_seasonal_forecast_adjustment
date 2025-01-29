@@ -11,7 +11,7 @@ from torch.distributions import Normal
 import torch
 from torch.utils.data import DataLoader
 from torch.optim import lr_scheduler
-from models.cvae import cVAE
+
 from losses import WeightedMSEKLD, WeightedMSE
 from losses import WeightedMSEKLDLowRess, WeightedMSELowRess
 from preprocessing import align_data_and_targets, create_mask, pole_centric, reverse_pole_centric, segment, reverse_segment, pad_xarray
@@ -30,6 +30,12 @@ data_dir_forecast = LOC_FORECASTS_SI
 
 def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, model_dir,  test_years, NPSProj  = False,  model_year = None, ensemble_list = None, ensemble_mode = 'Mean', btstrp_it = 200, save=True):
 
+    if 'run_set_1' in model_dir:
+        from models.cvae_0127 import cVAE
+    else:
+        from models.cvae import cVAE
+        if 'Linear' in model_dir:
+            params['VAE_MLP_encoder'] = True
 
     if model_year is None:
         model_year_ = np.min(test_years) - 1
@@ -311,8 +317,11 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
         
     except:
         pass
-
-    net = cVAE(VAE_latent_size = params['VAE_latent_size'], n_channels_x= n_channels_x+ add_feature_dim , sigmoid = sigmoid_activation, NPS_proj = NPSProj, device=device, combined_prediction = params['combined_prediction'])
+    
+    try:
+        net = cVAE(VAE_latent_size = params['VAE_latent_size'], n_channels_x= n_channels_x+ add_feature_dim , sigmoid = sigmoid_activation, NPS_proj = NPSProj, device=device, combined_prediction = params['combined_prediction'], VAE_MLP_encoder = params['VAE_MLP_encoder'])
+    except:
+        net = cVAE(VAE_latent_size = params['VAE_latent_size'], n_channels_x= n_channels_x+ add_feature_dim , sigmoid = sigmoid_activation, NPS_proj = NPSProj, device=device, combined_prediction = params['combined_prediction'])
 
     print('Loading model ....')
     net.load_state_dict(torch.load(glob.glob(model_dir + f'/*-{model_year_}*.pth')[0], map_location=torch.device('cpu'))) 
@@ -376,7 +385,7 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
             basic_unet = net.unet(test_raw, model_mask_)
             cond_var = torch.exp(cond_log_var) + 1e-4
             cond_std = torch.sqrt(cond_var)
-            z =  Normal(cond_mu, cond_std).rsample(sample_shape=(params['BVAE'],)).squeeze().to(device)
+            z =  Normal(cond_mu, cond_std * n_stds).rsample(sample_shape=(params['BVAE'],)).squeeze().to(device)
             z = torch.flatten(z, start_dim = 0, end_dim = 1)
             out = net.generation(z)
             out = torch.unflatten(out, dim = 0, sizes = (params['BVAE'],cond_var.shape[0]))
@@ -479,11 +488,11 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
 
 
         if np.min(test_years) != np.max(test_years):
-            result.to_netcdf(path=Path(model_dir, f'saved_model_nn_adjusted_ENS_{np.min(test_years)}-{np.max(test_years)}.nc', mode='w'))
+            result.to_netcdf(path=Path(model_dir, f'saved_model_nn_adjusted_ENS_{np.min(test_years)}-{np.max(test_years)}_nstds{n_stds}.nc', mode='w'))
             result_deterministic.to_netcdf(path=Path(model_dir, f'saved_model_nn_adjusted_deterministic_{np.min(test_years)}-{np.max(test_years)}.nc', mode='w'))
 
         else:
-            result.to_netcdf(path=Path(model_dir, f'saved_model_nn_adjusted_ENS_{np.min(test_years)}.nc', mode='w'))
+            result.to_netcdf(path=Path(model_dir, f'saved_model_nn_adjusted_ENS_{np.min(test_years)}_nstds{n_stds}.nc', mode='w'))
             result_deterministic.to_netcdf(path=Path(model_dir, f'saved_model_nn_adjusted_deterministic_{np.min(test_years)}.nc', mode='w'))
 
     return result, result_deterministic
@@ -524,7 +533,7 @@ if __name__ == "__main__":
 
     lead_months = 12
     bootstrap = False
-    test_years = np.arange(2016,2022)
+    test_years = np.arange(2017,2022)
 
     #################################################################################################
     obs_ref = out_dir_x.split('/')[-3]

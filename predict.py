@@ -529,7 +529,7 @@ if __name__ == "__main__":
     ############################################## Set_up ############################################
 
     out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/NASA/UNet2/run_set_2_convnext'
-    out_dir    = f'{out_dir_x}/N5_LT1_F12_v1_1x1_North_lr0.001_batch25_e100_LNone_bilinear' 
+    out_dir    = f'{out_dir_x}/N5_M12_F12_v1_NPSproj_North_lr0.001_batch10_e100_LNone_bilinear' 
 
     lead_months = 12
     bootstrap = False
@@ -557,41 +557,41 @@ if __name__ == "__main__":
     del ls
     gc.collect()
     ##################################################################################################
-    for i in range(1,13):
-        out_dir    = f'{out_dir_x}/N5_LT{i}_F12_v3_1x1_North_lr0.001_batch25_e100_LNone_bilinear_combined'  
-        params = extract_params(out_dir)
-        print(f'loaded configuration: \n')
-        for key, values in params.items():
-            print(f'{key} : {values} \n')
+    # for i in range(1,13):
+    #     out_dir    = f'{out_dir_x}/N5_LT{i}_F12_v3_1x1_North_lr0.001_batch25_e100_LNone_bilinear_combined'  
+    params = extract_params(out_dir)
+    print(f'loaded configuration: \n')
+    for key, values in params.items():
+        print(f'{key} : {values} \n')
+    
+
+    version = int(out_dir.split('/')[-1].split('_')[3][1])
+
+    
+    params["version"] = version
+    print( f'Version: {version}')
+
+    
+    if bootstrap:
+
+        result_list = []
+        ensembles = np.arange(1,11)#[f'r{i}i1p2f1' for i in range(1,11)]
+
+        for it in tqdm(range(200)):
+
+            ensemble_list = [random.choice(ensembles) for _ in range(len(ensembles))]
+            result_list.append(predict(fct, observation, params, lead_months, out_dir,  test_years, ensemble_list = ensemble_list,  save=False))
         
+        output = xr.concat(result_list, dim = 'iteration')
 
-        version = int(out_dir.split('/')[-1].split('_')[3][1])
-
-        
-        params["version"] = version
-        print( f'Version: {version}')
-
-        
-        if bootstrap:
-
-            result_list = []
-            ensembles = np.arange(1,11)#[f'r{i}i1p2f1' for i in range(1,11)]
-
-            for it in tqdm(range(200)):
-
-                ensemble_list = [random.choice(ensembles) for _ in range(len(ensembles))]
-                result_list.append(predict(fct, observation, params, lead_months, out_dir,  test_years, ensemble_list = ensemble_list,  save=False))
-            
-            output = xr.concat(result_list, dim = 'iteration')
-
-            if np.min(test_years) != np.max(test_years):
-                output.to_netcdf(path=Path(out_dir, f'saved_model_nn_adjusted_{np.min(test_years)}-{np.max(test_years)}_bootstrap.nc', mode='w'))
-            else:
-                output.to_netcdf(path=Path(out_dir, f'saved_model_nn_adjusted_{np.min(test_years)}_bootstrap.nc', mode='w'))
-        
+        if np.min(test_years) != np.max(test_years):
+            output.to_netcdf(path=Path(out_dir, f'saved_model_nn_adjusted_{np.min(test_years)}-{np.max(test_years)}_bootstrap.nc', mode='w'))
         else:
-            predict(fct, observation, params, lead_months, out_dir,  test_years, NPSProj  = NPSProj, model_year = 2016, ensemble_mode='Mean',  save=True)
+            output.to_netcdf(path=Path(out_dir, f'saved_model_nn_adjusted_{np.min(test_years)}_bootstrap.nc', mode='w'))
+    
+    else:
+        predict(fct, observation, params, lead_months, out_dir,  test_years, NPSProj  = NPSProj, model_year = 2016, ensemble_mode='Mean',  save=True)
 
-        print(f'Output dir: {out_dir}')
-        print('Saved!')
+    print(f'Output dir: {out_dir}')
+    print('Saved!')
 
