@@ -10,6 +10,7 @@ class cVAE(nn.Module):
         super().__init__()
         self.combined_prediction = combined_prediction
         self.VAE_MLP_encoder = VAE_MLP_encoder
+        self.n_channels_x = n_channels_x
         if not NPS_proj:
             self.unet = prediction(n_channels_x, sigmoid, )
             self.recognition = prior_recognition(n_channels_x + 1, sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder)
@@ -38,6 +39,11 @@ class cVAE(nn.Module):
         if self.combined_prediction:
             deterministic_output_extent = self.last_conv2(basic_unet)
             deterministic_output = (deterministic_output, deterministic_output_extent)
+
+        obs_mask = obs_mask.expand_as(obs[0])
+        if (type(model) == list) or (type(model) == tuple):  
+            model_mask = model_mask.expand((self.n_channels_x , *model_mask.shape[1:]))
+
 
         mask_recognition = torch.concat([obs_mask, model_mask], dim = 0)
         mu, log_var = self.recognition(obs, cond = model, mask = mask_recognition)
@@ -102,7 +108,7 @@ class generation(nn.Module):
         # Upsampling
         x = self.combine(z)
         if self.VAE_MLP_encoder is not None:
-            z = torch.unflatten(z, dim = 1, sizes = (256,6,11))
+            x = torch.unflatten(x, dim = 1, sizes = (256,6,11))
         x = self.up1(x)  # (batch, 128, 12, 22)
         x = self.up2(x, pad = (0,1,0,1))  # (batch, 64, 25, 45)
         x = self.up3(x)  # (batch, 32, 50, 90)
@@ -129,7 +135,7 @@ class generation_NPS(nn.Module):
     def forward(self, z):
         x = self.combine(z)
         if self.VAE_MLP_encoder is not None:
-            z = torch.unflatten(z, dim = 1, sizes = (512,13,13))
+            x = torch.unflatten(x, dim = 1, sizes = (512,13,13))
         # Upsampling
         x = self.up1(x, pad = (0,1,0,1))  # (batch, 256, 27, 27)
         x = self.up2(x)  # (batch, 128, 54, 54)
@@ -146,12 +152,12 @@ class prior_recognition(nn.Module):
         super().__init__()
         self.n_channels_x = n_channels_x 
         # input  (batch, n_channels_x, 100, 180)   
-        self.initial_conv = InitialConv(n_channels_x, 16)
+        self.initial_conv = InitialConv(n_channels_x, 16, multi_channel = True)
         # downsampling:
-        self.d1 = Down(16, 32)
-        self.d2 = Down(32, 64)
-        self.d3 = Down(64, 128)
-        self.d4 = Down(128, 256)
+        self.d1 = Down(16, 32, multi_channel = True)
+        self.d2 = Down(32, 64, multi_channel = True)
+        self.d3 = Down(64, 128, multi_channel = True)
+        self.d4 = Down(128, 256, multi_channel = True)
         # self.d5 = Down(256, 512)
         # last conv of downsampling
         if VAE_latent_size is None:
@@ -175,6 +181,8 @@ class prior_recognition(nn.Module):
             else:
                 cond_in = cond
             x_in = torch.cat([x_in, cond_in], dim=1)
+        if len(mask.shape) == 2:
+            mask = mask.unsqueeze(0).expand_as(x_in[0])    
 
         x1, mask1 = self.initial_conv(x_in, mask)  # (batch, 16, 100, 180)
 
@@ -194,13 +202,13 @@ class prior_recognition_NPS(nn.Module):
         super().__init__()
         self.n_channels_x = n_channels_x 
         # input  (batch, n_channels_x, 100, 180)   
-        self.initial_conv = InitialConv(n_channels_x, 16)
+        self.initial_conv = InitialConv(n_channels_x, 16, multi_channel = True)
         # downsampling:
-        self.d1 = Down(16, 32)
-        self.d2 = Down(32, 64)
-        self.d3 = Down(64, 128)
-        self.d4 = Down(128, 256)
-        self.d5 = Down(256, 512)
+        self.d1 = Down(16, 32, multi_channel = True)
+        self.d2 = Down(32, 64, multi_channel = True)
+        self.d3 = Down(64, 128, multi_channel = True)
+        self.d4 = Down(128, 256, multi_channel = True)
+        self.d5 = Down(256, 512, multi_channel = True)
         # last conv of downsampling
         if VAE_latent_size is None:
               VAE_latent_size = 512
@@ -223,7 +231,7 @@ class prior_recognition_NPS(nn.Module):
                 cond_in = cond
             x_in = torch.cat([x_in, cond_in], dim=1)
         if len(mask.shape) == 2:
-            mask = mask.unsqueeze(0).expand_as(x_in[0])
+            mask = mask.unsqueeze(0).expand_as(x_in[0])  
         x1, mask1 = self.initial_conv(x_in, mask)  # (batch, 16, 100, 180)
 
     # Downsampling
@@ -246,13 +254,13 @@ class prediction(nn.Module):
         # input  (batch, n_channels_x, 100, 180)   
         self.initial_conv = InitialConv(n_channels_x, 16)
         # downsampling:
-        self.d1 = Down(16, 32)
-        self.d2 = Down(32, 64)
-        self.d3 = Down(64, 128)
-        self.d4 = Down(128, 256)
+        self.d1 = Down(16, 32, return_skip = True)
+        self.d2 = Down(32, 64, return_skip = True)
+        self.d3 = Down(64, 128, return_skip = True)
+        self.d4 = Down(128, 256, return_skip = True)
         # self.d5 = Down(256, 512)
         # last conv of downsampling
-        self.last_conv_down = DoubleConvNext(256, 256,mid_channels=4*256, multi_channel=True, return_mask=False)
+        self.last_conv_down = DoubleConvNext(256, 256,mid_channels=4*256, multi_channel=False, return_mask=False)
         # upsampling:
         self.up1 = Up(512, 128)
         self.up2 = Up(256, 64)
@@ -267,7 +275,7 @@ class prediction(nn.Module):
         else:
             x_in = x
         if len(mask.shape) == 2:
-            mask = mask.unsqueeze(0).expand_as(x_in[0])
+            mask = mask.unsqueeze(0)#.expand_as(x_in[0])  ## Uncomment if multi_channel is True
         x1, mask1 = self.initial_conv(x_in, mask)  # (batch, 16, 100, 180)
 
     # Downsampling
@@ -301,14 +309,14 @@ class prediction_NPS(nn.Module):
         self.initial_conv = InitialConv(n_channels_x, 16)
 
         # downsampling:
-        self.d1 = Down(16, 32)
-        self.d2 = Down(32, 64)
-        self.d3 = Down(64, 128)
-        self.d4 = Down(128, 256)
-        self.d5 = Down(256, 512)
+        self.d1 = Down(16, 32, return_skip = True)
+        self.d2 = Down(32, 64, return_skip = True)
+        self.d3 = Down(64, 128, return_skip = True)
+        self.d4 = Down(128, 256, return_skip = True)
+        self.d5 = Down(256, 512, return_skip = True)
 
         # last conv of downsampling
-        self.last_conv_down = DoubleConvNext(512, 512,mid_channels=4*512, multi_channel=True, return_mask=False)
+        self.last_conv_down = DoubleConvNext(512, 512,mid_channels=4*512, multi_channel=False, return_mask=False)
 
         # upsampling:
 
@@ -326,7 +334,7 @@ class prediction_NPS(nn.Module):
         else:
             x_in = x
         if len(mask.shape) == 2:
-            mask = mask.unsqueeze(0).expand_as(x_in[0])
+            mask = mask.unsqueeze(0)#.expand_as(x_in[0])   ## Uncomment if multi_channel is True
         x1, mask1 = self.initial_conv(x_in, mask)  # (batch, 16, 432, 432)
 
     # Downsampling
@@ -369,24 +377,24 @@ class DoubleConvNext(nn.Module):
             self.lambda_skip = False
             self.skip_module = PartialConv2d(in_channels=in_channels,out_channels=out_channels,kernel_size=1,bias = False, multi_channel=multi_channel, return_mask=False)
                 
-        self.conv1 = PartialConv2d(in_channels, mid_channels, kernel_size=3, bias=False, padding= 1, multi_channel=multi_channel, return_mask=True)
+        self.conv1 = PartialConv2d(in_channels, mid_channels, kernel_size=3, padding= 1, multi_channel=multi_channel, return_mask=True)
         # self.bn1 = nn.BatchNorm2d(mid_channels)
         self.bn1 = LayerNorm(mid_channels, data_format='channels_first' )
         self.act1 = nn.GELU()
         
-        self.conv2 = PartialConv2d(mid_channels, mid_channels, kernel_size=3, bias=False, padding= 1, multi_channel=True, return_mask=True)
+        self.conv2 = PartialConv2d(mid_channels, mid_channels, kernel_size=3, padding= 1, multi_channel=multi_channel, return_mask=True)
         # self.bn2 = nn.BatchNorm2d(mid_channels)
         self.bn2 = LayerNorm(mid_channels, data_format='channels_first' )
         self.act2 = nn.GELU()
 
-        self.mlp = nn.Conv2d(mid_channels, out_channels, kernel_size=1, bias=False)
+        self.mlp = PartialConv2d(in_channels=mid_channels,out_channels=out_channels,kernel_size=1,bias = False, multi_channel=multi_channel, return_mask=True)
+        # self.mlp = nn.Conv2d(mid_channels, out_channels, kernel_size=1, bias=False)
 
         if VAE_latent_size is not None:
             # self.bn_vae = nn.BatchNorm2d(out_channels)
             self.bn_vae = LayerNorm(out_channels, data_format='channels_first' )
             self.acr_vae = nn.ReLU(inplace = True)
-            # self.mu = PartialConv2d(out_channels, out_channels, kernel_size=1, bias=False, multi_channel=True, return_mask=False)
-            # self.log_var = PartialConv2d(out_channels, out_channels, kernel_size=1, bias=False, multi_channel=True, return_mask=False)
+
             if VAE_MLP_input_dim is not None:
                 self.mu = nn.Linear(VAE_MLP_input_dim, VAE_latent_size, bias=False ) 
                 self.log_var = nn.Linear(VAE_MLP_input_dim, VAE_latent_size, bias=False ) 
@@ -405,14 +413,14 @@ class DoubleConvNext(nn.Module):
             x, mask = self.conv1(x, mask)
             x = self.bn1(x)
             x = self.act1(x)
-            if not self.multi_channel:
-                mask = None
+            # if not self.multi_channel:    ### Uncomment if multi_channel is True
+            #     mask = None
             x, mask = self.conv2(x, mask)
             x = self.bn2(x)
             x = self.act2(x)
 
-            # x= self.mlp(x, mask)
-            x= self.mlp(x)
+            x, mask= self.mlp(x, mask)
+            # x= self.mlp(x)
             x = x + skip
 
             if self.VAE_latent_size:
@@ -430,26 +438,29 @@ class DoubleConvNext(nn.Module):
                 else:
                     return x
 
-##########################################################################################################
+
 class Down(nn.Module):
-		"""Downscaling with double conv then maxpool"""
+        """Downscaling with double conv then maxpool"""
 
-		def __init__(self, in_channels, out_channels, pooling_padding = 0):
-				super().__init__()
-				self.pool = PartialConv2d(out_channels, out_channels, kernel_size=2, stride = 2, padding=pooling_padding,  multi_channel=True, return_mask=True)
-				self.doubleconv = DoubleConvNext(in_channels, out_channels,mid_channels= 4 * in_channels, multi_channel=True, return_mask=True)	
-		def forward(self, x, mask):
-				x1, mask1 = self.doubleconv(x, mask)
-				x2, mask2 = self.pool(x1, mask1)
-				return x2, x1, mask2, mask1
-
+        def __init__(self, in_channels, out_channels, pooling_padding = 0, multi_channel = False, return_skip = False):
+                super().__init__()
+                self.return_skip = return_skip
+                self.pool = PartialConv2d(out_channels, out_channels, kernel_size=2, stride = 2, padding=pooling_padding,  multi_channel=multi_channel, return_mask=True)
+                self.doubleconv = DoubleConvNext(in_channels, out_channels,mid_channels= 4 * in_channels, multi_channel=multi_channel, return_mask=True)	
+        def forward(self, x, mask):
+                x1, mask1 = self.doubleconv(x, mask)
+                x2, mask2 = self.pool(x1, mask1)
+                if self.return_skip:
+                    return x2, x1, mask2, mask1
+                else:
+                    return x2, mask2
 
 class Up(nn.Module):
     """Upscaling then double conv"""
     def __init__(self, in_channels, out_channels, up_kernel = 3):
             super().__init__()
             self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-            self.conv_mid = PartialConv2d(in_channels, in_channels, kernel_size=3, padding=  1, bias = False, multi_channel = True, return_mask = True)
+            self.conv_mid = PartialConv2d(in_channels, in_channels, kernel_size=3, padding=  1, multi_channel = True, return_mask = True)
             self.conv = DoubleConvNext(in_channels, out_channels, mid_channels=4 * in_channels, multi_channel=True, return_mask=False)
     
     def forward(self, x, x2 = None, mask2 = None, pad = None):# input is CHW
@@ -463,6 +474,7 @@ class Up(nn.Module):
                                             diffY // 2, diffY - diffY // 2])
             mask = F.pad(mask, [diffX // 2, diffX - diffX // 2,
                             diffY // 2, diffY - diffY // 2])
+            mask2 = mask2.expand_as(x2[0]) 
         
             x = torch.cat([x2, x], dim=1)
             mask = torch.cat([mask2, mask], dim=0)         
@@ -478,9 +490,9 @@ class Up(nn.Module):
 		
 
 class InitialConv(nn.Module):
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, in_channels, out_channels, multi_channel = False):
             super().__init__()
-            self.firstconv = PartialConv2d(in_channels, out_channels ,kernel_size=3, padding= [1,0], multi_channel=True, return_mask=True)
+            self.firstconv = PartialConv2d(in_channels, out_channels ,kernel_size=3, padding= [1,0], multi_channel=multi_channel, return_mask=True)
             # self.BN = nn.BatchNorm2d(out_channels)
             self.BN = LayerNorm(out_channels, data_format='channels_first' ) 
             self.activation = nn.ReLU(inplace=True)

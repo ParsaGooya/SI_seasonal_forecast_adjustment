@@ -446,6 +446,8 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
     epoch_loss_val_MSE_generated = []
     step = 0
     num_batches = len(dataloader)
+    model_mask_ = torch.from_numpy(model_mask.to_numpy()).unsqueeze(0)#.expand(n_channels_x + add_feature_dim,*model_mask.shape)  ## Uncomment if multi_channel is True
+    obs_mask = torch.from_numpy(land_mask.to_numpy()).unsqueeze(0) ## Uncomment if multi_channel is True
 
     for epoch in tqdm.tqdm(range(epochs)):
 
@@ -464,10 +466,6 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
         batch_loss = 0
         batch_MSE = 0
         batch_KLD = 0
-
-        model_mask_ = torch.from_numpy(model_mask.to_numpy()).unsqueeze(0).expand(n_channels_x + add_feature_dim,*model_mask.shape)
-        obs_mask = torch.from_numpy(land_mask.to_numpy()).unsqueeze(0)
-
         for batch, (x, y) in enumerate(dataloader):
             if (type(x) == list) or (type(x) == tuple):
                 x = (x[0].to(device), x[1].to(device)) 
@@ -483,7 +481,7 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
                 m  = None
 
             optimizer.zero_grad()
-            obs_mask = obs_mask.to(y).expand_as(y[0])
+            obs_mask = obs_mask.to(y)#.expand_as(y[0])    ## Uncomment if multi_channel is True
             generated_output, deterministic_output, mu, log_var , cond_mu, cond_log_var = net(y, obs_mask, x, model_mask_, sample_size = params['training_sample_size'] )
             if params['combined_prediction']:
                 (y, y_extent) = (y[:,0].unsqueeze(1), y[:,1].unsqueeze(1))

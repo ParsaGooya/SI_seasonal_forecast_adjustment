@@ -30,7 +30,7 @@ class UNet2(nn.Module):
 			# self.d5 = Down(256, 512)
 
 			# last conv of downsampling
-			self.last_conv_down = DoubleConvNext(512,  multi_channel=True, return_mask=False)
+			self.last_conv_down = DoubleConvNext(512,  multi_channel=False, return_mask=False)
 
 			# upsampling:
 			if bilinear:
@@ -56,7 +56,7 @@ class UNet2(nn.Module):
 				x_in = torch.cat([x[0], x[1]], dim=1)
 			else:
 				x_in = x
-			mask = mask.unsqueeze(0).expand_as(x_in[0])
+			mask = mask.unsqueeze(0)#.expand_as(x_in[0])      # uncomment if multichannel is True
 			x1, mask1 = self.initial_conv(x_in, mask)  # (batch, 32, 100, 180)
 
 		# Downsampling
@@ -109,7 +109,7 @@ class UNet2_NPS(nn.Module):
 			self.d5 = Down(512, 1024, skip_conv=skip_conv)
 
 			# last conv of downsampling
-			self.last_conv_down = DoubleConvNext(1024,  multi_channel=True, return_mask=False)
+			self.last_conv_down = DoubleConvNext(1024,  multi_channel=False, return_mask=False)
 
 			# upsampling:
 			if bilinear:
@@ -138,7 +138,7 @@ class UNet2_NPS(nn.Module):
 				x_in = torch.cat([x[0], x[1]], dim=1)
 			else:
 				x_in = x
-			mask = mask.unsqueeze(0).expand_as(x_in[0])
+			mask = mask.unsqueeze(0)#.expand_as(x_in[0])   # uncomment if multichannel is True
 			x1, mask1 = self.initial_conv(x_in, mask)  # (batch, 32, 432, 432)
 
 		# Downsampling
@@ -177,7 +177,7 @@ class InitialConv(nn.Module):
 		def __init__(self, in_channels, out_channels):
 				super().__init__()
 
-				self.firstconv = PartialConv2d(in_channels, out_channels ,kernel_size=3, padding= [1,0], multi_channel=True, return_mask=True)
+				self.firstconv = PartialConv2d(in_channels, out_channels ,kernel_size=3, padding= [1,0], multi_channel=False, return_mask=True)
 				self.BN = nn.BatchNorm2d(out_channels)
 				self.activation = nn.ReLU(inplace=True)
 				
@@ -199,7 +199,7 @@ class Up(nn.Module):
 				# if bilinear, use the normal convolutions to reduce the number of channels
 				if bilinear:
 						self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-						self.conv_mid = PartialConv2d(in_channels + concat_channel, out_channels, kernel_size=3, padding=  1, bias = False, multi_channel = True, return_mask = True)
+						self.conv_mid = PartialConv2d(in_channels + concat_channel, out_channels, kernel_size=3, padding=  1, multi_channel = True, return_mask = True)
 						self.conv = DoubleConvNext(out_channels,  multi_channel=True, return_mask=False)
 						self.conv_mid.apply(weights_init)
 
@@ -224,6 +224,7 @@ class Up(nn.Module):
 													diffY // 2, diffY - diffY // 2])
 					mask1 = F.pad(mask1, [diffX // 2, diffX - diffX // 2,
 									diffY // 2, diffY - diffY // 2])
+					mask2 = mask2.expand_as(x2[0])
 				
 					x = torch.cat([x2, x], dim=1)
 					mask1 = torch.cat([mask2, mask1], dim=0)
@@ -244,13 +245,13 @@ class Down(nn.Module):
 		def __init__(self, in_channels, out_channels,  skip_conv = False, pooling_padding = 0):
 				super().__init__()
 				self.skip_conv = False
-				self.doubleconv = DoubleConvNext(in_channels, multi_channel=True, return_mask=True)
-				self.pool = PartialConv2d(in_channels, out_channels, kernel_size=2, stride = 2, padding=pooling_padding,  multi_channel=True, return_mask=True)
+				self.doubleconv = DoubleConvNext(in_channels, multi_channel=False, return_mask=True)
+				self.pool = PartialConv2d(in_channels, out_channels, kernel_size=2, stride = 2, padding=pooling_padding,  multi_channel=False, return_mask=True)
 				# self.maxpool = nn.MaxPool2d(2,stride = 2, padding = pooling_padding)
 				
 				if skip_conv:
 					self.skip_conv = True
-					self.skipconv = DoubleConvNext(out_channels, multi_channel=True, return_mask=True)
+					self.skipconv = DoubleConvNext(out_channels, multi_channel=False, return_mask=True)
 				
 				self.pool.apply(weights_init)
 			
@@ -301,12 +302,12 @@ class DoubleConvNext(nn.Module):
 				self.return_mask = return_mask
 				self.multi_channel = multi_channel
 				self.block1 = Block( in_channels,  multi_channel = multi_channel, return_mask = True )
-				self.block2 = Block( in_channels,  multi_channel = True, return_mask = return_mask )
+				self.block2 = Block( in_channels,  multi_channel = multi_channel, return_mask = return_mask )
 					
 		def forward(self, x, mask = None):				
 				x, mask = self.block1(x, mask)
-				if not self.multi_channel:
-					mask = None
+				# if not self.multi_channel:
+				# 	mask = None
 				if self.return_mask:
 					x, mask = self.block2(x, mask)
 					return x, mask

@@ -447,8 +447,8 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                 num_batches = len(dataloader)
                 step = 0
 
-                model_mask_ = torch.from_numpy(model_mask.to_numpy()).unsqueeze(0).expand(n_channels_x + add_feature_dim,*model_mask.shape)
-                obs_mask = torch.from_numpy(land_mask.to_numpy()).unsqueeze(0)
+                model_mask_ = torch.from_numpy(model_mask.to_numpy()).unsqueeze(0)#.expand(n_channels_x + add_feature_dim,*model_mask.shape)  ## Uncomment if multi_channel is True
+                obs_mask = torch.from_numpy(land_mask.to_numpy()).unsqueeze(0) ## Uncomment if multi_channel is True
 
                 for epoch in tqdm.tqdm(range(epochs)):
                     batch_loss = 0
@@ -482,7 +482,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                             m  = None
 
                         optimizer.zero_grad()
-                        obs_mask = obs_mask.to(y).expand_as(y[0])
+                        obs_mask = obs_mask.to(y)#.expand_as(y[0])   ## Uncomment if multi_channel is True
                         generated_output, deterministic_output, mu, log_var , cond_mu, cond_log_var = net(y, obs_mask, x, model_mask_, sample_size = params['training_sample_size'] )
                         if params['combined_prediction']:
                             (y, y_extent) = (y[:,0].unsqueeze(1), y[:,1].unsqueeze(1))
@@ -743,7 +743,7 @@ if __name__ == "__main__":
         'VAE_latent_size' : 50,
         'VAE_MLP_encoder' : False,
         'BVAE' : 50,
-        'training_sample_size' : 10, 
+        'training_sample_size' : 1, 
         'loss_reduction' : 'mean' , # mean or sum
         'combined_prediction' : False
     }
