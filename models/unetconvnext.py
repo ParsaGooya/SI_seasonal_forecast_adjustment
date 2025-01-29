@@ -356,8 +356,9 @@ class Block(nn.Module):
 
 
 class LayerNorm(nn.Module):
-	r""" Adopted from https://github.com/facebookresearch/ConvNeXt/blob/main/models/convnext.py
-    LayerNorm that supports two data formats: channels_last (default) or channels_first. 
+	
+    r""" Adopted from https://github.com/facebookresearch/ConvNeXt/blob/main/models/convnext.py
+	LayerNorm that supports two data formats: channels_last (default) or channels_first. 
     The ordering of the dimensions in the inputs. channels_last corresponds to inputs with 
     shape (batch_size, height, width, channels) while channels_first corresponds to inputs 
     with shape (batch_size, channels, height, width).

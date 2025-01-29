@@ -347,10 +347,10 @@ class prediction_NPS(nn.Module):
         return x
     
 
-##################### from https://github.com/m2lines/Samudra/blob/main/samudra/model.py ######################
+
 
 class DoubleConvNext(nn.Module):
-	
+    r"""Adopted from from https://github.com/m2lines/Samudra/blob/main/samudra/model.py"""
     def __init__(self, in_channels, out_channels, mid_channels=None, multi_channel=False, return_mask=False, VAE_latent_size = None, VAE_MLP_input_dim = None):
         super().__init__()
         self.VAE_latent_size = VAE_latent_size
@@ -522,7 +522,8 @@ class OutConv(nn.Module):
             return self.conv2(x)
         
 class LayerNorm(nn.Module):
-    r""" LayerNorm that supports two data formats: channels_last (default) or channels_first. 
+    r""" Adopted from https://github.com/facebookresearch/ConvNeXt/blob/main/models/convnext.py
+	LayerNorm that supports two data formats: channels_last (default) or channels_first. 
     The ordering of the dimensions in the inputs. channels_last corresponds to inputs with 
     shape (batch_size, height, width, channels) while channels_first corresponds to inputs 
     with shape (batch_size, channels, height, width).
