@@ -838,7 +838,7 @@ if __name__ == "__main__":
     hyperparameterspace = config_grid(config_dict).full_grid()
 
     ##################################################################  Adjust the path if necessary #############3##############################################
-    out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_2_convnext/Model_tunning/'
+    out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_3_convnext/Model_tunning/'
     if lead_time is None:
         out_dir = out_dir_x + f'NV{params["num_val_years"]}_M{lead_months}_{params["subset_dimensions"]}_v{params["version"]}'
     else:

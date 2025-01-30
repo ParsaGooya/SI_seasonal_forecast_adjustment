@@ -759,7 +759,7 @@ if __name__ == "__main__":
     obs_ref = 'NASA'
     NPSProj = True
     
-    out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_2_convnext'
+    out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_3_convnext'
 
     # for lead_time in np.arange(10,13):
     if lead_time is None:

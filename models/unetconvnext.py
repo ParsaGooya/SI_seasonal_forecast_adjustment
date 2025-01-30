@@ -178,7 +178,8 @@ class InitialConv(nn.Module):
 				super().__init__()
 
 				self.firstconv = PartialConv2d(in_channels, out_channels ,kernel_size=3, padding= [1,0], multi_channel=False, return_mask=True)
-				self.BN = nn.BatchNorm2d(out_channels)
+				# self.BN = nn.BatchNorm2d(out_channels)
+				self.BN = LayerNorm(out_channels, eps=1e-6, data_format='channels_first')
 				self.activation = nn.ReLU(inplace=True)
 				
 		def forward(self, x, mask):

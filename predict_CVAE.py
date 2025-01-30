@@ -362,7 +362,7 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
 
     dataloader = DataLoader(test_set, batch_size=len(lead_times), shuffle=False)
 
-    model_mask_ = torch.from_numpy(model_mask.to_numpy()).unsqueeze(0).expand(n_channels_x + add_feature_dim,*model_mask.shape)
+    model_mask_ = torch.from_numpy(model_mask.to_numpy()).unsqueeze(0)#.expand(n_channels_x + add_feature_dim,*model_mask.shape) ## uncomment if multichannel true
     obs_mask = torch.from_numpy(land_mask.to_numpy()).unsqueeze(0)
 
     for time_id, (x, target) in enumerate(dataloader): 

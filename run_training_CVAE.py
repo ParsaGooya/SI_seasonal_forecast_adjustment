@@ -725,12 +725,12 @@ if __name__ == "__main__":
         "ensemble_features": False, ## PG
         'ensemble_list' : None, ## PG
         'ensemble_mode' : 'Mean',
-        "epochs": 100,
+        "epochs": 50,
         "batch_size": 10,
         "reg_scale" : None,
         "beta" : 1,
         "optimizer": torch.optim.Adam,
-        "lr": 0.001 ,
+        "lr": 0.0001 ,
         "loss_function" :'MSE',
         "loss_region": None,
         "subset_dims": 'North',   ## North or South or Global

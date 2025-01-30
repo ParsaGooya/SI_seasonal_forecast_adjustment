@@ -6,21 +6,21 @@ from models.partialconv2d import PartialConv2d
 
 class cVAE(nn.Module):
 	
-    def __init__( self, VAE_latent_size, n_channels_x=1 ,  sigmoid = True, NPS_proj = False, device = 'cpu', combined_prediction = False, VAE_MLP_encoder = False ):
+    def __init__( self, VAE_latent_size, n_channels_x=1 ,  sigmoid = True, NPS_proj = False,scale_factor_channels = None, combined_prediction = False, VAE_MLP_encoder = False, device = 'cpu' ):
         super().__init__()
         self.combined_prediction = combined_prediction
         self.VAE_MLP_encoder = VAE_MLP_encoder
         self.n_channels_x = n_channels_x
         if not NPS_proj:
-            self.unet = prediction(n_channels_x, sigmoid, )
-            self.recognition = prior_recognition(n_channels_x + 1, sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder)
-            self.prior = prior_recognition(n_channels_x + 1, sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder)
-            self.generation = generation(sigmoid = sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder)
+            self.unet = prediction(n_channels_x, sigmoid, scale_factor_channels = scale_factor_channels )
+            self.recognition = prior_recognition(n_channels_x + 1, sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder, scale_factor_channels = scale_factor_channels)
+            self.prior = prior_recognition(n_channels_x + 1, sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder, scale_factor_channels = scale_factor_channels)
+            self.generation = generation(sigmoid = sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder, scale_factor_channels = scale_factor_channels)
         else:
-            self.unet = prediction_NPS(n_channels_x, sigmoid)
-            self.recognition = prior_recognition_NPS(n_channels_x + 1, sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder)
-            self.prior = prior_recognition_NPS(n_channels_x + 1, sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder)
-            self.generation = generation_NPS(sigmoid = sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder)	
+            self.unet = prediction_NPS(n_channels_x, sigmoid, scale_factor_channels = scale_factor_channels)
+            self.recognition = prior_recognition_NPS(n_channels_x + 1, sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder, scale_factor_channels = scale_factor_channels)
+            self.prior = prior_recognition_NPS(n_channels_x + 1, sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder, scale_factor_channels = scale_factor_channels)
+            self.generation = generation_NPS(sigmoid = sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder, scale_factor_channels = scale_factor_channels)	
 				
         self.last_conv = OutConv(16, 1, sigmoid = sigmoid, NPS_proj= NPS_proj)
         if combined_prediction:
@@ -91,7 +91,7 @@ class cVAE(nn.Module):
 
 class generation(nn.Module):
 		
-    def __init__( self, VAE_latent_size,  sigmoid = True, VAE_MLP_encoder = False  ):
+    def __init__( self, VAE_latent_size,  sigmoid = True, VAE_MLP_encoder = False, scale_factor_channels = 2  ):
         
         super().__init__()
         self.VAE_MLP_encoder = VAE_MLP_encoder
@@ -99,15 +99,15 @@ class generation(nn.Module):
             self.combine = nn.Linear(VAE_latent_size, 256 * 6*11)
         else:
             self.combine = nn.Conv2d(VAE_latent_size, 256, kernel_size=1)
-        self.up1 = Up(256, 128)
-        self.up2 = Up(128, 64)
-        self.up3 = Up(64, 32)
-        self.up4 = Up(32, 16)
+        self.up1 = Up(256, 128, scale_factor_channels = scale_factor_channels)
+        self.up2 = Up(128, 64, scale_factor_channels = scale_factor_channels)
+        self.up3 = Up(64, 32, scale_factor_channels = scale_factor_channels)
+        self.up4 = Up(32, 16, scale_factor_channels = scale_factor_channels)
             # self last layer:	
     def forward(self, z):
         # Upsampling
         x = self.combine(z)
-        if self.VAE_MLP_encoder is not None:
+        if self.VAE_MLP_encoder:
             x = torch.unflatten(x, dim = 1, sizes = (256,6,11))
         x = self.up1(x)  # (batch, 128, 12, 22)
         x = self.up2(x, pad = (0,1,0,1))  # (batch, 64, 25, 45)
@@ -117,7 +117,7 @@ class generation(nn.Module):
 	
 class generation_NPS(nn.Module):
 		
-    def __init__( self, VAE_latent_size,   sigmoid = True, VAE_MLP_encoder = False   ):
+    def __init__( self, VAE_latent_size,   sigmoid = True, VAE_MLP_encoder = False , scale_factor_channels = 2  ):
 
         super().__init__()
         self.VAE_MLP_encoder = VAE_MLP_encoder
@@ -125,16 +125,16 @@ class generation_NPS(nn.Module):
             self.combine = nn.Linear(VAE_latent_size, 512 * 13*13)
         else:
             self.combine = nn.Conv2d(VAE_latent_size, 512, kernel_size=1)
-        self.up1 = Up(512, 256)
-        self.up2 = Up(256, 128)
-        self.up3 = Up(128, 64)
-        self.up4 = Up(64, 32)
-        self.up5 = Up(32, 16)
+        self.up1 = Up(512, 256, scale_factor_channels = scale_factor_channels)
+        self.up2 = Up(256, 128, scale_factor_channels = scale_factor_channels)
+        self.up3 = Up(128, 64, scale_factor_channels = scale_factor_channels)
+        self.up4 = Up(64, 32, scale_factor_channels = scale_factor_channels)
+        self.up5 = Up(32, 16, scale_factor_channels = scale_factor_channels)
 
             # self last layer:	
     def forward(self, z):
         x = self.combine(z)
-        if self.VAE_MLP_encoder is not None:
+        if self.VAE_MLP_encoder:
             x = torch.unflatten(x, dim = 1, sizes = (512,13,13))
         # Upsampling
         x = self.up1(x, pad = (0,1,0,1))  # (batch, 256, 27, 27)
@@ -147,17 +147,17 @@ class generation_NPS(nn.Module):
 
 class prior_recognition(nn.Module):
  
-    def __init__( self,  n_channels_x=1 ,  sigmoid = True, VAE_latent_size = None, VAE_MLP_encoder = False ):
+    def __init__( self,  n_channels_x=1 ,  sigmoid = True, VAE_latent_size = None, VAE_MLP_encoder = False, scale_factor_channels = 2 ):
         
         super().__init__()
         self.n_channels_x = n_channels_x 
         # input  (batch, n_channels_x, 100, 180)   
         self.initial_conv = InitialConv(n_channels_x, 16, multi_channel = True)
         # downsampling:
-        self.d1 = Down(16, 32, multi_channel = True)
-        self.d2 = Down(32, 64, multi_channel = True)
-        self.d3 = Down(64, 128, multi_channel = True)
-        self.d4 = Down(128, 256, multi_channel = True)
+        self.d1 = Down(16, 32, multi_channel = True, scale_factor_channels = scale_factor_channels)
+        self.d2 = Down(32, 64, multi_channel = True, scale_factor_channels = scale_factor_channels)
+        self.d3 = Down(64, 128, multi_channel = True, scale_factor_channels = scale_factor_channels)
+        self.d4 = Down(128, 256, multi_channel = True, scale_factor_channels = scale_factor_channels)
         # self.d5 = Down(256, 512)
         # last conv of downsampling
         if VAE_latent_size is None:
@@ -166,7 +166,11 @@ class prior_recognition(nn.Module):
             self.VAE_MLP_input_dim = 6 * 11 * 256
         else:
             self.VAE_MLP_input_dim = None
-        self.last_conv_down = DoubleConvNext(256, 256, mid_channels=4 * 256, multi_channel=True, return_mask=False, VAE_latent_size = VAE_latent_size, VAE_MLP_input_dim = self.VAE_MLP_input_dim)
+        if scale_factor_channels is None:
+             mid_channels = None
+        else:
+             mid_channels = scale_factor_channels * 256
+        self.last_conv_down = DoubleConvNext(256, 256, mid_channels=mid_channels, multi_channel=True, return_mask=False, VAE_latent_size = VAE_latent_size, VAE_MLP_input_dim = self.VAE_MLP_input_dim)
 
 
     def forward(self, x, cond, mask):
@@ -197,18 +201,18 @@ class prior_recognition(nn.Module):
 	
 class prior_recognition_NPS(nn.Module):
  
-    def __init__( self,  n_channels_x=1 ,  sigmoid = True, VAE_latent_size = None, VAE_MLP_encoder = False ):
+    def __init__( self,  n_channels_x=1 ,  sigmoid = True, VAE_latent_size = None, VAE_MLP_encoder = False, scale_factor_channels = 2 ):
         
         super().__init__()
         self.n_channels_x = n_channels_x 
         # input  (batch, n_channels_x, 100, 180)   
         self.initial_conv = InitialConv(n_channels_x, 16, multi_channel = True)
         # downsampling:
-        self.d1 = Down(16, 32, multi_channel = True)
-        self.d2 = Down(32, 64, multi_channel = True)
-        self.d3 = Down(64, 128, multi_channel = True)
-        self.d4 = Down(128, 256, multi_channel = True)
-        self.d5 = Down(256, 512, multi_channel = True)
+        self.d1 = Down(16, 32, multi_channel = True, scale_factor_channels = scale_factor_channels)
+        self.d2 = Down(32, 64, multi_channel = True, scale_factor_channels = scale_factor_channels)
+        self.d3 = Down(64, 128, multi_channel = True, scale_factor_channels = scale_factor_channels)
+        self.d4 = Down(128, 256, multi_channel = True, scale_factor_channels = scale_factor_channels)
+        self.d5 = Down(256, 512, multi_channel = True, scale_factor_channels = scale_factor_channels)
         # last conv of downsampling
         if VAE_latent_size is None:
               VAE_latent_size = 512
@@ -216,7 +220,11 @@ class prior_recognition_NPS(nn.Module):
             self.VAE_MLP_input_dim = 13 * 13 * 512
         else:
             self.VAE_MLP_input_dim = None
-        self.last_conv_down = DoubleConvNext(512, 512,mid_channels=4*512, multi_channel=True, return_mask=False, VAE_latent_size = VAE_latent_size, VAE_MLP_input_dim = self.VAE_MLP_input_dim)
+        if scale_factor_channels is None:
+             mid_channels = None
+        else:
+             mid_channels = scale_factor_channels * 512
+        self.last_conv_down = DoubleConvNext(512, 512,mid_channels=mid_channels, multi_channel=True, return_mask=False, VAE_latent_size = VAE_latent_size, VAE_MLP_input_dim = self.VAE_MLP_input_dim)
 
     def forward(self, x, cond, mask):
     # input  (batch, n_channels_x, 100, 180)
@@ -247,25 +255,29 @@ class prior_recognition_NPS(nn.Module):
 class prediction(nn.Module):
 	
     
-    def __init__( self,  n_channels_x=1 ,  sigmoid = True ):
+    def __init__( self,  n_channels_x=1 ,  sigmoid = True , scale_factor_channels = 2):
         
         super().__init__()
         self.n_channels_x = n_channels_x
         # input  (batch, n_channels_x, 100, 180)   
         self.initial_conv = InitialConv(n_channels_x, 16)
         # downsampling:
-        self.d1 = Down(16, 32, return_skip = True)
-        self.d2 = Down(32, 64, return_skip = True)
-        self.d3 = Down(64, 128, return_skip = True)
-        self.d4 = Down(128, 256, return_skip = True)
+        self.d1 = Down(16, 32, return_skip = True, scale_factor_channels = scale_factor_channels)
+        self.d2 = Down(32, 64, return_skip = True, scale_factor_channels = scale_factor_channels)
+        self.d3 = Down(64, 128, return_skip = True, scale_factor_channels = scale_factor_channels)
+        self.d4 = Down(128, 256, return_skip = True, scale_factor_channels = scale_factor_channels)
         # self.d5 = Down(256, 512)
         # last conv of downsampling
-        self.last_conv_down = DoubleConvNext(256, 256,mid_channels=4*256, multi_channel=False, return_mask=False)
+        if scale_factor_channels is None:
+             mid_channels = None
+        else:
+             mid_channels = scale_factor_channels *256
+        self.last_conv_down = DoubleConvNext(256, 256,mid_channels=mid_channels, multi_channel=False, return_mask=False)
         # upsampling:
-        self.up1 = Up(512, 128)
-        self.up2 = Up(256, 64)
-        self.up3 = Up(128, 32)
-        self.up4 = Up(64, 16)
+        self.up1 = Up(512, 128, scale_factor_channels = scale_factor_channels)
+        self.up2 = Up(256, 64, scale_factor_channels = scale_factor_channels)
+        self.up3 = Up(128, 32, scale_factor_channels = scale_factor_channels)
+        self.up4 = Up(64, 16, scale_factor_channels = scale_factor_channels)
 			# self last layer:		
 
     def forward(self, x, mask):
@@ -298,7 +310,7 @@ class prediction(nn.Module):
 class prediction_NPS(nn.Module):
 	
     
-    def __init__( self,  n_channels_x=1 ,  sigmoid = True ):
+    def __init__( self,  n_channels_x=1 ,  sigmoid = True, scale_factor_channels = 2 ):
         
         super().__init__()
         self.n_channels_x = n_channels_x
@@ -309,22 +321,25 @@ class prediction_NPS(nn.Module):
         self.initial_conv = InitialConv(n_channels_x, 16)
 
         # downsampling:
-        self.d1 = Down(16, 32, return_skip = True)
-        self.d2 = Down(32, 64, return_skip = True)
-        self.d3 = Down(64, 128, return_skip = True)
-        self.d4 = Down(128, 256, return_skip = True)
-        self.d5 = Down(256, 512, return_skip = True)
-
+        self.d1 = Down(16, 32, return_skip = True, scale_factor_channels = scale_factor_channels)
+        self.d2 = Down(32, 64, return_skip = True, scale_factor_channels = scale_factor_channels)
+        self.d3 = Down(64, 128, return_skip = True, scale_factor_channels = scale_factor_channels)
+        self.d4 = Down(128, 256, return_skip = True, scale_factor_channels = scale_factor_channels)
+        self.d5 = Down(256, 512, return_skip = True, scale_factor_channels = scale_factor_channels)
+        if scale_factor_channels is None:
+             mid_channels = None
+        else:
+             mid_channels = scale_factor_channels *512
         # last conv of downsampling
-        self.last_conv_down = DoubleConvNext(512, 512,mid_channels=4*512, multi_channel=False, return_mask=False)
+        self.last_conv_down = DoubleConvNext(512, 512,mid_channels=mid_channels, multi_channel=False, return_mask=False)
 
         # upsampling:
 
-        self.up1 = Up(1024, 256)
-        self.up2 = Up(512, 128)
-        self.up3 = Up(256, 64)
-        self.up4 = Up(128, 32)
-        self.up5 = Up(64, 16)
+        self.up1 = Up(1024, 256, scale_factor_channels = scale_factor_channels)
+        self.up2 = Up(512, 128, scale_factor_channels = scale_factor_channels)
+        self.up3 = Up(256, 64, scale_factor_channels = scale_factor_channels)
+        self.up4 = Up(128, 32, scale_factor_channels = scale_factor_channels)
+        self.up5 = Up(64, 16, scale_factor_channels = scale_factor_channels)
 			# self last layer:
 				
     def forward(self, x, mask, ind = None):
@@ -442,11 +457,15 @@ class DoubleConvNext(nn.Module):
 class Down(nn.Module):
         """Downscaling with double conv then maxpool"""
 
-        def __init__(self, in_channels, out_channels, pooling_padding = 0, multi_channel = False, return_skip = False):
+        def __init__(self, in_channels, out_channels, pooling_padding = 0, multi_channel = False, return_skip = False, scale_factor_channels = 2):
                 super().__init__()
                 self.return_skip = return_skip
+                if scale_factor_channels is None:
+                     mid_channels = None
+                else:
+                     mid_channels = scale_factor_channels * in_channels
                 self.pool = PartialConv2d(out_channels, out_channels, kernel_size=2, stride = 2, padding=pooling_padding,  multi_channel=multi_channel, return_mask=True)
-                self.doubleconv = DoubleConvNext(in_channels, out_channels,mid_channels= 4 * in_channels, multi_channel=multi_channel, return_mask=True)	
+                self.doubleconv = DoubleConvNext(in_channels, out_channels,mid_channels= mid_channels, multi_channel=multi_channel, return_mask=True)	
         def forward(self, x, mask):
                 x1, mask1 = self.doubleconv(x, mask)
                 x2, mask2 = self.pool(x1, mask1)
@@ -457,11 +476,15 @@ class Down(nn.Module):
 
 class Up(nn.Module):
     """Upscaling then double conv"""
-    def __init__(self, in_channels, out_channels, up_kernel = 3):
+    def __init__(self, in_channels, out_channels, up_kernel = 3, scale_factor_channels = 2):
             super().__init__()
+            if scale_factor_channels is None:
+                mid_channels = None
+            else:
+                mid_channels = scale_factor_channels * in_channels
             self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
             self.conv_mid = PartialConv2d(in_channels, in_channels, kernel_size=3, padding=  1, multi_channel = True, return_mask = True)
-            self.conv = DoubleConvNext(in_channels, out_channels, mid_channels=4 * in_channels, multi_channel=True, return_mask=False)
+            self.conv = DoubleConvNext(in_channels, out_channels, mid_channels= mid_channels, multi_channel=True, return_mask=False)
     
     def forward(self, x, x2 = None, mask2 = None, pad = None):# input is CHW
         x = self.up(x) 
