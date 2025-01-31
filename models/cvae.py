@@ -32,7 +32,7 @@ class cVAE(nn.Module):
             self.N.loc = self.N.loc.cuda()
             self.N.scale = self.N.scale.cuda()
         
-    def forward(self, obs, obs_mask, model, model_mask, sample_size = 1, seed = None, nstd = 1):
+    def forward(self, obs, obs_mask, model, model_mask, sample_size = 1, seed = None, nstd = 1, mode = 'CVAE'):
             
         basic_unet = self.unet(model, model_mask)
         deterministic_output = self.last_conv(basic_unet)
@@ -48,10 +48,13 @@ class cVAE(nn.Module):
         mask_recognition = torch.concat([obs_mask, model_mask], dim = 0)
         mu, log_var = self.recognition(obs, cond = model, mask = mask_recognition)
         
-        mask_prior = torch.concat([model_mask, torch.ones_like(deterministic_output[0]).to(deterministic_output)], dim = 0)
+        mask_prior = torch.concat([model_mask, obs_mask], dim = 0)
         cond_mu, cond_log_var = self.prior(model, cond = deterministic_output, mask = mask_prior)
         
-        z = self.sample( mu, log_var, sample_size, seed, nstd = nstd)
+        if mode == 'CVAE':
+            z = self.sample( mu, log_var, sample_size, seed, nstd = nstd)
+        elif mode == 'GCGN':
+            z = self.sample( cond_mu, cond_log_var, sample_size, seed, nstd = nstd) 
         out_shape = z.shape
         z = torch.flatten(z, start_dim = 0, end_dim = 1)
         out = self.generation(z)
@@ -186,7 +189,7 @@ class prior_recognition(nn.Module):
                 cond_in = cond
             x_in = torch.cat([x_in, cond_in], dim=1)
         if len(mask.shape) == 2:
-            mask = mask.unsqueeze(0).expand_as(x_in[0])    
+            mask = mask.unsqueeze(0).expand_as(x_in[0])
 
         x1, mask1 = self.initial_conv(x_in, mask)  # (batch, 16, 100, 180)
 
@@ -239,7 +242,7 @@ class prior_recognition_NPS(nn.Module):
                 cond_in = cond
             x_in = torch.cat([x_in, cond_in], dim=1)
         if len(mask.shape) == 2:
-            mask = mask.unsqueeze(0).expand_as(x_in[0])  
+            mask = mask.unsqueeze(0).expand_as(x_in[0])
         x1, mask1 = self.initial_conv(x_in, mask)  # (batch, 16, 100, 180)
 
     # Downsampling

@@ -69,35 +69,39 @@ class WeightedMSEKLD:  ## PG: penalizing negative anomalies
         self.mse = WeightedMSE(weights=weights, device=device, hyperparam=hyperparam, reduction=reduction, loss_area=loss_area)
         self.reduction = reduction
         self.device = device
-    def __call__(self, data, target, mu, log_var, cond_mu = None, cond_log_var = None, beta = 1, mask = None, return_ind_loss = False, print_loss = True, normalized_flow = None):
+    def __call__(self, data, target, mu = None, log_var = None, cond_mu = None, cond_log_var = None, beta = 1, mask = None, return_ind_loss = False, print_loss = True, normalized_flow = None):
         loss = 0
         MSE = self.mse(data, target, mask)
         loss += MSE#.mean()/(MSE.max() - MSE.min())
         if print_loss:
             print(f'MSE : {loss}')
 
-        var = (torch.exp(log_var) + 1e-4)
-        std = torch.sqrt(var)
-        shape = mu.shape
+        if any([mu is not None, log_var is not None]):
+            assert all([mu is not None, log_var is not None])
+            var = (torch.exp(log_var) + 1e-4)
+            std = torch.sqrt(var)
+            shape = mu.shape
 
-        if all([cond_mu is None, cond_log_var is None]):
-            KL = kl_divergence(
-                            Normal(torch.flatten(mu, start_dim = 1, end_dim = -1), torch.flatten(std, start_dim = 1, end_dim = -1) ),
-                            Normal(torch.zeros_like(torch.flatten(mu, start_dim = 1, end_dim = -1)), torch.ones_like(torch.flatten(mu, start_dim = 1, end_dim = -1))))
+            if all([cond_mu is None, cond_log_var is None]):
+                KL = kl_divergence(
+                                Normal(torch.flatten(mu, start_dim = 1, end_dim = -1), torch.flatten(std, start_dim = 1, end_dim = -1) ),
+                                Normal(torch.zeros_like(torch.flatten(mu, start_dim = 1, end_dim = -1)), torch.ones_like(torch.flatten(mu, start_dim = 1, end_dim = -1))))
+            else:
+                cond_var = (torch.exp(cond_log_var) + 1e-4)
+                cond_std = torch.sqrt(cond_var)
+                KL = kl_divergence(
+                                Normal(torch.flatten(mu, start_dim = 1, end_dim = -1),  torch.flatten(std, start_dim = 1, end_dim = -1)),
+                                Normal(torch.flatten(cond_mu, start_dim = 1, end_dim = -1),torch.flatten(cond_std, start_dim = 1, end_dim = -1) ))
+            if self.reduction == 'sum':
+                KL = KL.sum(dim=-1).mean()
+            if self.reduction == 'mean':
+                KL = KL.mean()
+            
+            loss += KL * beta 
+            if print_loss: 
+                print(f'KLD : {KL}')
         else:
-            cond_var = (torch.exp(cond_log_var) + 1e-4)
-            cond_std = torch.sqrt(cond_var)
-            KL = kl_divergence(
-                            Normal(torch.flatten(mu, start_dim = 1, end_dim = -1),  torch.flatten(std, start_dim = 1, end_dim = -1)),
-                            Normal(torch.flatten(cond_mu, start_dim = 1, end_dim = -1),torch.flatten(cond_std, start_dim = 1, end_dim = -1) ))
-        if self.reduction == 'sum':
-            KL = KL.sum(dim=-1).mean()
-        if self.reduction == 'mean':
-            KL = KL.mean()
-        
-        loss += KL * beta 
-        if print_loss: 
-            print(f'KLD : {KL}')
+            return_ind_loss = False
         if return_ind_loss:
             return loss, MSE, KL
         else:
@@ -177,34 +181,37 @@ class WeightedMSEKLDLowRess:  ## PG: penalizing negative anomalies
         self.mse = WeightedMSELowRess(weights=weights, device=device, hyperparam=hyperparam, reduction=reduction, loss_area=loss_area)
         self.reduction = reduction
         self.device = device
-    def __call__(self, data, target, mu, log_var, cond_mu = None, cond_log_var = None, beta = 1, mask = None, return_ind_loss = False, print_loss = True, normalized_flow = None):
+    def __call__(self, data, target, mu = None, log_var = None, cond_mu = None, cond_log_var = None, beta = 1, mask = None, return_ind_loss = False, print_loss = True, normalized_flow = None):
         loss = 0
         MSE = self.mse(data, target, mask)
         loss += MSE#.mean()/(MSE.max() - MSE.min())
         if print_loss:
             print(f'MSE : {loss}')
+        if any([mu is not None, log_var is not None]):
+            assert all([mu is not None, log_var is not None])
+            var = (torch.exp(log_var) + 1e-4)
+            std = torch.sqrt(var)
+            shape = mu.shape
 
-        var = (torch.exp(log_var) + 1e-4)
-        std = torch.sqrt(var)
-        shape = mu.shape
-
-        if all([cond_mu is None, cond_log_var is None]):
-            KL = kl_divergence(
-                            Normal(torch.flatten(mu, start_dim = 1, end_dim = -1), torch.flatten(std, start_dim = 1, end_dim = -1) ),
-                            Normal(torch.zeros_like(torch.flatten(mu, start_dim = 1, end_dim = -1)), torch.ones_like(torch.flatten(mu, start_dim = 1, end_dim = -1))))
+            if all([cond_mu is None, cond_log_var is None]):
+                KL = kl_divergence(
+                                Normal(torch.flatten(mu, start_dim = 1, end_dim = -1), torch.flatten(std, start_dim = 1, end_dim = -1) ),
+                                Normal(torch.zeros_like(torch.flatten(mu, start_dim = 1, end_dim = -1)), torch.ones_like(torch.flatten(mu, start_dim = 1, end_dim = -1))))
+            else:
+                cond_var = (torch.exp(cond_log_var) + 1e-4)
+                cond_std = torch.sqrt(cond_var)
+                KL = kl_divergence(
+                                Normal(torch.flatten(mu, start_dim = 1, end_dim = -1),  torch.flatten(std, start_dim = 1, end_dim = -1)),
+                                Normal(torch.flatten(cond_mu, start_dim = 1, end_dim = -1),torch.flatten(cond_std, start_dim = 1, end_dim = -1) ))
+            if self.reduction == 'sum':
+                KL = KL.sum(dim=-1).mean()
+            if self.reduction == 'mean':
+                KL = KL.mean()
+            loss += KL * beta 
+            if print_loss: 
+                print(f'KLD : {KL}')
         else:
-            cond_var = (torch.exp(cond_log_var) + 1e-4)
-            cond_std = torch.sqrt(cond_var)
-            KL = kl_divergence(
-                            Normal(torch.flatten(mu, start_dim = 1, end_dim = -1),  torch.flatten(std, start_dim = 1, end_dim = -1)),
-                            Normal(torch.flatten(cond_mu, start_dim = 1, end_dim = -1),torch.flatten(cond_std, start_dim = 1, end_dim = -1) ))
-        if self.reduction == 'sum':
-            KL = KL.sum(dim=-1).mean()
-        if self.reduction == 'mean':
-            KL = KL.mean()
-        loss += KL * beta 
-        if print_loss: 
-            print(f'KLD : {KL}')
+            return_ind_loss = False
         if return_ind_loss:
             return loss, MSE, KL
         else:

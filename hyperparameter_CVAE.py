@@ -382,7 +382,7 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
     n_channels_x = len(ds_train.channels)
 
 
-    net = cVAE(VAE_latent_size = params['VAE_latent_size'], n_channels_x= n_channels_x+ add_feature_dim , sigmoid = sigmoid_activation, NPS_proj = NPSProj, device=device, combined_prediction = params['combined_prediction'], VAE_MLP_encoder = params['VAE_MLP_encoder'])
+    net = cVAE(VAE_latent_size = params['VAE_latent_size'], n_channels_x= n_channels_x+ add_feature_dim , sigmoid = sigmoid_activation, NPS_proj = NPSProj, device=device, combined_prediction = params['combined_prediction'], VAE_MLP_encoder = params['VAE_MLP_encoder'], scale_factor_channels = params['scale_factor_channels'])
 
     net.to(device)
     optimizer = torch.optim.Adam(net.parameters(), lr=lr, weight_decay = l2_reg)
@@ -755,6 +755,7 @@ if __name__ == "__main__":
         "L2_reg": 0,
         'lr_scheduler' : True,
         'VAE_latent_size' : 50,
+        'scale_factor_channels' : None,
         'VAE_MLP_encoder' : False,
         'training_sample_size' : 1,
         'BVAE' : 50,

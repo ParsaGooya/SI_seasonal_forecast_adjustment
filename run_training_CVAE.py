@@ -279,8 +279,10 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
             f"L2_reg\t{l2_reg}\n" + 
             f"loss_reduction\t{params['loss_reduction']}\n" + 
             f"VAE_latent_size\t{params['VAE_latent_size']}\n"  + 
+            f"scale_factor_channels\t{params['scale_factor_channels']}\n"  + 
             f"VAE_MLP_encoder\t{params['VAE_MLP_encoder']}\n"  + 
-            f"training_sample_size\t{params['training_sample_size']}\n" 
+            f"training_sample_size\t{params['training_sample_size']}\n" +
+            f"hybrid_weight\t{params['hybrid_weight']}\n"
         )
     del ds_raw
     gc.collect()
@@ -410,7 +412,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                 n_channels_x = len(ds_train.channels)
 
 
-                net = cVAE(VAE_latent_size = params['VAE_latent_size'], n_channels_x= n_channels_x+ add_feature_dim , sigmoid = sigmoid_activation, NPS_proj = NPSProj, device=device, combined_prediction = params['combined_prediction'], VAE_MLP_encoder = params['VAE_MLP_encoder'])
+                net = cVAE(VAE_latent_size = params['VAE_latent_size'], n_channels_x= n_channels_x+ add_feature_dim , sigmoid = sigmoid_activation, NPS_proj = NPSProj, device=device, combined_prediction = params['combined_prediction'], VAE_MLP_encoder = params['VAE_MLP_encoder'], scale_factor_channels = params['scale_factor_channels'])
 
                 net.to(device)
                 optimizer = torch.optim.Adam(net.parameters(), lr=lr, weight_decay = l2_reg)
@@ -484,12 +486,24 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                         optimizer.zero_grad()
                         obs_mask = obs_mask.to(y)#.expand_as(y[0])   ## Uncomment if multi_channel is True
                         generated_output, deterministic_output, mu, log_var , cond_mu, cond_log_var = net(y, obs_mask, x, model_mask_, sample_size = params['training_sample_size'] )
+                        if params['hybrid_weight'] is not None:
+                            generated_output_GCGN, _, _, _ , _, _ = net(y, obs_mask, x, model_mask_, sample_size = params['training_sample_size'], mode = 'GCGN' )   
+
                         if params['combined_prediction']:
                             (y, y_extent) = (y[:,0].unsqueeze(1), y[:,1].unsqueeze(1))
                             (generated_output, generated_output_extent) = generated_output
                             loss_extent = criterion_extent(generated_output_extent, y_extent.unsqueeze(0).expand_as(generated_output_extent))
+                            if params['hybrid_weight'] is not None:
+                                (generated_output_GCGN, generated_output_GCGN_extent) = generated_output_GCGN
+                                loss_extent_GCGN = criterion_extent(generated_output_GCGN_extent, y_extent.unsqueeze(0).expand_as(generated_output_extent))
+                                loss_extent = loss_extent * params['hybrid_weight'] + ( 1- params['hybrid_weight']) * loss_extent_GCGN
 
                         loss, MSE, KLD = criterion(generated_output, y.unsqueeze(0).expand_as(generated_output) ,mu, log_var, cond_mu = cond_mu, cond_log_var = cond_log_var ,beta = beta, mask = m, return_ind_loss=True , print_loss = True)
+                        if params['hybrid_weight'] is not None:
+                            loss_GCGN = criterion(generated_output_GCGN, y.unsqueeze(0).expand_as(generated_output) , mask = m , return_ind_loss=False , print_loss = False)
+                            print(f'GCGN : {loss_GCGN}')
+                            loss = loss * params['hybrid_weight'] + ( 1- params['hybrid_weight']) * loss_GCGN
+                         
                         if params['combined_prediction']:
                             loss = loss + loss_extent
 
@@ -505,6 +519,14 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                     if params['lr_scheduler']:
                         scheduler.step()
                 del train_set, dataloader, ds_train, obs_train, generated_output, x, y , m, deterministic_output, mu, log_var , cond_mu, cond_log_var 
+                if params['hybrid_weight'] is not None:
+                    del generated_output_GCGN
+                if params['combined_prediction']:
+                    del generated_output_extent
+                    try:
+                        del generated_output_GCGN_extent
+                    except:
+                        pass                
                 gc.collect()
                 # EVALUATE MODEL
                 ##################################################################################################################################
@@ -730,7 +752,7 @@ if __name__ == "__main__":
         "reg_scale" : None,
         "beta" : 1,
         "optimizer": torch.optim.Adam,
-        "lr": 0.0001 ,
+        "lr": 0.001 ,
         "loss_function" :'MSE',
         "loss_region": None,
         "subset_dims": 'North',   ## North or South or Global
@@ -740,19 +762,21 @@ if __name__ == "__main__":
         "decoder_kernel_size" : 1, ## only for (Reg)CNN
         "L2_reg": 0,
         'lr_scheduler' : False,
-        'VAE_latent_size' : 50,
+        'VAE_latent_size' : 25,
         'VAE_MLP_encoder' : False,
+        'scale_factor_channels' : None,
         'BVAE' : 50,
         'training_sample_size' : 1, 
         'loss_reduction' : 'mean' , # mean or sum
-        'combined_prediction' : False
+        'combined_prediction' : False,
+        'hybrid_weight' : None, 
     }
 
 
 
     params['version'] =  1  ### 1 , 2 ,3 , 'IceExtent'
     params['forecast_range_months'] = 12
-    params['beta'] =   dict(start = 0, end =1, start_epoch = 1 , end_epoch = params['epochs'])  
+    params['beta'] =   dict(start = 0, end =0.5, start_epoch = 10 , end_epoch = params['epochs'])  
 
     obs_ref = 'NASA'
     NPSProj = True
@@ -766,10 +790,15 @@ if __name__ == "__main__":
     # for lead_time in np.arange(1,13):
     print( f'Training lead_time {lead_time} ...')
 
-    if lead_time is None:
-        out_dir    = f'{out_dir_x}/N{n_years}_M{lead_months}_F{params["forecast_range_months"]}_v{params["version"]}_{beta_arg}_batch{params["batch_size"]}_e{params["epochs"]}_cVAE_{params["BVAE"]}-{params["training_sample_size"]}_LS{params["VAE_latent_size"]}'
+    if params['hybrid_weight'] is not None:
+        model_type = 'CGNhybrid'
     else:
-        out_dir    = f'{out_dir_x}/N{n_years}_LT{lead_time}_F{params["forecast_range_months"]}_v{params["version"]}_{beta_arg}_batch{params["batch_size"]}_e{params["epochs"]}_cVAE_{params["BVAE"]}-{params["training_sample_size"]}_LS{params["VAE_latent_size"]}'
+        model_type = 'CVAE'
+
+    if lead_time is None:
+        out_dir    = f'{out_dir_x}/N{n_years}_M{lead_months}_F{params["forecast_range_months"]}_v{params["version"]}_{beta_arg}_batch{params["batch_size"]}_e{params["epochs"]}_Cscale{params["scale_factor_channels"]}_{model_type}_{params["BVAE"]}-{params["training_sample_size"]}_LS{params["VAE_latent_size"]}'
+    else:
+        out_dir    = f'{out_dir_x}/N{n_years}_LT{lead_time}_F{params["forecast_range_months"]}_v{params["version"]}_{beta_arg}_batch{params["batch_size"]}_e{params["epochs"]}_Cscale{params["scale_factor_channels"]}_{model_type}_{params["BVAE"]}-{params["training_sample_size"]}_LS{params["VAE_latent_size"]}'
     
     if params['VAE_MLP_encoder']:
         out_dir = out_dir + '_Linear'
