@@ -13,7 +13,7 @@ The **probabilistic bias adjustment** is based on the **4-way conditional genera
 **Note:** This repository is intended for internal script sharing and does not include final, cleaned versions of the codes and scripts.
 
 ## Contributors
-This work was developed by **Parsa Gooya** in collaboration with **Reinel Sospedra-Alfonso** and **Johannes Exenberger**.
+This work was developed by **Parsa Gooya** in collaboration with **Reinel Sospedra-Alfonso** and **Johannes Exenberger** at the **Canadian Centre for Climate Modeling and Analysis (CCCma)**. 
 
 ## Copyright
 © Environment and Climate Change Canada and the contributors, 2025. All rights reserved.  
