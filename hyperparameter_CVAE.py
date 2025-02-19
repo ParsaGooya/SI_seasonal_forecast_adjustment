@@ -12,7 +12,7 @@ import torch
 from torch.utils.data import DataLoader
 from torch.optim import lr_scheduler
 
-from models.cvae import cVAE
+from models.cvae_0127 import cVAE
 from losses import WeightedMSEKLD, WeightedMSE
 from losses import WeightedMSEKLDLowRess, WeightedMSELowRess, GlobalLoss, IceextentlLoss
 from preprocessing import align_data_and_targets, create_mask, config_grid, pole_centric, reverse_pole_centric, segment, reverse_segment, pad_xarray
@@ -421,7 +421,7 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
         val_mask = create_mask(ds_validation)
 
     validation_set = XArrayDataset(ds_validation, obs_validation, mask=val_mask, zeros_mask = zeros_mask, lead_time=lead_time, time_features=time_features,ensemble_features =ensemble_features,  in_memory=False, aligned = True, month_min_max = month_min_max, model = 'UNet2') 
-    dataloader_val = DataLoader(validation_set, batch_size=batch_size, shuffle=True)   
+    dataloader_val = DataLoader(validation_set, batch_size=12, shuffle=True)   
 
 
     if low_ress_loss:
@@ -446,7 +446,7 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
     epoch_loss_val_MSE_generated = []
     step = 0
     num_batches = len(dataloader)
-    model_mask_ = torch.from_numpy(model_mask.to_numpy()).unsqueeze(0)#.expand(n_channels_x + add_feature_dim,*model_mask.shape)  ## Uncomment if multi_channel is True
+    model_mask_ = torch.from_numpy(model_mask.to_numpy()).unsqueeze(0).expand(n_channels_x + add_feature_dim,*model_mask.shape)  ## Uncomment if multi_channel is True
     obs_mask = torch.from_numpy(land_mask.to_numpy()).unsqueeze(0) ## Uncomment if multi_channel is True
 
     for epoch in tqdm.tqdm(range(epochs)):
@@ -481,14 +481,29 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
                 m  = None
 
             optimizer.zero_grad()
-            obs_mask = obs_mask.to(y)#.expand_as(y[0])    ## Uncomment if multi_channel is True
-            generated_output, deterministic_output, mu, log_var , cond_mu, cond_log_var = net(y, obs_mask, x, model_mask_, sample_size = params['training_sample_size'] )
+            obs_mask = obs_mask.to(y).expand_as(y[0])    ## Uncomment if multi_channel is True
+            generated_output, _, mu, log_var , cond_mu, cond_log_var = net(y, obs_mask, x, model_mask_, sample_size = params['training_sample_size']  )
+            if params['hybrid_weight'] is not None:
+                generated_output_GCGN, _, _, _ , _, _ = net(y, obs_mask, x, model_mask_, sample_size = params['training_sample_size'] , mode = 'GCGN' )   
+            
             if params['combined_prediction']:
                 (y, y_extent) = (y[:,0].unsqueeze(1), y[:,1].unsqueeze(1))
                 (generated_output, generated_output_extent) = generated_output
                 loss_extent = criterion_extent(generated_output_extent, y_extent.unsqueeze(0).expand_as(generated_output_extent))
+                if params['hybrid_weight'] is not None:
+                        (generated_output_GCGN, generated_output_GCGN_extent) = generated_output_GCGN
+                        loss_extent_GCGN = criterion_extent(generated_output_GCGN_extent, y_extent.unsqueeze(0).expand_as(generated_output_extent))
+                        loss_extent = loss_extent * params['hybrid_weight'] + ( 1- params['hybrid_weight']) * loss_extent_GCGN
+                        del generated_output_GCGN_extent
+                del y_extent, generated_output_extent
 
-            loss, MSE, KLD = criterion(generated_output, y.unsqueeze(0).expand_as(generated_output) ,mu, log_var, cond_mu = cond_mu, cond_log_var = cond_log_var ,beta = beta, mask = m, return_ind_loss=True , print_loss = True)
+
+            loss, MSE, KLD = criterion(generated_output, y.unsqueeze(0).expand_as(generated_output) ,mu, log_var, cond_mu = cond_mu, cond_log_var = cond_log_var ,beta = beta, mask = m, return_ind_loss=True , print_loss = False)
+            if params['hybrid_weight'] is not None:
+                loss_GCGN = criterion(generated_output_GCGN, y.unsqueeze(0).expand_as(generated_output) , mask = m , return_ind_loss=False , print_loss = False)
+                loss = loss * params['hybrid_weight'] + ( 1- params['hybrid_weight']) * loss_GCGN
+                del generated_output_GCGN
+
             if params['combined_prediction']:
                 loss = loss + loss_extent
 
@@ -505,7 +520,8 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
         if params['lr_scheduler']:
             scheduler.step()
 
-        del  x, y, generated_output, deterministic_output, mu, log_var , cond_mu, cond_log_var
+        del  x, y, generated_output, mu, log_var , cond_mu, cond_log_var
+
 
         gc.collect()
         net.eval()
@@ -527,21 +543,24 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
                 else:
                     test_obs = target.to(device)
                     m = None
+                del x, target    
 
-                generated_output, deterministic_output, mu, log_var , cond_mu, cond_log_var = net(test_obs, obs_mask, test_raw, model_mask_, sample_size = params['training_sample_size'] )
+                generated_output, _, mu, log_var , cond_mu, cond_log_var = net(test_obs, obs_mask, test_raw, model_mask_, sample_size = params['training_sample_size'] * int(np.ceil(batch_size/12)))
 
                 if params['combined_prediction']:
                     (test_obs, test_obs_extent) = (test_obs[:,0].unsqueeze(1), test_obs[:,1].unsqueeze(1))
                     (generated_output, generated_output_extent) = generated_output
-                    loss_extent_ = criterion_extent(generated_output_extent, y_extent.unsqueeze(0).expand_as(generated_output_extent))
+                    loss_extent_ = criterion_extent(generated_output_extent, test_obs_extent.unsqueeze(0).expand_as(generated_output_extent))
+                    del test_obs_extent, generated_output_extent
 
-                loss_, MSE_, KLD_ = criterion_eval(generated_output, test_obs.unsqueeze(0).expand_as(generated_output) ,mu, log_var, cond_mu = cond_mu, cond_log_var = cond_log_var ,beta = beta, mask = m, return_ind_loss=True , print_loss = True)
+                loss_, MSE_, KLD_ = criterion_eval(generated_output, test_obs.unsqueeze(0).expand_as(generated_output) ,mu, log_var, cond_mu = cond_mu, cond_log_var = cond_log_var ,beta = beta, mask = m, return_ind_loss=True , print_loss = False)
                 if params['combined_prediction']:
                     loss_ = loss_ + loss_extent_
 
                 val_loss += loss_.item()
                 val_loss_MSE += MSE_.item()
                 val_loss_KLD += KLD_.item()
+                del generated_output, mu, log_var
                 if m is not None:
                     m[m != 0] = 1
                     test_adjusted = test_adjusted * m
@@ -550,67 +569,66 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
                 else:
                     m_ = None
 
-                _,deterministic_output, _, _, cond_mu, cond_log_var = net(test_obs, obs_mask, test_raw, model_mask_, sample_size = 1 )
+                # _,_, _, _, cond_mu, cond_log_var = net(test_obs, obs_mask, test_raw, model_mask_, sample_size = 1 )
                 basic_unet = net.unet(test_raw, model_mask_)
                 cond_var = torch.exp(cond_log_var) + 1e-4
                 cond_std = torch.sqrt(cond_var)
                 z =  Normal(cond_mu, cond_std).rsample(sample_shape=(params['BVAE'],)).squeeze().to(device)
                 z = torch.flatten(z, start_dim = 0, end_dim = 1)
                 out = net.generation(z)
+                del z
                 out = torch.unflatten(out, dim = 0, sizes = (params['BVAE'],cond_var.shape[0]))
                 out = out + basic_unet.squeeze() 
                 out = torch.flatten(out, start_dim = 0, end_dim = 1)
                 generated_output = net.last_conv(out)
                 
                 if params['combined_prediction']:
-                        (generated_output, _) = generated_output
-                        (deterministic_output, _) = deterministic_output
+                        # (generated_output, _) = generated_output
+                        # (deterministic_output, _) = deterministic_output
                         (test_obs, _) = (test_obs[:,0].unsqueeze(1), test_obs[:,1].unsqueeze(1))
-
+                del out
                 generated_output = torch.unflatten(generated_output, dim = 0, sizes = (params['BVAE'],cond_var.shape[0]))
-                loss_MSE_generated = criterion_eval_MSE(generated_output.mean(0), test_obs , mask= m_)
-                loss_MSE_deterministic = criterion_eval_MSE(deterministic_output, test_obs , mask= m_)
+                loss_MSE_generated = criterion_eval_MSE(generated_output, test_obs.unsqueeze(0).expand_as(generated_output) , mask= m_)
+                # loss_MSE_deterministic = criterion_eval_MSE(deterministic_output, test_obs , mask= m_)
 
                 val_loss_MSE_generated += loss_MSE_generated.item()
-                val_loss_MSE_deterministic += loss_MSE_deterministic.item()
+                # val_loss_MSE_deterministic += loss_MSE_deterministic.item()
 
 
         epoch_loss_val.append(val_loss / len(dataloader_val))
         epoch_loss_val_MSE.append(val_loss_MSE / len(dataloader_val))
         epoch_loss_val_KLD.append(val_loss_KLD / len(dataloader_val))
         epoch_loss_val_MSE_generated.append(val_loss_MSE_generated / len(dataloader_val))
-        epoch_loss_val_MSE_deterministic.append(val_loss_MSE_deterministic / len(dataloader_val))
+        # epoch_loss_val_MSE_deterministic.append(val_loss_MSE_deterministic / len(dataloader_val))
         # Store results as NetCDF            
-    del train_set,validation_set, dataloader, dataloader_val, m, test_raw, test_obs,  target, deterministic_output, generated_output, mu, log_var, cond_mu, cond_log_var , net, 
-    try:
-        del generated_output_extent, test_obs_extent, y_extent
-    except:
-        pass
+    del train_set,validation_set, dataloader, dataloader_val, m, test_raw, test_obs, generated_output, cond_mu, cond_log_var , net
     gc.collect()
     torch.cuda.empty_cache() 
     torch.cuda.synchronize() 
     epoch_loss_val = smooth_curve(epoch_loss_val)
-    epoch_loss_val_extent = smooth_curve(epoch_loss_val_extent)
-    epoch_loss_val_area = smooth_curve(epoch_loss_val_area)
+    # epoch_loss_val_extent = smooth_curve(epoch_loss_val_extent)
+    # epoch_loss_val_area = smooth_curve(epoch_loss_val_area)
     epoch_loss_val_MSE = smooth_curve(epoch_loss_val_MSE)
+    epoch_loss_val_KLD = smooth_curve(epoch_loss_val_KLD)
+    epoch_loss_val_MSE_generated = smooth_curve(epoch_loss_val_MSE_generated)
 
 
     plt.figure(figsize = (8,5))
     plt.plot(np.arange(2,epochs+1), epoch_loss_train[1:], color = 'b', label = 'Train Loss Total')
-    plt.plot(np.arange(2,epochs+1), epoch_loss_val[1:], color = 'darkorange', label = 'Validation Loss Total')
-    plt.plot(np.arange(2,epochs+1), epoch_loss_train_MSE[1:], color = 'b', label = 'Train MSE', linestyle = 'dashed', alpha = 0.5)
-    plt.plot(np.arange(2,epochs+1), epoch_loss_val_MSE[1:], color = 'darkorange', label = 'Val MSE', linestyle = 'dashed', alpha = 0.5)
+    plt.plot(np.arange(2,epochs+1), epoch_loss_val_MSE_generated[1:], label = 'Validation generated MSE',  color = 'darkorange')
+    plt.plot(np.arange(2,epochs+1), epoch_loss_train_MSE[1:], color = 'b', label = 'Train MSE only', linestyle = 'dashed', alpha = 0.5)
+    plt.title(f'{hyperparamater_grid}')
+    # plt.twinx()
+    plt.plot(np.arange(2,epochs+1), epoch_loss_val[1:], color = 'darkorange', label = 'Validation Loss Total', alpha = 0.5)
+    plt.plot(np.arange(2,epochs+1), epoch_loss_val_MSE[1:], color = 'darkorange', label = 'Val MSE only', linestyle = 'dashed', alpha = 0.5)
+    plt.legend()
+    plt.ylabel('MSE')
+    plt.xlabel('Epoch')
+    plt.twinx()
     plt.plot(np.arange(2,epochs+1), epoch_loss_train_KLD[1:], color = 'b', label = 'Train KLD', linestyle = 'dotted', alpha = 0.5)
     plt.plot(np.arange(2,epochs+1), epoch_loss_val_KLD[1:], color = 'darkorange', label = 'Val KLD', linestyle = 'dotted', alpha = 0.5)
-    plt.title(f'{hyperparamater_grid}')
-    plt.legend()
-    plt.ylabel(params['loss_function'])
-    plt.twinx()
-    plt.plot(np.arange(2,epochs+1), epoch_loss_val_MSE_generated[1:], label = 'Validation Area generated MSE',  color = 'k', alpha = 0.5)
-    plt.ylabel('MSE')
-    plt.legend()
-    plt.xlabel('Epoch')
-    
+    plt.legend(loc="upper right", bbox_to_anchor=(1, 1))
+    plt.ylabel('KLD')   
     plt.grid()
     plt.show()
     plt.savefig(results_dir+f'/val-train_loss_1982-{test_year}-{hyperparamater_grid}.png')
@@ -620,10 +638,10 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
     with open(Path(results_dir, "Hyperparameter_training.txt"), 'a') as f:
         f.write(
   
-            f"{hyperparamater_grid} ---> val_loss at best epoch: {min(epoch_loss_val)} at {np.argmin(epoch_loss_val)+1}  (MSE : {epoch_loss_val_MSE[np.argmin(epoch_loss_val)]})\n" +  ## PG: The scale to be passed to Signloss regularization
+            f"{hyperparamater_grid} ---> val_loss at best epoch: {min(epoch_loss_val)} at {np.argmin(epoch_loss_val)+1}  (MSE_generated : {epoch_loss_val_MSE_generated[np.argmin(epoch_loss_val)]})\n" +  ## PG: The scale to be passed to Signloss regularization
             f"-------------------------------------------------------------------------------------------------------------------------------------------------------------------------\n" 
         )
-    return epoch_loss_val_MSE[np.argmin(epoch_loss_val)], epoch_loss_val, epoch_loss_train, epoch_loss_train_MSE , epoch_loss_val_MSE, epoch_loss_val_MSE_generated
+    return epoch_loss_val_MSE_generated[np.argmin(epoch_loss_val_MSE_generated)], epoch_loss_val, epoch_loss_train, epoch_loss_train_MSE , epoch_loss_val_MSE, epoch_loss_val_MSE_generated
 
                                  #########         ##########
 
@@ -674,6 +692,7 @@ def run_hp_tunning( ds_raw_ensemble_mean: XArrayDataset ,obs_raw: XArrayDataset,
                 f"active_grid\t{params['active_grid']}\n" + 
                 f"VAE_latent_size\t{params['VAE_latent_size']}\n" + 
                 f"VAE_MLP_encoder\t{params['VAE_MLP_encoder']}\n"  + 
+                f"hybrid_weight\t{params['hybrid_weight']}\n" +
                 f"training_sample_size\t{params['training_sample_size']}\n\n\n" +
                 ' ----------------------------------------------------------------------------------\n'
             )
@@ -686,10 +705,17 @@ def run_hp_tunning( ds_raw_ensemble_mean: XArrayDataset ,obs_raw: XArrayDataset,
         
         for ind, dic in enumerate(hyperparameterspace):
             print(f'Training for {dic}')
+            try:
             # losses[ind], val_losses[ind_, ind, :], val_losses_global[ind_, ind, :], val_losses_corr[ind_, ind, :],  train_losses[ind_, ind, :] = run_training_hp(dic, params, test_year=test_year, lead_years=lead_years, n_runs=n_runs, results_dir=out_dir, numpy_seed=1, torch_seed=1)
-            losses[ind], val_losses[ind_, ind, :],  train_losses[ind_, ind, :] ,train_losses_MSE[ind_, ind, :],  val_losses_MSE[ind_, ind, :],  val_losses_MSE_generated[ind_, ind, :] = training_hp(ds_raw_ensemble_mean =  ds_raw_ensemble_mean,obs_raw = obs_raw ,
+                losses[ind], val_losses[ind_, ind, :],  train_losses[ind_, ind, :] ,train_losses_MSE[ind_, ind, :],  val_losses_MSE[ind_, ind, :],  val_losses_MSE_generated[ind_, ind, :] = training_hp(ds_raw_ensemble_mean =  ds_raw_ensemble_mean,obs_raw = obs_raw ,
                    hyperparamater_grid= dic,zeros_mask_full = zeros_mask_full,land_masks=land_masks, params = params , test_year=test_year, lead_time = lead_time, n_runs=n_runs, results_dir=out_dir, numpy_seed=numpy_seed, torch_seed=torch_seed)
-
+            except:
+                with open(Path(out_dir, "Hyperparameter_training.txt"), 'a') as f:
+                    f.write(
+            
+                        f"{dic} ---> Not trainable! \n" +  ## PG: The scale to be passed to Signloss regularization
+                        f"-------------------------------------------------------------------------------------------------------------------------------------------------------------------------\n" 
+                    )
         
         with open(Path(out_dir, "Hyperparameter_training.txt"), 'a') as f:
             f.write(
@@ -740,10 +766,10 @@ if __name__ == "__main__":
         'ensemble_list' : None, ## PG
         'ensemble_mode' : 'Mean',
         "epochs": 100,
-        "batch_size": 25,
+        "batch_size": 100,
         "reg_scale" : None,
         "optimizer": torch.optim.Adam,
-        "lr": 0.001,
+        "lr": 0.0001,
         "loss_function" :'MSE',
         "loss_region": None,
         "subset_dimensions": 'North' , ##  North or South or Global
@@ -761,6 +787,7 @@ if __name__ == "__main__":
         'BVAE' : 50,
         'loss_reduction' : 'mean' , # mean or sum
         'combined_prediction' : False,
+        'hybrid_weight' : 0.5
     }
 
 
@@ -770,13 +797,13 @@ if __name__ == "__main__":
     lead_time = None
     n_runs = 1  # number of training runs
     params['version'] = 1 ### 1 , 2 ,3, 'PatternsOnly' , 'IceExtent'
-    
+    params['beta'] =   dict(start = 0, end =1, start_epoch = 1 , end_epoch = params['epochs']) 
     ### load data
 
     obs_ref = 'NASA'
-    NPSProj = True
+    NPSProj = False
     y_start = 2018
-    y_end = 2019
+    y_end = 2018
 
     # y_end = int(ds_raw_ensemble_mean.time[-1]/100) +1 
     params['num_val_years'] = 3
@@ -784,16 +811,20 @@ if __name__ == "__main__":
     ds_raw_ensemble_mean, obs_raw, params, zeros_mask_full, land_masks = HP_congif(params, obs_ref, lead_months, y_start, y_end, NPSProj=NPSProj)
     ########################################################### Set HP space specifics #########################################################################
     
-    config_dict = {'skip_conv' : [True, False] }
-    # config_dict = {  'batch_size': [100, 200], 'reg_scale' : [None, 50, 100], 'L2_reg' : [0, 0.0001,0.001 ] }
+    config_dict = {  'batch_size': [10,50, 100], 'VAE_latent_size' : [2,10, 50] }
     hyperparameterspace = config_grid(config_dict).full_grid()
 
     ##################################################################  Adjust the path if necessary #############3##############################################
-    out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_2_convnext/Model_tunning/'
-    if lead_time is None:
-        out_dir = out_dir_x + f'NV{params["num_val_years"]}_M{lead_months}_{params["subset_dimensions"]}_v{params["version"]}_cVAE'
+    out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_1_convnext/Model_tunning/'
+    if params['hybrid_weight'] is not None:
+        model_type = 'CGNhybrid'
     else:
-        out_dir = out_dir_x + f'NV{params["num_val_years"]}_LT{lead_time}_{params["subset_dimensions"]}_v{params["version"]}_cVAE'
+        model_type = 'CVAE'    
+    
+    if lead_time is None:
+        out_dir = out_dir_x + f'NV{params["num_val_years"]}_M{lead_months}_{params["subset_dimensions"]}_v{params["version"]}_{model_type}'
+    else:
+        out_dir = out_dir_x + f'NV{params["num_val_years"]}_LT{lead_time}_{params["subset_dimensions"]}_v{params["version"]}_{model_type}'
 
     if params['VAE_MLP_encoder']:
         out_dir = out_dir + '_Linear'

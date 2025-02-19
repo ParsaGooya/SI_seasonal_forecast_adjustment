@@ -220,6 +220,13 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
     except:
         pass
 
+    if params['combined_prediction']:
+        obs_raw_ = obs_raw.where(obs_raw>=0.15,0)
+        obs_raw_ = obs_raw_.where(obs_raw_ ==0 , 1)
+        obs_raw = xr.concat([obs_raw, obs_raw_], dim = 'channels')
+        params['loss_function'] = 'combined'
+        del obs_raw_
+
     if NPSProj is False:
             ds_raw_ensemble_mean = pole_centric(ds_raw_ensemble_mean, subset_dimensions)
             obs_raw =  pole_centric(obs_raw, subset_dimensions)
@@ -269,6 +276,9 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
     # if 'standardize' in ds_pipeline.steps:
     #     obs_pipeline.add_fitted_preprocessor(ds_pipeline.get_preprocessors('standardize'), 'standardize')
     obs = obs_pipeline.transform(obs_raw.isel(channels = slice(0,1)))
+
+    if params['combined_prediction']:
+            obs = xr.concat([obs, obs_raw.isel(channels = slice(1,2))], dim  = 'channels')  
 
     del ds_baseline, obs_baseline, preprocessing_mask_obs, preprocessing_mask_fct
     gc.collect()
@@ -350,21 +360,25 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
         lead_times = [lead_time]
 
     test_loss = np.zeros(shape=(test_set.target.shape[0]))
-    target_ens = xr.concat([test_set.target.expand_dims('ensembles', axis = 0) for _ in range(params['BVAE'])], dim = 'ensembles')
+    target_ens = xr.concat([test_set.target.expand_dims('ensembles', axis = 0).isel(channels = 0) for _ in range(params['BVAE'])], dim = 'ensembles')
 
     test_results = np.zeros_like(target_ens.values)
-    test_results_deterministic = np.zeros_like(test_set.target.values)
-
     results_shape = xr.full_like(target_ens, fill_value = np.nan)
-    results_shape_deterministic = xr.full_like(test_set.target, fill_value = np.nan)
+
+    if params['save_deterministic'] :
+        test_results_deterministic = np.zeros_like(test_set.target.values)
+        results_shape_deterministic = xr.full_like(test_set.target, fill_value = np.nan)
+    
+    
     del target_ens
    
     test_time_list =  np.arange(1, ds_test.shape[0] + 1) ########?
     if params['combined_prediction']:
             test_results_extent = test_results.copy()
             results_shape_extent = results_shape.copy()
-            test_results_deterministic_extent = test_results_deterministic.copy()
-            results_shape_deterministic_extent = results_shape_deterministic.copy()
+            if params['save_deterministic'] :
+                test_results_deterministic_extent = test_results_deterministic.copy()
+                results_shape_deterministic_extent = results_shape_deterministic.copy()
 
     if params['active_grid']:
         zeros_mask_test = results_shape.copy()
@@ -399,61 +413,72 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
                 obs_mask = obs_mask.expand_as(test_obs[0])
 
             _,deterministic_output, _, _, cond_mu, cond_log_var = net(test_obs, obs_mask, test_raw, model_mask_, sample_size = 1 )
+            if not params['save_deterministic'] :
+                del deterministic_output
             basic_unet = net.unet(test_raw, model_mask_)
             cond_var = torch.exp(cond_log_var) + 1e-4
             cond_std = torch.sqrt(cond_var)
             z =  Normal(cond_mu, cond_std * n_stds).rsample(sample_shape=(params['BVAE'],)).squeeze().to(device)
             z = torch.flatten(z, start_dim = 0, end_dim = 1)
             out = net.generation(z)
+            del z
             out = torch.unflatten(out, dim = 0, sizes = (params['BVAE'],cond_var.shape[0]))
             out = out + basic_unet.squeeze() 
             out = torch.flatten(out, start_dim = 0, end_dim = 1)
             generated_output = net.last_conv(out)
-
+            
             if params['combined_prediction']:
-                    (generated_output, generated_output_extent) = generated_output
-                    (deterministic_output, deterministic_output_extent) = deterministic_output
+                    generated_output_extent = net.last_conv2(out)
+                    try:
+                        (deterministic_output, deterministic_output_extent) = deterministic_output
+                    except:
+                        pass
                     (test_obs, test_obs_extent) = (test_obs[:,0].unsqueeze(1), test_obs[:,1].unsqueeze(1))
-                    test_results_extent[:,time_id * len(lead_times) : (time_id+1) * len(lead_times),] = generated_output_extent.to(torch.device('cpu')).numpy()
-                    test_results_deterministic_extent[time_id * len(lead_times) : (time_id+1) * len(lead_times),] = deterministic_output_extent.squeeze().to(torch.device('cpu')).numpy()
-                            
+                    generated_output_extent = torch.unflatten(generated_output_extent, dim = 0, sizes = (params['BVAE'],cond_var.shape[0]))
+                    test_results_extent[:,time_id * len(lead_times) : (time_id+1) * len(lead_times),] = generated_output_extent.squeeze().to(torch.device('cpu')).numpy()
+                    if params['save_deterministic'] :
+                        test_results_deterministic_extent[time_id * len(lead_times) : (time_id+1) * len(lead_times),] = deterministic_output_extent.squeeze().to(torch.device('cpu')).numpy()
+            del out                
             generated_output = torch.unflatten(generated_output, dim = 0, sizes = (params['BVAE'],cond_var.shape[0]))
-            test_results[:,time_id * len(lead_times) : (time_id+1) * len(lead_times),] = generated_output.to(torch.device('cpu')).numpy()
-            test_results_deterministic[time_id * len(lead_times) : (time_id+1) * len(lead_times),] = deterministic_output.to(torch.device('cpu')).numpy()
+            test_results[:,time_id * len(lead_times) : (time_id+1) * len(lead_times),] = generated_output.squeeze().to(torch.device('cpu')).numpy()
+            if params['save_deterministic'] :
+                test_results_deterministic[time_id * len(lead_times) : (time_id+1) * len(lead_times),] = deterministic_output.to(torch.device('cpu')).numpy()
                                       
 
-    del  test_raw,  x, target, test_obs, test_set, ds_test , generated_output, deterministic_output
+    del  test_raw,  x, target, test_obs, test_set, ds_test , generated_output
     try:
         del  generated_output_extent, deterministic_output_extent
     except:
         pass
+    if params['save_deterministic'] :
+        del deterministic_output
     gc.collect()
     ###################################################### has to be eddited for large ensembles!! #####################################################################
     results_shape[:] = test_results[:]
-    results_shape_deterministic[:] = test_results_deterministic[:]
-
     test_results = results_shape.unstack('flattened').transpose('time','lead_time',...)
-    test_results_deterministic = results_shape_deterministic.unstack('flattened').transpose('time','lead_time',...)
-
     test_results_untransformed = obs_pipeline.inverse_transform(test_results.values)
-    test_results_untransformed_deterministic = obs_pipeline.inverse_transform(test_results_deterministic.values)
-
     result = xr.DataArray(test_results_untransformed, test_results.coords, test_results.dims, name='nn_adjusted')
-    result_deterministic = xr.DataArray(test_results_untransformed_deterministic, test_results_deterministic.coords, test_results_deterministic.dims, name='nn_adjusted')
 
+    if params['save_deterministic'] :
+        results_shape_deterministic[:] = test_results_deterministic[:]
+        test_results_deterministic = results_shape_deterministic.unstack('flattened').transpose('time','lead_time',...)
+        test_results_untransformed_deterministic = obs_pipeline.inverse_transform(test_results_deterministic.values)
+        result_deterministic = xr.DataArray(test_results_untransformed_deterministic, test_results_deterministic.coords, test_results_deterministic.dims, name='nn_adjusted')
 
     if params['combined_prediction']:
             results_shape_extent[:] = test_results_extent[:]
             result_extent = results_shape_extent.unstack('flattened').transpose('time','lead_time',...)
-
-            results_shape_deterministic_extent[:] = test_results_deterministic_extent[:]
-            result_extent_deterministic = results_shape_deterministic_extent.unstack('flattened').transpose('time','lead_time',...)
+            if params['save_deterministic'] :
+                results_shape_deterministic_extent[:] = test_results_deterministic_extent[:]
+                result_extent_deterministic = results_shape_deterministic_extent.unstack('flattened').transpose('time','lead_time',...)
 
 
     if obs_clim:
         result = result.isel(channels = 0).expand_dims('channels', axis=2)
 
-    del  results_shape, test_results, test_results_untransformed,  results_shape_deterministic, test_results_deterministic, test_results_untransformed_deterministic
+    del  results_shape, test_results, test_results_untransformed
+    if params['save_deterministic'] :
+        del results_shape_deterministic, test_results_deterministic, test_results_untransformed_deterministic
     try:
         test_results_extent, test_results_deterministic_extent
     except:
@@ -461,15 +486,18 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
     gc.collect()
 
     result = (result * land_mask)
-    result_deterministic = (result_deterministic * land_mask)
+    if params['save_deterministic'] :
+        result_deterministic = (result_deterministic * land_mask)
 
     if not NPSProj:
 
             result = reverse_pole_centric(result, subset_dimensions)
-            result_deterministic = reverse_pole_centric(result_deterministic, subset_dimensions)
+            if params['save_deterministic'] :
+                result_deterministic = reverse_pole_centric(result_deterministic, subset_dimensions)
 
     result = result.to_dataset(name = 'nn_adjusted') 
-    result_deterministic = result_deterministic.to_dataset(name = 'nn_adjusted')
+    if params['save_deterministic'] :
+        result_deterministic = result_deterministic.to_dataset(name = 'nn_adjusted')
 
     if params['active_grid']:
         if not NPSProj:
@@ -477,25 +505,28 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
         else:
             zeros_mask_test = zeros_mask_test.rename({'lon':'x', 'lat':'y'})
         result = xr.combine_by_coords([result * zeros_mask_test, zeros_mask_test.to_dataset(name = 'active_grid')])
-        result_deterministic = xr.combine_by_coords([result_deterministic * zeros_mask_test, zeros_mask_test.to_dataset(name = 'active_grid')])
+        if params['save_deterministic'] :
+            result_deterministic = xr.combine_by_coords([result_deterministic * zeros_mask_test, zeros_mask_test.to_dataset(name = 'active_grid')])
 
 
     if params['combined_prediction']:
         result_extent = (result_extent * land_mask)
-        result_deterministic_extent = (result_deterministic_extent * land_mask)
+        if params['save_deterministic'] :
+            result_deterministic_extent = (result_deterministic_extent * land_mask)
         if not NPSProj:
             result_extent = reverse_pole_centric(result_extent, subset_dimensions)
-            result_deterministic_extent = reverse_pole_centric(result_deterministic_extent, subset_dimensions)
+            if params['save_deterministic'] :
+                result_deterministic_extent = reverse_pole_centric(result_deterministic_extent, subset_dimensions)
 
         result_extent = result_extent.to_dataset(name = 'nn_adjusted_extent')
         result_extent = result_extent.where(result_extent >= 0.5, 0)
         result_extent = result_extent.where(result_extent ==0, 1)
         result = xr.combine_by_coords([result , result_extent])
-
-        result_deterministic_extent = result_deterministic_extent.to_dataset(name = 'nn_adjusted_extent')
-        result_deterministic_extent = result_deterministic_extent.where(result_deterministic_extent >= 0.5, 0)
-        result_deterministic_extent = result_deterministic_extent.where(result_deterministic_extent ==0, 1)
-        result_deterministic = xr.combine_by_coords([result_deterministic , result_deterministic_extent])
+        if params['save_deterministic'] :
+            result_deterministic_extent = result_deterministic_extent.to_dataset(name = 'nn_adjusted_extent')
+            result_deterministic_extent = result_deterministic_extent.where(result_deterministic_extent >= 0.5, 0)
+            result_deterministic_extent = result_deterministic_extent.where(result_deterministic_extent ==0, 1)
+            result_deterministic = xr.combine_by_coords([result_deterministic , result_deterministic_extent])
 
 
     if model_year is not None:
@@ -506,13 +537,18 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
 
     if np.min(test_years) != np.max(test_years):
         result.to_netcdf(path=Path(model_dir, f'saved_model_nn_adjusted_ENS_{np.min(test_years)}-{np.max(test_years)}_nstds{n_stds}.nc', mode='w'))
-        result_deterministic.to_netcdf(path=Path(model_dir, f'saved_model_nn_adjusted_deterministic_{np.min(test_years)}-{np.max(test_years)}.nc', mode='w'))
+        if params['save_deterministic'] :
+            result_deterministic.to_netcdf(path=Path(model_dir, f'saved_model_nn_adjusted_deterministic_{np.min(test_years)}-{np.max(test_years)}.nc', mode='w'))
 
     else:
         result.to_netcdf(path=Path(model_dir, f'saved_model_nn_adjusted_ENS_{np.min(test_years)}_nstds{n_stds}.nc', mode='w'))
-        result_deterministic.to_netcdf(path=Path(model_dir, f'saved_model_nn_adjusted_deterministic_{np.min(test_years)}.nc', mode='w'))
+        if params['save_deterministic'] :
+            result_deterministic.to_netcdf(path=Path(model_dir, f'saved_model_nn_adjusted_deterministic_{np.min(test_years)}.nc', mode='w'))
 
-    return result, result_deterministic
+    if params['save_deterministic'] :
+        return result, result_deterministic
+    else:
+        return result
 
 
 def extract_params(model_dir):
@@ -546,12 +582,26 @@ if __name__ == "__main__":
     ############################################## Set_up ############################################
 
     out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/NASA/cVAE/run_set_1_convnext'
-    out_dir    = f'{out_dir_x}/N4_M12_F12_v1_Banealing_batch10_e50_CscaleNone_cVAE_50-1_LS50_NPSproj_North_lr0.0001_batch10_e50_LNone' 
+    out_dir    = f'{out_dir_x}/N4_M12_F12_v1_B0.1_batch10_e50_CscaleNone_CGNhybrid_50-1_LS50_NPSproj_North_lr0.0001_batch10_e50_LNone' 
+
+
+    params = extract_params(out_dir)
+    print(f'loaded configuration: \n')
+    for key, values in params.items():
+        print(f'{key} : {values} \n')
+    
+    version = int(out_dir.split('/')[-1].split('_')[3][1])
+
+    params["version"] = version
+    print( f'Version: {version}')
+    #################################################################################################
 
     lead_months = 12
     bootstrap = False
     test_years = np.arange(2018,2022)
-
+    n_stds = 1
+    params['BVAE'] = 50
+    params['save_deterministic'] = False
     #################################################################################################
     obs_ref = out_dir_x.split('/')[-3]
     if '1x1' in out_dir:
@@ -576,20 +626,8 @@ if __name__ == "__main__":
     ##################################################################################################
     # for i in range(1,13):
     # out_dir    = f'{out_dir_x}/N4_M12_F12_v1_Banealing_batch10_e50_cVAE_50-1_LS50_NPSproj_North_lr0.001_batch10_e50_LNone'  
-    params = extract_params(out_dir)
-    print(f'loaded configuration: \n')
-    for key, values in params.items():
-        print(f'{key} : {values} \n')
-    
 
-    version = int(out_dir.split('/')[-1].split('_')[3][1])
 
-    
-    params["version"] = version
-    print( f'Version: {version}')
-
-    n_stds = 1
-    params['BVAE'] = 100
     predict(fct, observation, params, lead_months, out_dir,  test_years, NPSProj  = NPSProj, model_year = 2017, ensemble_mode='Mean',  save=True)
 
     print(f'Output dir: {out_dir}')

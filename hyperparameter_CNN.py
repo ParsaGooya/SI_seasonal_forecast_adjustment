@@ -823,9 +823,9 @@ if __name__ == "__main__":
     ### load data
 
     obs_ref = 'NASA'
-    NPSProj = True
+    NPSProj = False
     y_start = 2018
-    y_end = 2019
+    y_end = 2018
 
     # y_end = int(ds_raw_ensemble_mean.time[-1]/100) +1 
     params['num_val_years'] = 3
@@ -833,7 +833,7 @@ if __name__ == "__main__":
     ds_raw_ensemble_mean, obs_raw, params, zeros_mask_full, land_masks = HP_congif(params, obs_ref, lead_months, y_start, y_end, NPSProj=NPSProj)
     ########################################################### Set HP space specifics #########################################################################
     
-    config_dict = {'skip_conv' : [True, False] }
+    config_dict = {'time_features' : [['land_mask'], ['month_sin','month_cos', 'imonth_sin', 'imonth_cos'], ['month_sin','month_cos', 'imonth_sin', 'imonth_cos', 'land_mask']] }
     # config_dict = {  'batch_size': [100, 200], 'reg_scale' : [None, 50, 100], 'L2_reg' : [0, 0.0001,0.001 ] }
     hyperparameterspace = config_grid(config_dict).full_grid()
 

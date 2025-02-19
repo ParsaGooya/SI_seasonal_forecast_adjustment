@@ -485,7 +485,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
 
                         optimizer.zero_grad()
                         obs_mask = obs_mask.to(y)#.expand_as(y[0])   ## Uncomment if multi_channel is True
-                        generated_output, deterministic_output, mu, log_var , cond_mu, cond_log_var = net(y, obs_mask, x, model_mask_, sample_size = params['training_sample_size'] )
+                        generated_output, _, mu, log_var , cond_mu, cond_log_var = net(y, obs_mask, x, model_mask_, sample_size = params['training_sample_size'] )
                         if params['hybrid_weight'] is not None:
                             generated_output_GCGN, _, _, _ , _, _ = net(y, obs_mask, x, model_mask_, sample_size = params['training_sample_size'], mode = 'GCGN' )   
 
@@ -497,12 +497,15 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                                 (generated_output_GCGN, generated_output_GCGN_extent) = generated_output_GCGN
                                 loss_extent_GCGN = criterion_extent(generated_output_GCGN_extent, y_extent.unsqueeze(0).expand_as(generated_output_extent))
                                 loss_extent = loss_extent * params['hybrid_weight'] + ( 1- params['hybrid_weight']) * loss_extent_GCGN
+                                del generated_output_GCGN_extent
+                            del generated_output_extent
 
                         loss, MSE, KLD = criterion(generated_output, y.unsqueeze(0).expand_as(generated_output) ,mu, log_var, cond_mu = cond_mu, cond_log_var = cond_log_var ,beta = beta, mask = m, return_ind_loss=True , print_loss = True)
                         if params['hybrid_weight'] is not None:
                             loss_GCGN = criterion(generated_output_GCGN, y.unsqueeze(0).expand_as(generated_output) , mask = m , return_ind_loss=False , print_loss = False)
                             print(f'GCGN : {loss_GCGN}')
                             loss = loss * params['hybrid_weight'] + ( 1- params['hybrid_weight']) * loss_GCGN
+                            del generated_output_GCGN
                          
                         if params['combined_prediction']:
                             loss = loss + loss_extent
@@ -518,20 +521,16 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
 
                     if params['lr_scheduler']:
                         scheduler.step()
-                del train_set, dataloader, ds_train, obs_train, generated_output, x, y , m, deterministic_output, mu, log_var , cond_mu, cond_log_var 
-                if params['hybrid_weight'] is not None:
-                    del generated_output_GCGN
-                if params['combined_prediction']:
-                    del generated_output_extent
-                    try:
-                        del generated_output_GCGN_extent
-                    except:
-                        pass                
+                del train_set, dataloader, ds_train, obs_train, generated_output, x, y , m, mu, log_var , cond_mu, cond_log_var 
+
                 gc.collect()
                 # EVALUATE MODEL
                 ##################################################################################################################################
                 if test_year*100 + month <= ds_raw_ensemble_mean.time[-1]:
-
+                    
+                    if save:
+                        nameSave = f"MODEL_V{params['version']}_198101-{test_year * 100 + month -1}.pth"
+                        torch.save( net.state_dict(),results_dir + '/' + nameSave)
                     test_years_list = np.arange(1, ds_test.shape[0] + 1)
                     test_lead_time_list = np.arange(1, ds_test.shape[1] + 1)
 
@@ -548,7 +547,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
 
 
                     test_loss = np.zeros(shape=(test_set.target.shape[0]))
-                    target_ens = xr.concat([test_set.target.expand_dims('ensembles', axis = 0) for _ in range(params['BVAE'])], dim = 'ensembles')
+                    target_ens = xr.concat([test_set.target.expand_dims('ensembles', axis = 0).isel(channels = 0) for _ in range(params['BVAE'])], dim = 'ensembles')
 
                     test_results = np.zeros_like(target_ens.values)
                     test_results_deterministic = np.zeros_like(test_set.target.values)
@@ -581,7 +580,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                             else:
                                 test_obs = target.unsqueeze(0).to(device)
                                 m = None
-                            
+                            del x, target
                             _,deterministic_output, _, _, cond_mu, cond_log_var = net(test_obs, obs_mask, test_raw, model_mask_, sample_size = 1 )
                             basic_unet = net.unet(test_raw, model_mask_)
                             cond_var = torch.exp(cond_log_var) + 1e-4
@@ -591,13 +590,14 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                             # z = torch.unflatten(z , dim = -1, sizes = cond_std.shape[-3:])
                             out = net.generation(z) + basic_unet.squeeze() 
                             generated_output = net.last_conv(out)
+                            
                             if params['combined_prediction']:
-                                (generated_output, generated_output_extent) = generated_output
+                                generated_output_extent = net.last_conv2(out)
                                 (deterministic_output, deterministic_output_extent) = deterministic_output
                                 (test_obs, test_obs_extent) = (test_obs[:,0].unsqueeze(1), test_obs[:,1].unsqueeze(1))
                                 test_results_extent[:,i,] = generated_output_extent.to(torch.device('cpu')).numpy()
                                 test_results_deterministic_extent[i,] = deterministic_output_extent.squeeze().to(torch.device('cpu')).numpy()
-                            
+                            del z, out
                             if m is not None:
                                 m[m != 0] = 1
                             # if params['version'] == 'IceExtent':
@@ -608,8 +608,9 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                             test_results[:,i,] = generated_output.to(torch.device('cpu')).numpy()
                             test_results_deterministic[i,] = deterministic_output.squeeze().to(torch.device('cpu')).numpy()
                             test_loss[i] = loss.item()
-                    del  test_set , test_raw, test_obs, x, target, m, deterministic_output,  generated_output , ds_test, obs_test, cond_mu, cond_var, cond_std, basic_unet
+                    del  test_set , test_raw, test_obs, m, deterministic_output,  generated_output , ds_test, obs_test, cond_mu, cond_var, cond_std, basic_unet
                     gc.collect()
+
                     ###################################################### has to be eddited for large ensembles!! #####################################################################
                     results_shape[:] = test_results[:]
                     results_shape_deterministic[:] = test_results_deterministic[:]
@@ -629,16 +630,14 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
 
                         results_shape_deterministic_extent[:] = test_results_deterministic_extent[:]
                         result_extent_deterministic = results_shape_deterministic_extent.unstack('flattened').transpose('time','lead_time',...)
+                        del results_shape_extent, results_shape_deterministic_extent
 
 
                     if obs_clim:
                         result = result.isel(channels = 0).expand_dims('channels', axis=2)
 
                     del  results_shape, test_results, test_results_untransformed,  results_shape_deterministic, test_results_deterministic, test_results_untransformed_deterministic
-                    try:
-                        del results_shape_extent
-                    except:
-                        pass
+
                     gc.collect()
                     result = (result * land_mask)
                     result_deterministic = (result_deterministic * land_mask)
@@ -669,28 +668,28 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
 
                     if params['combined_prediction']:
                         result_extent = (result_extent * land_mask)
-                        result_deterministic_extent = (result_deterministic_extent * land_mask)
+                        result_extent_deterministic = (result_extent_deterministic * land_mask)
                         if not NPSProj:
                             result_extent = reverse_pole_centric(result_extent, subset_dimensions)
-                            result_deterministic_extent = reverse_pole_centric(result_deterministic_extent, subset_dimensions)
+                            result_extent_deterministic = reverse_pole_centric(result_extent_deterministic, subset_dimensions)
 
                         result_extent = result_extent.to_dataset(name = 'nn_adjusted_extent')
                         result_extent = result_extent.where(result_extent >= 0.5, 0)
                         result_extent = result_extent.where(result_extent ==0, 1)
                         result = xr.combine_by_coords([result , result_extent])
 
-                        result_deterministic_extent = result_deterministic_extent.to_dataset(name = 'nn_adjusted_extent')
-                        result_deterministic_extent = result_deterministic_extent.where(result_deterministic_extent >= 0.5, 0)
-                        result_deterministic_extent = result_deterministic_extent.where(result_deterministic_extent ==0, 1)
-                        result_deterministic = xr.combine_by_coords([result_deterministic , result_deterministic_extent])
+                        result_extent_deterministic = result_extent_deterministic.to_dataset(name = 'nn_adjusted_extent')
+                        result_extent_deterministic = result_extent_deterministic.where(result_extent_deterministic >= 0.5, 0)
+                        result_extent_deterministic = result_extent_deterministic.where(result_extent_deterministic ==0, 1)
+                        result_deterministic = xr.combine_by_coords([result_deterministic , result_extent_deterministic])
 
 
                     monthly_results.append(result)
                     monthly_results_deterministic.append(result_deterministic)
                     
                     fig, ax = plt.subplots(1,1, figsize=(8,5))
-                    ax.plot(np.arange(1,epochs+1), epoch_loss, label = 'Epoch loss')
-                    ax.plot(np.arange(1,epochs+1), epoch_MSE, linestyle = 'dashed', label = 'Epoch MSE')
+                    ax.plot(np.arange(1,epochs+1), epoch_loss, label = 'Epoch loss total')
+                    ax.plot(np.arange(1,epochs+1), epoch_MSE, linestyle = 'dashed', label = 'Epoch MSE only')
                     ax.plot(np.arange(1,epochs+1), epoch_KLD, linestyle = 'dotted', label = 'Epoch KLD')
 
                     ax.set_title(f'Train Loss \n test loss (SIC only): {np.mean(test_loss)}') ###
@@ -701,10 +700,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                     plt.savefig(results_dir+f'/Figures/train_loss_198101-{test_year * 100 + month -1}.png')
                     plt.close()
 
-                    if save:
-                        nameSave = f"MODEL_V{params['version']}_198101-{test_year * 100 + month -1}.pth"
-                        torch.save( net.state_dict(),results_dir + '/' + nameSave)
-                    
+
                     del result,result_deterministic, net, optimizer
                     gc.collect()
                     torch.cuda.empty_cache() 

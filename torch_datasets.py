@@ -65,6 +65,9 @@ class XArrayDataset(Dataset):
             mcos = np.cos(2 * np.pi * target_month/12.0)
             self.time_features = np.stack([y, lt, msin, mcos, isin, icos], axis=1)
             self.time_features = self.time_features[:, [feature_indices[k] for k in time_features if k not in ['active_mask', 'full_ice_mask', 'land_mask']],...]
+            if self.time_features.shape[1] == 0:
+                self.use_time_features = False
+                self.time_features = None
         else:
             self.use_time_features = False
 

@@ -11,20 +11,24 @@ class cVAE(nn.Module):
         self.combined_prediction = combined_prediction
         self.VAE_MLP_encoder = VAE_MLP_encoder
         self.n_channels_x = n_channels_x
+        if self.combined_prediction:
+             num_obs_channels = 2
+        else:
+             num_obs_channels = 1
         if not NPS_proj:
             self.unet = prediction(n_channels_x, sigmoid, scale_factor_channels = scale_factor_channels )
-            self.recognition = prior_recognition(n_channels_x + 1, sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder, scale_factor_channels = scale_factor_channels)
-            self.prior = prior_recognition(n_channels_x + 1, sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder, scale_factor_channels = scale_factor_channels)
+            self.recognition = prior_recognition(n_channels_x + num_obs_channels, sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder, scale_factor_channels = scale_factor_channels)
+            self.prior = prior_recognition(n_channels_x + num_obs_channels, sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder, scale_factor_channels = scale_factor_channels)
             self.generation = generation(sigmoid = sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder, scale_factor_channels = scale_factor_channels)
         else:
             self.unet = prediction_NPS(n_channels_x, sigmoid, scale_factor_channels = scale_factor_channels)
-            self.recognition = prior_recognition_NPS(n_channels_x + 1, sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder, scale_factor_channels = scale_factor_channels)
-            self.prior = prior_recognition_NPS(n_channels_x + 1, sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder, scale_factor_channels = scale_factor_channels)
+            self.recognition = prior_recognition_NPS(n_channels_x + num_obs_channels, sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder, scale_factor_channels = scale_factor_channels)
+            self.prior = prior_recognition_NPS(n_channels_x + num_obs_channels, sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder, scale_factor_channels = scale_factor_channels)
             self.generation = generation_NPS(sigmoid = sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder, scale_factor_channels = scale_factor_channels)	
 				
         self.last_conv = OutConv(16, 1, sigmoid = sigmoid, NPS_proj= NPS_proj)
         if combined_prediction:
-            self.last_conv2 = OutConv(32, 1, sigmoid = True, NPS_proj = True)
+            self.last_conv2 = OutConv(16, 1, sigmoid = True, NPS_proj = True)
                   
         self.N = torch.distributions.Normal(0, 1)
             # Get sampling working on GPU
@@ -58,6 +62,7 @@ class cVAE(nn.Module):
         out_shape = z.shape
         z = torch.flatten(z, start_dim = 0, end_dim = 1)
         out = self.generation(z)
+        del z
         out = torch.unflatten(out, dim = 0 , sizes = out_shape[0:2])
         out = out + basic_unet.unsqueeze(0).expand_as(out)
         out = torch.flatten(out, start_dim = 0, end_dim = 1)
@@ -67,7 +72,7 @@ class cVAE(nn.Module):
             generated_output_extent = self.last_conv2(out)
             generated_output_extent = torch.unflatten(generated_output_extent, dim = 0 , sizes = out_shape[0:2])
             generated_output = (generated_output, generated_output_extent)
-
+        del out
         return generated_output, deterministic_output, mu, log_var , cond_mu, cond_log_var
 
     def sample( self, mu, log_var, sample_size = 1, seed = None, nstd = 1):
