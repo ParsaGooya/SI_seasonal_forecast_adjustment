@@ -12,7 +12,7 @@ import torch
 from torch.utils.data import DataLoader
 from torch.optim import lr_scheduler
 
-from models.cvae_0127 import cVAE
+from models.cvae_0226 import cVAE
 from losses import WeightedMSEKLD, WeightedMSE
 from losses import WeightedMSEKLDLowRess, WeightedMSELowRess, GlobalLoss, IceextentlLoss
 from preprocessing import align_data_and_targets, create_mask, config_grid, pole_centric, reverse_pole_centric, segment, reverse_segment, pad_xarray
@@ -382,7 +382,7 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
     n_channels_x = len(ds_train.channels)
 
 
-    net = cVAE(VAE_latent_size = params['VAE_latent_size'], n_channels_x= n_channels_x+ add_feature_dim , sigmoid = sigmoid_activation, NPS_proj = NPSProj, device=device, combined_prediction = params['combined_prediction'], VAE_MLP_encoder = params['VAE_MLP_encoder'], scale_factor_channels = params['scale_factor_channels'])
+    net = cVAE(VAE_latent_size = params['VAE_latent_size'], n_channels_x= n_channels_x+ add_feature_dim , sigmoid = sigmoid_activation, NPS_proj = NPSProj, device=device, combined_prediction = params['combined_prediction'], VAE_MLP_encoder = params['VAE_MLP_encoder'], scale_factor_channels = params['scale_factor_channels'], skip_VAE_added_dim = params['skip_VAE_added_dim'])
 
     net.to(device)
     optimizer = torch.optim.Adam(net.parameters(), lr=lr, weight_decay = l2_reg)
@@ -627,7 +627,7 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
     plt.twinx()
     plt.plot(np.arange(2,epochs+1), epoch_loss_train_KLD[1:], color = 'b', label = 'Train KLD', linestyle = 'dotted', alpha = 0.5)
     plt.plot(np.arange(2,epochs+1), epoch_loss_val_KLD[1:], color = 'darkorange', label = 'Val KLD', linestyle = 'dotted', alpha = 0.5)
-    plt.legend(loc="upper right", bbox_to_anchor=(1, 1))
+    plt.legend(loc="upper right", bbox_to_anchor=(1.5, 1.5))
     plt.ylabel('KLD')   
     plt.grid()
     plt.show()
@@ -693,6 +693,7 @@ def run_hp_tunning( ds_raw_ensemble_mean: XArrayDataset ,obs_raw: XArrayDataset,
                 f"VAE_latent_size\t{params['VAE_latent_size']}\n" + 
                 f"VAE_MLP_encoder\t{params['VAE_MLP_encoder']}\n"  + 
                 f"hybrid_weight\t{params['hybrid_weight']}\n" +
+                f"skip_VAE_added_dim\t{params['skip_VAE_added_dim']}\n" +
                 f"training_sample_size\t{params['training_sample_size']}\n\n\n" +
                 ' ----------------------------------------------------------------------------------\n'
             )
@@ -787,7 +788,8 @@ if __name__ == "__main__":
         'BVAE' : 50,
         'loss_reduction' : 'mean' , # mean or sum
         'combined_prediction' : False,
-        'hybrid_weight' : 0.5
+        'hybrid_weight' : 0.5,
+        'skip_VAE_added_dim' : False,
     }
 
 
@@ -797,7 +799,7 @@ if __name__ == "__main__":
     lead_time = None
     n_runs = 1  # number of training runs
     params['version'] = 1 ### 1 , 2 ,3, 'PatternsOnly' , 'IceExtent'
-    params['beta'] =   dict(start = 0, end =1, start_epoch = 1 , end_epoch = params['epochs']) 
+    params['beta'] =   1#dict(start = 0, end =1, start_epoch = 1 , end_epoch = params['epochs']) 
     ### load data
 
     obs_ref = 'NASA'
@@ -811,7 +813,7 @@ if __name__ == "__main__":
     ds_raw_ensemble_mean, obs_raw, params, zeros_mask_full, land_masks = HP_congif(params, obs_ref, lead_months, y_start, y_end, NPSProj=NPSProj)
     ########################################################### Set HP space specifics #########################################################################
     
-    config_dict = {  'batch_size': [10,50, 100], 'VAE_latent_size' : [2,10, 50] }
+    config_dict = {  'beta' : [0.05,0.1, 0.5] , 'VAE_latent_size' : [2,10,50]}
     hyperparameterspace = config_grid(config_dict).full_grid()
 
     ##################################################################  Adjust the path if necessary #############3##############################################
@@ -820,11 +822,15 @@ if __name__ == "__main__":
         model_type = 'CGNhybrid'
     else:
         model_type = 'CVAE'    
+    if params['skip_VAE_added_dim']:
+        model_type = 'skip-' + model_type
     
     if lead_time is None:
         out_dir = out_dir_x + f'NV{params["num_val_years"]}_M{lead_months}_{params["subset_dimensions"]}_v{params["version"]}_{model_type}'
     else:
         out_dir = out_dir_x + f'NV{params["num_val_years"]}_LT{lead_time}_{params["subset_dimensions"]}_v{params["version"]}_{model_type}'
+    if type(params['beta']) == dict:
+        out_dir = out_dir + '_betaAnealing'
 
     if params['VAE_MLP_encoder']:
         out_dir = out_dir + '_Linear'

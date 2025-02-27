@@ -10,7 +10,7 @@ from torch.distributions import Normal
 import torch
 from torch.utils.data import DataLoader
 from torch.optim import lr_scheduler
-from models.cvae_0127 import cVAE
+from models.cvae_0226 import cVAE
 from losses import WeightedMSEKLD, WeightedMSE
 from losses import WeightedMSEKLDLowRess, WeightedMSELowRess
 from preprocessing import align_data_and_targets, create_mask, pole_centric, reverse_pole_centric, segment, reverse_segment, pad_xarray
@@ -282,6 +282,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
             f"scale_factor_channels\t{params['scale_factor_channels']}\n"  + 
             f"VAE_MLP_encoder\t{params['VAE_MLP_encoder']}\n"  + 
             f"training_sample_size\t{params['training_sample_size']}\n" +
+            f"skip_VAE_added_dim\t{params['skip_VAE_added_dim']}\n" +
             f"hybrid_weight\t{params['hybrid_weight']}\n"
         )
     del ds_raw
@@ -412,7 +413,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                 n_channels_x = len(ds_train.channels)
 
 
-                net = cVAE(VAE_latent_size = params['VAE_latent_size'], n_channels_x= n_channels_x+ add_feature_dim , sigmoid = sigmoid_activation, NPS_proj = NPSProj, device=device, combined_prediction = params['combined_prediction'], VAE_MLP_encoder = params['VAE_MLP_encoder'], scale_factor_channels = params['scale_factor_channels'])
+                net = cVAE(VAE_latent_size = params['VAE_latent_size'], n_channels_x= n_channels_x+ add_feature_dim , sigmoid = sigmoid_activation, NPS_proj = NPSProj, device=device, combined_prediction = params['combined_prediction'], VAE_MLP_encoder = params['VAE_MLP_encoder'], scale_factor_channels = params['scale_factor_channels'], skip_VAE_added_dim = params['skip_VAE_added_dim'])
 
                 net.to(device)
                 optimizer = torch.optim.Adam(net.parameters(), lr=lr, weight_decay = l2_reg)
@@ -765,6 +766,7 @@ if __name__ == "__main__":
         'loss_reduction' : 'mean' , # mean or sum
         'combined_prediction' : False,
         'hybrid_weight' : 0.5, ### CVAE weight
+        'skip_VAE_added_dim' : False,
     }
 
 
@@ -789,6 +791,8 @@ if __name__ == "__main__":
         model_type = 'CGNhybrid'
     else:
         model_type = 'CVAE'
+    if params['skip_VAE_added_dim']:
+        model_type = 'skip-' + model_type
 
     if lead_time is None:
         out_dir    = f'{out_dir_x}/N{n_years}_M{lead_months}_F{params["forecast_range_months"]}_v{params["version"]}_{beta_arg}_batch{params["batch_size"]}_e{params["epochs"]}_Cscale{params["scale_factor_channels"]}_{model_type}_{params["BVAE"]}-{params["training_sample_size"]}_LS{params["VAE_latent_size"]}'

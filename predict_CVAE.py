@@ -30,8 +30,10 @@ data_dir_forecast = LOC_FORECASTS_SI
 
 def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, model_dir,  test_years, NPSProj  = False,  model_year = None, ensemble_list = None, ensemble_mode = 'Mean', btstrp_it = 200, save=True):
 
-    if 'run_set_1' in model_dir:
+    if 'run_set_1_0127' in model_dir:
         from models.cvae_0127 import cVAE
+    elif 'run_set_1' in model_dir:
+        from models.cvae_0226 import cVAE
     else:
         from models.cvae import cVAE
 
@@ -79,6 +81,8 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
     model = params['model']
     forecast_preprocessing_steps = params["forecast_preprocessing_steps"]
     observations_preprocessing_steps = params["observations_preprocessing_steps"]
+    if 'skip_VAE_added_dim' not in params.keys():
+        params['skip_VAE_added_dim'] = False
     try:
         ensemble_mode = params['ensemble_mode']
     except:
@@ -341,7 +345,7 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
         pass
     
 
-    net = cVAE(VAE_latent_size = params['VAE_latent_size'], n_channels_x= n_channels_x+ add_feature_dim , sigmoid = sigmoid_activation, NPS_proj = NPSProj, device=device, combined_prediction = params['combined_prediction'],scale_factor_channels = scale_factor_channels, VAE_MLP_encoder = params['VAE_MLP_encoder'])
+    net = cVAE(VAE_latent_size = params['VAE_latent_size'], n_channels_x= n_channels_x+ add_feature_dim , sigmoid = sigmoid_activation, NPS_proj = NPSProj, device=device, combined_prediction = params['combined_prediction'],scale_factor_channels = scale_factor_channels, VAE_MLP_encoder = params['VAE_MLP_encoder'], skip_VAE_added_dim = params['skip_VAE_added_dim'])
 
 
     print('Loading model ....')
@@ -424,7 +428,7 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
             del z
             out = torch.unflatten(out, dim = 0, sizes = (params['BVAE'],cond_var.shape[0]))
             out = out + basic_unet.squeeze() 
-            out = torch.flatten(out, start_dim = 0, end_dim = 1)
+            out = torch.flatten(out, start_dim = 0, end_dim = 1)            
             generated_output = net.last_conv(out)
             
             if params['combined_prediction']:
