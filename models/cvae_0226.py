@@ -6,29 +6,60 @@ from models.partialconv2d import PartialConv2d
 
 class cVAE(nn.Module):
 	
-    def __init__( self, VAE_latent_size, n_channels_x=1 ,  sigmoid = True, NPS_proj = False,scale_factor_channels = None, combined_prediction = False, VAE_MLP_encoder = False,skip_VAE_added_dim = False, device = 'cpu' ):
+    def __init__( self, VAE_latent_size, n_channels_x=1 ,  sigmoid = True, NPS_proj = False,scale_factor_channels = None, combined_prediction = False, VAE_MLP_encoder = False,skip_VAE_added_dim = False, saved_deterministic_model = None, freeze_deterministic = True, device = 'cpu' ):
         super().__init__()
         self.combined_prediction = combined_prediction
         self.VAE_MLP_encoder = VAE_MLP_encoder
         self.n_channels_x = n_channels_x
+        self.loaded_unet = True if saved_deterministic_model is not None else False
         if self.combined_prediction:
              num_obs_channels = 2
         else:
              num_obs_channels = 1
+
+        # if saved_deterministic_model is not None:
+        #      for param in saved_deterministic_model.parameters():
+        #         param.requires_grad = False
+
         if not NPS_proj:
-            self.unet = prediction(n_channels_x, sigmoid, scale_factor_channels = scale_factor_channels )
+            if saved_deterministic_model is None:
+                self.unet = prediction(n_channels_x, sigmoid, scale_factor_channels = scale_factor_channels )
+            else:
+                self.unet = Trimed_unet(saved_deterministic_model)
+                if freeze_deterministic:
+                    for param in self.unet.parameters():
+                        param.requires_grad = False
+
             self.recognition = prior_recognition(n_channels_x + num_obs_channels, sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder, scale_factor_channels = scale_factor_channels)
             self.prior = prior_recognition(n_channels_x + num_obs_channels, sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder, scale_factor_channels = scale_factor_channels)
             self.generation = generation(sigmoid = sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder, scale_factor_channels = scale_factor_channels, skip_VAE_added_dim = skip_VAE_added_dim)
         else:
-            self.unet = prediction_NPS(n_channels_x, sigmoid, scale_factor_channels = scale_factor_channels)
+            if saved_deterministic_model is None:
+                self.unet = prediction_NPS(n_channels_x, sigmoid, scale_factor_channels = scale_factor_channels)
+            else:
+                self.unet = Trimed_unet_NPS(saved_deterministic_model)
+                if freeze_deterministic:
+                    for param in self.unet.parameters():
+                        param.requires_grad = False
+
             self.recognition = prior_recognition_NPS(n_channels_x + num_obs_channels, sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder, scale_factor_channels = scale_factor_channels)
             self.prior = prior_recognition_NPS(n_channels_x + num_obs_channels, sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder, scale_factor_channels = scale_factor_channels)
             self.generation = generation_NPS(sigmoid = sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder, scale_factor_channels = scale_factor_channels, skip_VAE_added_dim = skip_VAE_added_dim)	
-				
-        self.last_conv = OutConv(16  , 1, sigmoid = sigmoid, NPS_proj= NPS_proj)
-        if combined_prediction:
-            self.last_conv2 = OutConv(16 , 1, sigmoid = True, NPS_proj = True)
+		
+        if saved_deterministic_model:
+            self.last_conv = saved_deterministic_model.last_conv
+            if freeze_deterministic:
+                for param in self.last_conv.parameters():
+                        param.requires_grad = False
+            if combined_prediction:
+                self.last_conv2 = saved_deterministic_model.last_conv2
+                if freeze_deterministic:
+                    for param in self.last_conv2.parameters():
+                        param.requires_grad = False
+        else:		
+            self.last_conv = OutConv(16  , 1, sigmoid = sigmoid, NPS_proj= NPS_proj)
+            if combined_prediction:
+                self.last_conv2 = OutConv(16 , 1, sigmoid = True, NPS_proj = True)
                   
         self.N = torch.distributions.Normal(0, 1)
             # Get sampling working on GPU
@@ -38,7 +69,7 @@ class cVAE(nn.Module):
         
     def forward(self, obs, obs_mask, model, model_mask, sample_size = 1, seed = None, nstd = 1, mode = 'CVAE'):
             
-        basic_unet = self.unet(model, model_mask)
+        basic_unet = self.unet(model, model_mask) if not self.loaded_unet else self.unet(model, model_mask[0,...])
         deterministic_output = self.last_conv(basic_unet)
         if self.combined_prediction:
             deterministic_output_extent = self.last_conv2(basic_unet)
@@ -109,6 +140,10 @@ class generation(nn.Module):
             self.skip2 = nn.Linear(VAE_latent_size, 1 *25*45)
             self.skip3 = nn.Linear(VAE_latent_size, 1 *50 * 90)
             self.skip4 = nn.Linear(VAE_latent_size, 1 *100 * 180)
+            self.skil4conv =  SingleConvNext(17, 16,  multi_channel=False, return_mask=False) 
+                            #nn.Sequential(PartialConv2d(17, 16, kernel_size=3, padding= 1, multi_channel=False, return_mask=False),
+                            # LayerNorm(16, data_format='channels_first' ),
+                            # nn.GELU())
             self.added_dim  = 1
 
         self.up1 = Up(256 , 128, scale_factor_channels = scale_factor_channels)
@@ -141,7 +176,10 @@ class generation(nn.Module):
         if self.added_dim >0:
             z_ = self.skip4(z)
             z_ = torch.unflatten(z_, dim = 1, sizes = (self.added_dim,100,180))
-            x = x + z_.expand_as(x)
+            x = self.skil4conv(torch.cat([x, z_], dim = 1))
+            # x = x + z_.expand_as(x)
+            # x = self.bn_last(x)
+            # x = self.act_last(x)
         return x
 	
 class generation_NPS(nn.Module):
@@ -162,6 +200,11 @@ class generation_NPS(nn.Module):
             self.skip3 = nn.Linear(VAE_latent_size, 1 *108 * 108)
             self.skip4 = nn.Linear(VAE_latent_size, 1 *216 * 216)
             self.skip5 = nn.Linear(VAE_latent_size, 1 *432 * 432)
+
+            self.skil5conv =   SingleConvNext(17, 16,  multi_channel=False, return_mask=False) 
+                            #nn.Sequential(PartialConv2d(17, 16, kernel_size=3, padding= 1, multi_channel=False, return_mask=False),
+                            # LayerNorm(16, data_format='channels_first' ),
+                            # nn.GELU())
             self.added_dim  = 1
 
         self.up1 = Up(512, 256, scale_factor_channels = scale_factor_channels)
@@ -200,7 +243,10 @@ class generation_NPS(nn.Module):
         if self.added_dim >0:
             z_ = self.skip5(z)
             z_ = torch.unflatten(z_, dim = 1, sizes = (self.added_dim,432,432))
-            x = x + z_.expand_as(x)
+            x = self.skil5conv(torch.cat([x, z_], dim = 1))
+            # x = x + z_.expand_as(x)
+            # x = self.bn_last(x)
+            # x = self.act_last(x)
         return x
 	
 
@@ -513,6 +559,52 @@ class DoubleConvNext(nn.Module):
                     return x
 
 
+class SingleConvNext(nn.Module):
+    r"""Adopted from from https://github.com/m2lines/Samudra/blob/main/samudra/model.py"""
+    def __init__(self, in_channels, out_channels,  multi_channel=False, return_mask=False):
+        super().__init__()
+
+        self.return_mask = return_mask
+        self.multi_channel = multi_channel
+                # 1x1 conv to increase/decrease channel depth if necessary
+        if in_channels == out_channels:
+            self.skip_module = lambda x: x  # Identity-function required in forward pass
+            self.lambda_skip = True
+        else:
+            self.lambda_skip = False
+            self.skip_module = PartialConv2d(in_channels=in_channels,out_channels=out_channels,kernel_size=1,bias = False, multi_channel=multi_channel, return_mask=False)
+                
+        self.conv1 = PartialConv2d(in_channels, in_channels, kernel_size=3, padding= 1, multi_channel=multi_channel, return_mask=True)
+        self.bn1 = LayerNorm(in_channels, data_format='channels_first' )
+        self.act1 = nn.GELU()
+        
+        self.mlp = PartialConv2d(in_channels=in_channels,out_channels=out_channels,kernel_size=1,bias = False, multi_channel=multi_channel, return_mask=True)
+
+
+    def forward(self, x, mask = None):
+            
+            if self.multi_channel:
+                assert mask is not None
+            if  self.lambda_skip:
+                skip = self.skip_module(x)     
+            else:
+                skip = self.skip_module(x, mask)
+            x, mask = self.conv1(x, mask)
+            x = self.bn1(x)
+            x = self.act1(x)
+            if not self.multi_channel:
+                mask = None
+
+            x, mask= self.mlp(x, mask)
+            # x= self.mlp(x)
+            x = x + skip
+
+            if self.return_mask:
+                return x, mask
+            else:
+                return x
+
+
 class Down(nn.Module):
         """Downscaling with double conv then maxpool"""
 
@@ -648,3 +740,116 @@ def pad_ice(x,   size): # NxCxHxW
 
 
 
+
+class Trimed_unet(nn.Module):
+    def __init__(self, original_model):
+        super().__init__()
+
+        self.n_channels_x = original_model.n_channels_x
+        self.bilinear = original_model.bilinear
+        self.skip_connection = original_model.skip_connection
+    
+        self.initial_conv = original_model.initial_conv
+
+        self.d1 = original_model.d1
+        self.d2 = original_model.d2
+        self.d3 = original_model.d3
+        self.d4 = original_model.d4
+
+        self.last_conv_down = original_model.last_conv_down
+
+        self.up1 = original_model.up1
+        self.up2 = original_model.up2 
+        self.up3 = original_model.up3
+        self.up4 = original_model.up4
+
+                    
+    def forward(self, x, mask, ind = None):
+
+        if (type(x) == list) or (type(x) == tuple):    
+            x_in = torch.cat([x[0], x[1]], dim=1)
+        else:
+            x_in = x
+        mask = mask.unsqueeze(0)#.expand_as(x_in[0])      # uncomment if multichannel is True
+        x1, mask1 = self.initial_conv(x_in, mask)  # (batch, 32, 100, 180)
+
+    # Downsampling
+        x2, x2_bm, mask2, mask2_bm  = self.d1(x1, mask1)  # (batch, 64, 50, 90) (batch, 32, 100, 180)
+        x3, x3_bm, mask3, mask3_bm  = self.d2(x2, mask2)  # (batch, 128, 25, 45) (batch, 64, 50, 90)
+        x4, x4_bm, mask4, mask4_bm = self.d3(x3, mask3)  # (batch, 256, 12, 22) (batch, 128, 25, 45)
+        x5, x5_bm, mask5, mask5_bm  = self.d4(x4, mask4)  # (batch, 512, 6, 11) (batch, 256, 12, 22)
+        
+        x6 = self.last_conv_down(x5, mask5)  # (batch, 512, 6, 11)
+        
+        # Upsampling
+        if self.skip_connection:
+            x = self.up1(x6, x5_bm, mask5_bm)  # (batch, 256, 12, 22)
+            x = self.up2(x, x4_bm, mask4_bm)  # (batch, 128, 25, 45)
+            x = self.up3(x, x3_bm, mask3_bm)  # (batch, 64, 50, 90)
+            x = self.up4(x, x2_bm, mask2_bm)  # (batch, 32, 100, 180)
+        else:
+            x = self.up1(x6)  # (batch, 256, 12, 22)
+            x = self.up2(x)  # (batch, 128, 25, 45)
+            x = self.up3(x)  # (batch, 64, 50, 90)
+            x = self.up4(x)  # (batch, 32, 100, 180)			
+        
+        return x
+    
+
+class Trimed_unet_NPS(nn.Module):
+    def __init__(self, original_model):
+        super().__init__()
+
+        self.n_channels_x = original_model.n_channels_x
+        self.bilinear = original_model.bilinear
+        self.skip_connection = original_model.skip_connection
+    
+        self.initial_conv = original_model.initial_conv
+
+        self.d1 = original_model.d1
+        self.d2 = original_model.d2
+        self.d3 = original_model.d3
+        self.d4 = original_model.d4
+        self.d5 = original_model.d5
+
+        self.last_conv_down = original_model.last_conv_down
+
+        self.up1 = original_model.up1
+        self.up2 = original_model.up2 
+        self.up3 = original_model.up3
+        self.up4 = original_model.up4
+        self.up5 = original_model.up5
+                    
+    def forward(self, x, mask, ind = None):
+
+        if (type(x) == list) or (type(x) == tuple):    
+            x_in = torch.cat([x[0], x[1]], dim=1)
+        else:
+            x_in = x
+        mask = mask.unsqueeze(0)#.expand_as(x_in[0])   # uncomment if multichannel is True
+        x1, mask1 = self.initial_conv(x_in, mask)  # (batch, 32, 432, 432)
+
+    # Downsampling
+        x2, x2_bm, mask2, mask2_bm  = self.d1(x1, mask1)  # (batch, 64, 216, 216) (batch, 32, 432, 432)
+        x3, x3_bm, mask3, mask3_bm  = self.d2(x2, mask2)  # (batch, 128, 108, 108) (batch, 64, 216, 216)
+        x4, x4_bm, mask4, mask4_bm = self.d3(x3, mask3)  # (batch, 256, 54, 54)  (batch, 128, 108, 108)
+        x5, x5_bm, mask5, mask5_bm  = self.d4(x4, mask4)  # (batch, 512, 27, 27) (batch, 256, 54, 54)
+        x6, x6_bm, mask6, mask6_bm  = self.d5(x5, mask5)  # (batch, 1024, 13, 13) (batch, 512, 27, 27)
+
+        x7 = self.last_conv_down(x6, mask6)  # (batch, 1024, 13, 13)
+
+        # Upsampling
+        if self.skip_connection:
+            x = self.up1(x7, x6_bm, mask6_bm)  # (batch, 512, 27, 27)
+            x = self.up2(x, x5_bm, mask5_bm)  # (batch, 256, 54, 54)
+            x = self.up3(x, x4_bm, mask4_bm)  # (batch, 128, 108, 108)
+            x = self.up4(x, x3_bm, mask3_bm)  # (batch, 64, 216, 216)
+            x = self.up5(x, x2_bm, mask2_bm)  # (batch, 32, 432, 432)
+        else:
+            x = self.up1(x7)  # (batch, 512, 27, 27)
+            x = self.up2(x)  # (batch, 256, 54, 54)
+            x = self.up3(x)  # (batch, 128, 108, 108)
+            x = self.up4(x)  # (batch, 64, 216, 216)
+            x = self.up5(x)  # (batch, 32, 432, 432)					
+        
+        return x

@@ -170,3 +170,11 @@ Jobs/
 
 models/cvae_0127.py
 run_training_CVAE_0127.py
+
+
+BashHelloJob.err
+BashHelloJob.out
+mjob.sh
+mjob2.sh
+output.txt
+qstat.txt

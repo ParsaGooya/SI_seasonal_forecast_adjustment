@@ -15,9 +15,9 @@ from models.unet import UNet, UNetLCL,UNet_NPS
 from models.unetconvnext import UNet2,UNet2_NPS
 from models.convlstm import UNetLSTM, PNet, CNNLSTM, CNNLSTM_monthly, UNetLSTM_monthly
 from models.cnn import CNN, RegCNN
-from losses import WeightedMSE, WeightedMSEGlobalLoss
-from losses import WeightedMSELowRess , WeightedMSEGlobalLossLowRess, GlobalLoss, IceextentlLoss
-from preprocessing import align_data_and_targets, create_mask, config_grid, pole_centric, reverse_pole_centric, segment, reverse_segment, pad_xarray
+from losses import WeightedMSE, WeightedMSEGlobalLoss, WeightedMSELowRess
+from losses import GlobalLoss, IceextentlLoss
+from preprocessing import align_data_and_targets, create_mask, config_grid, pole_centric, reverse_pole_centric, segment, reverse_segment, pad_xarray, smoother
 from preprocessing import AnomaliesScaler_v1_seasonal, AnomaliesScaler_v2_seasonal, Standardizer, PreprocessingPipeline, calculate_climatology,bias_adj, zeros_mask_gen, Normalizer
 from torch_datasets import XArrayDataset, ConvLSTMDataset
 import torch.nn as nn
@@ -151,7 +151,7 @@ def HP_congif(params, obs_ref, lead_months, y_start, y_end, NPSProj = False):
     zeros_mask_full = zeros_mask_full.expand_dims('channels', axis=-3)          
     if 'ensembles' in ds_raw.dims:
         zeros_mask_full = zeros_mask_full.expand_dims('ensembles', axis=2)
-    
+ 
     obs_clim = params["obs_clim"]
 
     if obs_clim:
@@ -175,6 +175,7 @@ def HP_congif(params, obs_ref, lead_months, y_start, y_end, NPSProj = False):
         obs_raw = obs_raw.where(obs_raw ==0 , 1)
         # ds_raw_ensemble_mean = ds_raw_ensemble_mean.where(ds_raw_ensemble_mean>=0.15,0)
         # ds_raw_ensemble_mean = ds_raw_ensemble_mean.where(ds_raw_ensemble_mean ==0 , 1)
+        params['loss_function'] = 'BCELoss'
         
     if params['combined_prediction']:
         obs_raw_ = obs_raw.where(obs_raw>=0.15,0)
@@ -227,10 +228,11 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
     land_mask = land_masks[0]
     if params['NPSProj']:
         mask_projection = land_masks[2]
+        
+    if not params['masked_weights']:
+        assert 'land_mask' in params['time_features']
 
     assert params['version'] in [1,2,3, 'IceExtent']
-
-    
 
     if params['version'] == 2:
 
@@ -243,6 +245,11 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
 
     if params['version'] == 'IceExtent':
         params['reg_scale'] = None
+        params['combined_prediction'] = False
+        assert params['multi_ress_loss_kernel_size']  is None
+        assert params['low_ress_loss_kernel_size']  is None
+        assert params['loss_reduction'] == 'mean', 'Loss reduction SUM not yet set in the loss ...'
+
 
     for key, value in hyperparamater_grid.items():
             params[key] = value 
@@ -253,10 +260,12 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
         total_iters = params['total_iters']
 
         
-    if params['low_ress_loss']:
+    if params['multi_ress_loss_kernel_size'] is not None:
         params['active_grid'] = False
-        print('Warning: active_grid turned off because low_ress_loss is on!')
-
+        print('Warning: active_grid turned off because multi_ress_loss is on!')
+        assert params['low_ress_loss_kernel_size'] is None
+    if params['low_ress_loss_kernel_size'] is not None:
+        assert params['multi_ress_loss_kernel_size'] is None
     ##### PG: Ensemble members to load 
     ensemble_list = params['ensemble_list']
     ###### PG: Add ensemble features to training features
@@ -275,7 +284,7 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
     lr = params["lr"]
     l2_reg = params['L2_reg']
     active_grid = params['active_grid']
-    low_ress_loss = params['low_ress_loss']
+    multi_ress_loss_kernel_size = params['multi_ress_loss_kernel_size']
     forecast_preprocessing_steps = params["forecast_preprocessing_steps"]
     observations_preprocessing_steps = params["observations_preprocessing_steps"]
 
@@ -371,10 +380,20 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
         ds_validation = ds[n_train:n_train + num_val_years*12,...]
         obs_validation = obs[n_train:n_train + num_val_years*12,...]
 
+    land_mask_smooth = land_mask.copy()
+    land_mask_smooth[:] = smoother(land_mask, 5)
+    land_mask_smooth = land_mask_smooth.where(land_mask_smooth == 0 ,1)
+
+    if params['masked_weights']:
+        weights_mask = land_mask.copy()
+        weights_mask[:] = smoother(land_mask, 5)
+        weights_mask = weights_mask.where(weights_mask == 0 ,1).values
+    else:
+        weights_mask = None
     if params['NPSProj']:
         weights = (np.ones_like(ds_train.lon) * (np.ones_like(ds_train.lat.to_numpy()))[..., None])  # Moved this up
         weights = xr.DataArray(weights, dims = ds_train.dims[-2:], name = 'weights').assign_coords({'lat': ds_train.lat, 'lon' : ds_train.lon})
-        weights = weights * land_mask
+        # weights = weights * land_mask_smooth  if params['masked_weights'] else weights
         weights_val = weights.copy() * land_mask
     else:       
         weights = np.cos(np.ones_like(ds_train.lon) * (np.deg2rad(ds_train.lat.to_numpy()))[..., None])  # Moved this up
@@ -384,8 +403,8 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
         if params['equal_weights']:
             weights = xr.ones_like(weights)
         # if any(['land_mask' not in time_features, model not in [UNet2]]):
-        weights = weights * land_mask
-
+        # weights = weights * land_mask_smooth  if params['masked_weights'] else weights
+    del land_mask_smooth
     if loss_region is not None:
         loss_region_indices, loss_area = get_coordinate_indices(ds_raw_ensemble_mean, loss_region)
     
@@ -450,22 +469,16 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
 
         criterion = nn.BCELoss()
     else:
+        if params['low_ress_loss_kernel_size'] is None: 
+        # if reg_scale is None: ## PG: if no penalizing for negative anomalies
 
-        if reg_scale is None: ## PG: if no penalizing for negative anomalies
-            if low_ress_loss:
-                criterion = WeightedMSELowRess(weights=weights, device=device, hyperparam=1, reduction='mean', loss_area=loss_region_indices)
-                criterion_MSE = WeightedMSELowRess(weights=weights, device=device, hyperparam=1, reduction='mean', loss_area=loss_region_indices)
-            else:
-                criterion = WeightedMSE(weights=weights, device=device, hyperparam=1, reduction='mean', loss_area=loss_region_indices)
-                criterion_MSE = WeightedMSE(weights=weights, device=device, hyperparam=1, reduction='mean', loss_area=loss_region_indices)
+                criterion = WeightedMSE(weights=weights, device=device, weights_mask = weights_mask, hyperparam=1, reduction='mean', loss_area=loss_region_indices, multi_ress_loss_kernel_size = multi_ress_loss_kernel_size)
+                criterion_MSE = WeightedMSE(weights=weights, device=device, weights_mask = weights_mask, hyperparam=1, reduction='mean', loss_area=loss_region_indices, multi_ress_loss_kernel_size = multi_ress_loss_kernel_size)
 
         else:
-            if low_ress_loss:
-                criterion = WeightedMSEGlobalLossLowRess(weights=weights, device=device, hyperparam=1, reduction='mean', loss_area=loss_region_indices, scale=reg_scale, map = True)
-                criterion_MSE = WeightedMSELowRess(weights=weights, device=device, hyperparam=1, reduction='mean', loss_area=loss_region_indices)
-            else:
-                criterion = WeightedMSEGlobalLoss(weights=weights, device=device, hyperparam=1, reduction='mean', loss_area=loss_region_indices, scale=reg_scale, map = True)
-                criterion_MSE = WeightedMSE(weights=weights, device=device, hyperparam=1, reduction='mean', loss_area=loss_region_indices)
+
+                criterion = WeightedMSELowRess(weights=weights, device=device, weights_mask = weights_mask, hyperparam=1, reduction='mean', loss_area=loss_region_indices, kernel = params['low_ress_loss_kernel_size'])
+                criterion_MSE = WeightedMSELowRess(weights=weights, device=device, weights_mask = weights_mask, hyperparam=1, reduction='mean', loss_area=loss_region_indices, kernel = params['low_ress_loss_kernel_size'])
 
         if params['combined_prediction']:
                 criterion_extent = nn.BCELoss()
@@ -488,16 +501,11 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
     if params['version'] == 'IceExtent':
         criterion_eval = nn.BCELoss()
     else:
-        if reg_scale is None:
-            if low_ress_loss:
-                criterion_eval =  WeightedMSELowRess(weights=weights_val, device=device, hyperparam=1, reduction='mean', loss_area=loss_region_indices)
-            else:    
-                criterion_eval =  WeightedMSE(weights=weights_val, device=device, hyperparam=1, reduction='mean', loss_area=loss_region_indices)
+        # if reg_scale is None:
+        if params['low_ress_loss_kernel_size'] is None:
+                criterion_eval =  WeightedMSE(weights=weights, device=device, weights_mask = weights_mask, hyperparam=1, reduction='mean', loss_area=loss_region_indices, multi_ress_loss_kernel_size = multi_ress_loss_kernel_size)
         else:
-            if low_ress_loss:
-                criterion_eval = WeightedMSEGlobalLossLowRess(weights=weights_val, device=device, hyperparam=1, reduction='mean', loss_area=loss_region_indices, scale=reg_scale, map = True)
-            else:
-                criterion_eval = WeightedMSEGlobalLoss(weights=weights_val, device=device, hyperparam=1, reduction='mean', loss_area=loss_region_indices, scale=reg_scale, map = True)
+                criterion_eval = WeightedMSELowRess(weights=weights, device=device, weights_mask = weights_mask, hyperparam=1, reduction='mean', loss_area=loss_region_indices, kernel = params['low_ress_loss_kernel_size'])
     
     criterion_eval_MSE =   WeightedMSE(weights=weights_val, device=device, hyperparam=1, reduction='mean', loss_area=loss_region_indices)
     # WeightedMSEGlobalLoss(weights=weights, device=device, hyperparam=1, reduction='mean', loss_area=loss_region_indices, scale=10, map  =True)
@@ -647,6 +655,7 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
         epoch_loss_val_extent = np.zeros_like(epoch_loss_val_extent)
 
     plt.figure(figsize = (8,5))
+
     plt.plot(np.arange(2,epochs+1), epoch_loss_train[1:], color = 'b', label = 'Train Loss Total')
     plt.plot(np.arange(2,epochs+1), epoch_loss_val[1:], color = 'darkorange', label = 'Validation Loss Total')
     plt.plot(np.arange(2,epochs+1), epoch_loss_train_MSE[1:], color = 'b', label = 'Train MSE', linestyle = 'dashed', alpha = 0.5)
@@ -720,7 +729,7 @@ def run_hp_tunning( ds_raw_ensemble_mean: XArrayDataset ,obs_raw: XArrayDataset,
                 f"decoder_kernel_size\t{params['decoder_kernel_size']}\n" +
                 f"L2_reg\t{params['L2_reg']}\n" +
                 f"skip_conv\t{params['skip_conv']}\n" +
-                f"low_ress_loss\t{params['low_ress_loss']}\n" +
+                f"multi_ress_loss_kernel_size\t{params['multi_ress_loss_kernel_size']}\n" +
                 f"equal_weights\t{params['equal_weights']}\n" +
                 f"active_grid\t{params['active_grid']}\n\n\n" +
                 ' ----------------------------------------------------------------------------------\n'
@@ -734,10 +743,17 @@ def run_hp_tunning( ds_raw_ensemble_mean: XArrayDataset ,obs_raw: XArrayDataset,
         
         for ind, dic in enumerate(hyperparameterspace):
             print(f'Training for {dic}')
+            try:
             # losses[ind], val_losses[ind_, ind, :], val_losses_global[ind_, ind, :], val_losses_corr[ind_, ind, :],  train_losses[ind_, ind, :] = run_training_hp(dic, params, test_year=test_year, lead_years=lead_years, n_runs=n_runs, results_dir=out_dir, numpy_seed=1, torch_seed=1)
-            losses[ind], val_losses[ind_, ind, :],  train_losses[ind_, ind, :] ,val_losses_area[ind_, ind, :],  val_losses_extent[ind_, ind, :], val_losses_mean[ind_, ind, :],  train_losses_MSE[ind_, ind, :] = training_hp(ds_raw_ensemble_mean =  ds_raw_ensemble_mean,obs_raw = obs_raw ,
+                   losses[ind], val_losses[ind_, ind, :],  train_losses[ind_, ind, :] ,val_losses_area[ind_, ind, :],  val_losses_extent[ind_, ind, :], val_losses_mean[ind_, ind, :],  train_losses_MSE[ind_, ind, :] = training_hp(ds_raw_ensemble_mean =  ds_raw_ensemble_mean,obs_raw = obs_raw ,
                    hyperparamater_grid= dic,zeros_mask_full = zeros_mask_full,land_masks=land_masks, params = params , test_year=test_year, lead_time = lead_time, n_runs=n_runs, results_dir=out_dir, numpy_seed=numpy_seed, torch_seed=torch_seed)
-
+            except Exception as e:
+                with open(Path(out_dir, "Hyperparameter_training.txt"), 'a') as f:
+                    f.write(
+            
+                        f"{dic} ---> Error: \n {e} \n" +  ## PG: The scale to be passed to Signloss regularization
+                        f"-------------------------------------------------------------------------------------------------------------------------------------------------------------------------\n" 
+                    )
         
         with open(Path(out_dir, "Hyperparameter_training.txt"), 'a') as f:
             f.write(
@@ -786,13 +802,13 @@ if __name__ == "__main__":
     params = {
         "model": UNet2,
         "hidden_dims":  [ 64, 128,256, 128, 64],#[16, 64, 128, 64, 32],## only for (Reg)CNN
-        "time_features": ['month_sin','month_cos', 'imonth_sin', 'imonth_cos'],
+        "time_features": ['month_sin','month_cos', 'imonth_sin', 'imonth_cos', 'land_mask'],
         "obs_clim" : False,
         "ensemble_features": False, ## PG
         'ensemble_list' : None, ## PG
         'ensemble_mode' : 'Mean',
         "epochs": 100,
-        "batch_size": 25,
+        "batch_size": 100,
         "reg_scale" : None,
         "optimizer": torch.optim.Adam,
         "lr": 0.001,
@@ -800,8 +816,10 @@ if __name__ == "__main__":
         "loss_region": None,
         "subset_dimensions": 'North' , ##  North or South or Global
         'active_grid' : False,
-        'low_ress_loss' : False,
+        'multi_ress_loss_kernel_size' : None,
+        'low_ress_loss_kernel_size' : None,
         'equal_weights' : False,
+        'masked_weights' : True,
         "kernel_size" : 5,
         "decoder_kernel_size" : 1,
         'DSC' : False,
@@ -833,7 +851,7 @@ if __name__ == "__main__":
     ds_raw_ensemble_mean, obs_raw, params, zeros_mask_full, land_masks = HP_congif(params, obs_ref, lead_months, y_start, y_end, NPSProj=NPSProj)
     ########################################################### Set HP space specifics #########################################################################
     
-    config_dict = {'time_features' : [['land_mask'], ['month_sin','month_cos', 'imonth_sin', 'imonth_cos'], ['month_sin','month_cos', 'imonth_sin', 'imonth_cos', 'land_mask']] }
+    config_dict = {'multi_ress_loss' : [False, True]}
     # config_dict = {  'batch_size': [100, 200], 'reg_scale' : [None, 50, 100], 'L2_reg' : [0, 0.0001,0.001 ] }
     hyperparameterspace = config_grid(config_dict).full_grid()
 
@@ -854,11 +872,17 @@ if __name__ == "__main__":
         out_dir = out_dir + '_skip_conv'   
     if params['combined_prediction']:
         out_dir = out_dir + '_combined'  
+    if params['multi_ress_loss_kernel_size'] is not None:
+        out_dir = out_dir + f'_multiressloss{params["multi_ress_loss_kernel_size"]}'
+    if params['low_ress_loss_kernel_size'] is not None:
+         out_dir = out_dir + f'_low_ress_loss{params["low_ress_loss_kernel_size"]}'
+    if not params['masked_weights']:
+        out_dir = out_dir + '_weightsnonmaked'  
     if params['lr_scheduler']:
         out_dir = out_dir + '_lr_scheduler'
         params['start_factor'] = 1.0
         params['end_factor'] = 0.1
-        params['total_iters'] = 100
+        params['total_iters'] = params['epochs']
         
     run_hp_tunning(ds_raw_ensemble_mean = ds_raw_ensemble_mean ,obs_raw = obs_raw, zeros_mask_full = zeros_mask_full,land_masks = land_masks,  
                    lead_time = lead_time, hyperparameterspace = hyperparameterspace, params = params, y_start = y_start ,y_end = y_end, out_dir_x = out_dir, n_runs=1, numpy_seed=1, torch_seed=1 )

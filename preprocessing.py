@@ -846,3 +846,43 @@ def pad_xarray(ds, padding = 1, model = 'constant', constant_values = 0):
     dims=ds.dims, 
     coords={dim: np.arange(-1, len(ds[dim]) + 1) for dim in ds.dims})
 
+
+
+def smoother(ds, smoother_kernel = 10):
+    from scipy.ndimage import convolve
+    kernel_lat = np.ones(( smoother_kernel, 1)) / smoother_kernel
+    # Apply the moving average filter in latitude using convolution
+    smoothed_data_lat = convolve(ds, kernel_lat, mode='constant')
+    # Create the filter kernel for longitude
+    kernel_lon = np.ones(( 1, smoother_kernel)) / smoother_kernel
+    # Apply the moving average filter in longitude using convolution
+    smoothed_data_lon = convolve(smoothed_data_lat, kernel_lon, mode='constant')
+    # Print the smoothed data in latitude and longitude
+    return smoothed_data_lon
+
+import glob
+def extract_params(model_dir):
+    params = {}
+    path = glob.glob(model_dir + '/*.txt')[0]
+    file = open(path)
+    content=file.readlines()
+    for line in content:
+        key = line.split('\t')[0]
+        try:
+            value = line.split('\t')[1].split('\n')[0]
+        except:
+            value = line.split('\t')[1]
+        try:    
+            params[key] = eval(value)
+        except:
+            if key == 'ensemble_list':
+                ls = []
+                for item in value.split('[')[1].split(']')[0].split(' '):
+                    try:
+                        ls.append(eval(item))
+                    except:
+                        pass
+                params[key] = ls
+            else:
+                params[key] = value
+    return params

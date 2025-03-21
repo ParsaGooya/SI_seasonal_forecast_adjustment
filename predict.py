@@ -564,8 +564,10 @@ if __name__ == "__main__":
     for key, values in params.items():
         print(f'{key} : {values} \n')
     
-
-    version = int(out_dir.split('/')[-1].split('_')[3][1])
+    try:
+        version = int(out_dir.split('/')[-1].split('_')[3][1])
+    except:
+        version = (out_dir.split('/')[-1].split('_')[3][1])
 
     
     params["version"] = version

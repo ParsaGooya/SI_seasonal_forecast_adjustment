@@ -12,8 +12,7 @@ import torch
 from torch.utils.data import DataLoader
 from torch.optim import lr_scheduler
 
-from losses import WeightedMSEKLD, WeightedMSE
-from losses import WeightedMSEKLDLowRess, WeightedMSELowRess
+from losses import WeightedMSEKLD, WeightedMSE, BCElossKLD
 from preprocessing import align_data_and_targets, create_mask, pole_centric, reverse_pole_centric, segment, reverse_segment, pad_xarray
 from preprocessing import AnomaliesScaler_v1_seasonal, AnomaliesScaler_v2_seasonal, Standardizer, Normalizer, PreprocessingPipeline, calculate_climatology, bias_adj, zeros_mask_gen
 from torch_datasets import XArrayDataset
@@ -73,6 +72,9 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
 
 
     print(f"Start run for test year {test_years}...")
+    if params['version'] == 'IceExtent':
+        params['reg_scale'] = None
+        params['combined_prediction'] = False
 
     ############################################## load data ##################################
     ensemble_list = params['ensemble_list']
@@ -223,7 +225,12 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
                 train_years = train_years[24:]
     except:
         pass
-
+    if params['version'] == 'IceExtent':
+        obs_raw = obs_raw.where(obs_raw>=0.15,0)
+        obs_raw = obs_raw.where(obs_raw ==0 , 1)
+        # ds_raw_ensemble_mean = ds_raw_ensemble_mean.where(ds_raw_ensemble_mean>=0.15,0)
+        # ds_raw_ensemble_mean = ds_raw_ensemble_mean.where(ds_raw_ensemble_mean ==0 , 1)
+        params['loss_function'] = 'BCELoss'
     if params['combined_prediction']:
         obs_raw_ = obs_raw.where(obs_raw>=0.15,0)
         obs_raw_ = obs_raw_.where(obs_raw_ ==0 , 1)
@@ -231,13 +238,16 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
         params['loss_function'] = 'combined'
         del obs_raw_
 
+    
     if NPSProj is False:
+     
             ds_raw_ensemble_mean = pole_centric(ds_raw_ensemble_mean, subset_dimensions)
             obs_raw =  pole_centric(obs_raw, subset_dimensions)
             land_mask = pole_centric(land_mask, subset_dimensions)
             model_mask = pole_centric(model_mask, subset_dimensions)
             if any([params['active_grid'],'active_mask' in params["time_features"], 'full_ice_mask' in params["time_features"]]):
                 zeros_mask_full = pole_centric(zeros_mask_full, subset_dimensions)
+
 
     ###################################################################################
     if lead_time is not None:
@@ -489,9 +499,9 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
         pass
     gc.collect()
 
-    result = (result * land_mask)
-    if params['save_deterministic'] :
-        result_deterministic = (result_deterministic * land_mask)
+    # result = (result * land_mask)
+    # if params['save_deterministic'] :
+    #     result_deterministic = (result_deterministic * land_mask)
 
     if not NPSProj:
 
@@ -502,6 +512,16 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
     result = result.to_dataset(name = 'nn_adjusted') 
     if params['save_deterministic'] :
         result_deterministic = result_deterministic.to_dataset(name = 'nn_adjusted')
+
+    if params['version'] == 'IceExtent':
+        
+        result = result.where(result >= 0.5, 0)
+        result = result.where(result ==0, 1)
+        if params['save_deterministic'] :
+
+            result_deterministic = result_deterministic.where(result_deterministic >= 0.5, 0)
+            result_deterministic = result_deterministic.where(result_deterministic ==0, 1)
+
 
     if params['active_grid']:
         if not NPSProj:
@@ -514,9 +534,9 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
 
 
     if params['combined_prediction']:
-        result_extent = (result_extent * land_mask)
-        if params['save_deterministic'] :
-            result_deterministic_extent = (result_deterministic_extent * land_mask)
+        # result_extent = (result_extent * land_mask)
+        # if params['save_deterministic'] :
+        #     result_deterministic_extent = (result_deterministic_extent * land_mask)
         if not NPSProj:
             result_extent = reverse_pole_centric(result_extent, subset_dimensions)
             if params['save_deterministic'] :
@@ -586,15 +606,17 @@ if __name__ == "__main__":
     ############################################## Set_up ############################################
 
     out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/NASA/cVAE/run_set_1_convnext'
-    out_dir    = f'{out_dir_x}/N4_M12_F12_v1_B0.1_batch10_e50_CscaleNone_CGNhybrid_50-1_LS50_NPSproj_North_lr0.0001_batch10_e50_LNone' 
+    out_dir    = f'{out_dir_x}/N4_M12_F12_vIceExtent_B0.1_batch5_e50_CscaleNone_skip-CVAE_50-100_LS1000_Linear_1x1_North_lr0.0001_batch5_e50_LNone' 
 
 
     params = extract_params(out_dir)
     print(f'loaded configuration: \n')
     for key, values in params.items():
         print(f'{key} : {values} \n')
-    
-    version = int(out_dir.split('/')[-1].split('_')[3][1])
+    try:
+        version = int(out_dir.split('/')[-1].split('_')[3][1])
+    except:
+        version = (out_dir.split('/')[-1].split('_')[3][1])
 
     params["version"] = version
     print( f'Version: {version}')

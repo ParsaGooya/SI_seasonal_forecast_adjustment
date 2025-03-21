@@ -20,34 +20,34 @@ class UNet2(nn.Module):
 			self.combined_prediction = combined_prediction
 			# input  (batch, n_channels_x, 100, 180)
 			
-			self.initial_conv = InitialConv(n_channels_x, 32)
+			self.initial_conv = InitialConv(n_channels_x, 16)
 
 			# downsampling:
-			self.d1 = Down(32, 64,  skip_conv=skip_conv)
-			self.d2 = Down(64, 128,  skip_conv=skip_conv)
-			self.d3 = Down(128, 256,  skip_conv=skip_conv)
-			self.d4 = Down(256, 512,  skip_conv=skip_conv)
+			self.d1 = Down(16, 32,  skip_conv=skip_conv)
+			self.d2 = Down(32, 64,  skip_conv=skip_conv)
+			self.d3 = Down(64, 128,  skip_conv=skip_conv)
+			self.d4 = Down(128, 256,  skip_conv=skip_conv)
 			# self.d5 = Down(256, 512)
 
 			# last conv of downsampling
-			self.last_conv_down = DoubleConvNext(512,  multi_channel=False, return_mask=False)
+			self.last_conv_down = DoubleConvNext(256,  multi_channel=False, return_mask=False)
 
 			# upsampling:
 			if bilinear:
-				self.up1 = Up(512, 256, concat_channel= 256, bilinear=  True)
-				self.up2 = Up(256, 128, concat_channel= 128, bilinear=True)
-				self.up3 = Up(128, 64, concat_channel= 64, bilinear= True)
-				self.up4 = Up(64, 32, concat_channel= 32, bilinear= True)
+				self.up1 = Up(256, 128, concat_channel= 128, bilinear=  True)
+				self.up2 = Up(128, 64, concat_channel= 64, bilinear=True)
+				self.up3 = Up(64, 32, concat_channel= 32, bilinear= True)
+				self.up4 = Up(32, 16, concat_channel= 16, bilinear= True)
 			else:	
 				# self.up1 = Up(1024, 512, bilinear= self.bilinear, up_kernel = 2)
-				self.up1 = Up(512, 256, concat_channel= 256,bilinear=  False, up_kernel = 2)
-				self.up2 = Up(256, 128, concat_channel= 128, bilinear= False, up_kernel = [3,3])
-				self.up3 = Up(128, 64, concat_channel= 64, bilinear= False, up_kernel = 2)
-				self.up4 = Up(64, 32, concat_channel= 32, bilinear= False, up_kernel = 2)
+				self.up1 = Up(256, 128, concat_channel= 128,bilinear=  False, up_kernel = 2)
+				self.up2 = Up(128, 64, concat_channel= 64, bilinear= False, up_kernel = [3,3])
+				self.up3 = Up(64, 32, concat_channel= 32, bilinear= False, up_kernel = 2)
+				self.up4 = Up(32, 16, concat_channel= 16, bilinear= False, up_kernel = 2)
 			# self last layer:
-			self.last_conv = OutConv(32, 1, sigmoid = sigmoid)
+			self.last_conv = OutConv(16, 1, sigmoid = sigmoid)
 			if combined_prediction:
-				self.last_conv2 = OutConv(32, 1, sigmoid = True, NPS_proj = True)
+				self.last_conv2 = OutConv(16, 1, sigmoid = True, NPS_proj = True)
 
 
 		def forward(self, x, mask, ind = None):
@@ -86,6 +86,84 @@ class UNet2(nn.Module):
 			else:
 				return x1
     
+class UNet2_small(nn.Module):
+	
+    
+		def __init__( self,  n_channels_x=1 ,  bilinear=False, sigmoid = True,skip_connection = True,  skip_conv = False, combined_prediction = False ):
+			
+			super().__init__()
+			self.n_channels_x = n_channels_x
+			self.bilinear = bilinear
+			self.skip_connection = skip_connection
+			self.combined_prediction = combined_prediction
+			# input  (batch, n_channels_x, 100, 180)
+			
+			self.initial_conv = InitialConv(n_channels_x, 16)
+
+			# downsampling:
+			self.d1 = Down(16, 32,  skip_conv=skip_conv)
+			self.d2 = Down(32, 64,  skip_conv=skip_conv)
+			self.d3 = Down(64, 128,  skip_conv=skip_conv)
+			# self.d4 = Down(128, 256,  skip_conv=skip_conv)
+			# self.d5 = Down(256, 512)
+
+			# last conv of downsampling
+			self.last_conv_down = DoubleConvNext(128,  multi_channel=False, return_mask=False)
+
+			# upsampling:
+			if bilinear:
+				# self.up1 = Up(256, 128, concat_channel= 128, bilinear=  True)
+				self.up1 = Up(128, 64, concat_channel= 64, bilinear=True)
+				self.up2 = Up(64, 32, concat_channel= 32, bilinear= True)
+				self.up3 = Up(32, 16, concat_channel= 16, bilinear= True)
+			else:	
+
+				# self.up1 = Up(256, 128, concat_channel= 128,bilinear=  False, up_kernel = 2)
+				self.up1 = Up(128, 64, concat_channel= 64, bilinear= False, up_kernel = [3,3])
+				self.up2 = Up(64, 32, concat_channel= 32, bilinear= False, up_kernel = 2)
+				self.up3 = Up(32, 16, concat_channel= 16, bilinear= False, up_kernel = 2)
+			# self last layer:
+			self.last_conv = OutConv(16, 1, sigmoid = sigmoid)
+			if combined_prediction:
+				self.last_conv2 = OutConv(16, 1, sigmoid = True, NPS_proj = True)
+
+
+		def forward(self, x, mask, ind = None):
+        # input  (batch, n_channels_x, 100, 180)
+			if (type(x) == list) or (type(x) == tuple):    
+				x_in = torch.cat([x[0], x[1]], dim=1)
+			else:
+				x_in = x
+			mask = mask.unsqueeze(0)#.expand_as(x_in[0])      # uncomment if multichannel is True
+			x1, mask1 = self.initial_conv(x_in, mask)  # (batch, 32, 100, 180)
+
+		# Downsampling
+			x2, x2_bm, mask2, mask2_bm  = self.d1(x1, mask1)  # (batch, 64, 50, 90) (batch, 32, 100, 180)
+			x3, x3_bm, mask3, mask3_bm  = self.d2(x2, mask2)  # (batch, 128, 25, 45) (batch, 64, 50, 90)
+			x4, x4_bm, mask4, mask4_bm = self.d3(x3, mask3)  # (batch, 256, 12, 22) (batch, 128, 25, 45)
+			# x5, x5_bm, mask5, mask5_bm  = self.d4(x4, mask4)  # (batch, 512, 6, 11) (batch, 256, 12, 22)
+			
+			x5 = self.last_conv_down(x4, mask4)  # (batch, 512, 6, 11)
+			
+			# Upsampling
+			if self.skip_connection:
+				x = self.up1(x5, x4_bm, mask4_bm)  # (batch, 256, 12, 22)
+				x = self.up2(x, x3_bm, mask3_bm)  # (batch, 128, 25, 45)
+				x = self.up3(x, x2_bm, mask2_bm)  # (batch, 64, 50, 90)
+				# x = self.up4(x, x2_bm, mask2_bm)  # (batch, 32, 100, 180)
+			else:
+				x = self.up1(x5)  # (batch, 256, 12, 22)
+				x = self.up2(x)  # (batch, 128, 25, 45)
+				x = self.up3(x)  # (batch, 64, 50, 90)
+				# x = self.up4(x)  # (batch, 32, 100, 180)	
+
+			x1 = self.last_conv(x)
+			if self.combined_prediction:
+				x2 = self.last_conv2(x)
+				return x1, x2
+			else:
+				return x1
+    
 
 class UNet2_NPS(nn.Module):
 	
@@ -99,37 +177,37 @@ class UNet2_NPS(nn.Module):
 			self.combined_prediction = combined_prediction
 			# input  (batch, n_channels_x, 100, 180)
 			
-			self.initial_conv = InitialConv(n_channels_x, 32)
+			self.initial_conv = InitialConv(n_channels_x, 16)
 
 			# downsampling:
-			self.d1 = Down(32, 64,  skip_conv=skip_conv)
-			self.d2 = Down(64, 128, skip_conv=skip_conv)
-			self.d3 = Down(128, 256,  skip_conv=skip_conv)
-			self.d4 = Down(256, 512,  skip_conv=skip_conv)
-			self.d5 = Down(512, 1024, skip_conv=skip_conv)
+			self.d1 = Down(16, 32,  skip_conv=skip_conv)
+			self.d2 = Down(32, 64, skip_conv=skip_conv)
+			self.d3 = Down(64, 128,  skip_conv=skip_conv)
+			self.d4 = Down(128, 256,  skip_conv=skip_conv)
+			self.d5 = Down(256, 512, skip_conv=skip_conv)
 
 			# last conv of downsampling
-			self.last_conv_down = DoubleConvNext(1024,  multi_channel=False, return_mask=False)
+			self.last_conv_down = DoubleConvNext(512,  multi_channel=False, return_mask=False)
 
 			# upsampling:
 			if bilinear:
-				self.up1 = Up(1024, 512, concat_channel= 512, bilinear=  True)
-				self.up2 = Up(512, 256, concat_channel= 256, bilinear= True)
-				self.up3 = Up(256, 128, concat_channel= 128, bilinear= True)
-				self.up4 = Up(128, 64, concat_channel= 64, bilinear= True)
-				self.up5 = Up(64, 32, concat_channel= 32, bilinear= True)
+				self.up1 = Up(512, 256, concat_channel= 256, bilinear=  True)
+				self.up2 = Up(256, 128, concat_channel= 128, bilinear= True)
+				self.up3 = Up(128, 64, concat_channel= 64, bilinear= True)
+				self.up4 = Up(64, 32, concat_channel= 32, bilinear= True)
+				self.up5 = Up(32, 16, concat_channel= 16, bilinear= True)
 			else:	
-				self.up1 = Up(1024, 512, concat_channel= 512,bilinear=  False, up_kernel = 3)
-				self.up2 = Up(512, 256, concat_channel= 256, bilinear= False, up_kernel = 2)
-				self.up3 = Up(256, 128, concat_channel= 128, bilinear= False, up_kernel = 2)
-				self.up4 = Up(128, 64, concat_channel= 64, bilinear= False, up_kernel = 2)
-				self.up5 = Up(64, 32, concat_channel= 32, bilinear= False, up_kernel = 2)
+				self.up1 = Up(512, 256, concat_channel= 256,bilinear=  False, up_kernel = 3)
+				self.up2 = Up(256, 128, concat_channel= 128, bilinear= False, up_kernel = 2)
+				self.up3 = Up(128, 64, concat_channel= 64, bilinear= False, up_kernel = 2)
+				self.up4 = Up(64, 32, concat_channel= 32, bilinear= False, up_kernel = 2)
+				self.up5 = Up(32, 16, concat_channel= 16, bilinear= False, up_kernel = 2)
 
 
 			# self last layer:
-			self.last_conv = OutConv(32, 1, sigmoid = sigmoid, NPS_proj = True)
+			self.last_conv = OutConv(16, 1, sigmoid = sigmoid, NPS_proj = True)
 			if combined_prediction:
-				self.last_conv2 = OutConv(32, 1, sigmoid = True, NPS_proj = True)
+				self.last_conv2 = OutConv(16, 1, sigmoid = True, NPS_proj = True)
 			
 
 		def forward(self, x, mask, ind = None):
@@ -172,6 +250,87 @@ class UNet2_NPS(nn.Module):
 				return x1
     
 	
+class UNet2_NPS_small(nn.Module):
+	
+    
+		def __init__( self,  n_channels_x=1 ,  bilinear=False, sigmoid = True,skip_connection = True, skip_conv = False, combined_prediction = False ):
+			
+			super().__init__()
+			self.n_channels_x = n_channels_x
+			self.bilinear = bilinear
+			self.skip_connection = skip_connection
+			self.combined_prediction = combined_prediction
+			# input  (batch, n_channels_x, 100, 180)
+			
+			self.initial_conv = InitialConv(n_channels_x, 16)
+
+			# downsampling:
+			self.d1 = Down(16, 32,  skip_conv=skip_conv)
+			self.d2 = Down(32, 64, skip_conv=skip_conv)
+			self.d3 = Down(64, 128,  skip_conv=skip_conv)
+			self.d4 = Down(128, 256,  skip_conv=skip_conv)
+
+			# last conv of downsampling
+			self.last_conv_down = DoubleConvNext(256,  multi_channel=False, return_mask=False)
+
+			# upsampling:
+			if bilinear:
+				# self.up1 = Up(512, 256, concat_channel= 256, bilinear=  True)
+				self.up1 = Up(256, 128, concat_channel= 128, bilinear= True)
+				self.up2 = Up(128, 64, concat_channel= 64, bilinear= True)
+				self.up3 = Up(64, 32, concat_channel= 32, bilinear= True)
+				self.up4 = Up(32, 16, concat_channel= 16, bilinear= True)
+			else:	
+				# self.up1 = Up(512, 256, concat_channel= 256,bilinear=  False, up_kernel = 3)
+				self.up1 = Up(256, 128, concat_channel= 128, bilinear= False, up_kernel = 2)
+				self.up2 = Up(128, 64, concat_channel= 64, bilinear= False, up_kernel = 2)
+				self.up3 = Up(64, 32, concat_channel= 32, bilinear= False, up_kernel = 2)
+				self.up4 = Up(32, 16, concat_channel= 16, bilinear= False, up_kernel = 2)
+
+
+			# self last layer:
+			self.last_conv = OutConv(16, 1, sigmoid = sigmoid, NPS_proj = True)
+			if combined_prediction:
+				self.last_conv2 = OutConv(16, 1, sigmoid = True, NPS_proj = True)
+			
+
+		def forward(self, x, mask, ind = None):
+        # input  (batch, n_channels_x, 100, 180)
+			if (type(x) == list) or (type(x) == tuple):    
+				x_in = torch.cat([x[0], x[1]], dim=1)
+			else:
+				x_in = x
+			mask = mask.unsqueeze(0)#.expand_as(x_in[0])   # uncomment if multichannel is True
+			x1, mask1 = self.initial_conv(x_in, mask)  # (batch, 32, 432, 432)
+
+		# Downsampling
+			x2, x2_bm, mask2, mask2_bm  = self.d1(x1, mask1)  # (batch, 64, 216, 216) (batch, 32, 432, 432)
+			x3, x3_bm, mask3, mask3_bm  = self.d2(x2, mask2)  # (batch, 128, 108, 108) (batch, 64, 216, 216)
+			x4, x4_bm, mask4, mask4_bm = self.d3(x3, mask3)  # (batch, 256, 54, 54)  (batch, 128, 108, 108)
+			x5, x5_bm, mask5, mask5_bm  = self.d4(x4, mask4)  # (batch, 512, 27, 27) (batch, 256, 54, 54)
+			# x6, x6_bm, mask6, mask6_bm  = self.d5(x5, mask5)  # (batch, 1024, 13, 13) (batch, 512, 27, 27)
+
+			x6 = self.last_conv_down(x5, mask5)  # (batch, 1024, 13, 13)
+
+			# Upsampling
+			if self.skip_connection:
+				x = self.up1(x6, x5_bm, mask5_bm)  # (batch, 256, 54, 54)
+				x = self.up2(x, x4_bm, mask4_bm)  # (batch, 128, 108, 108)
+				x = self.up3(x, x3_bm, mask3_bm)  # (batch, 64, 216, 216)
+				x = self.up4(x, x2_bm, mask2_bm)  # (batch, 32, 432, 432)
+			else:
+				x = self.up1(x6)  # (batch, 256, 54, 54)
+				x = self.up2(x)  # (batch, 128, 108, 108)
+				x = self.up3(x)  # (batch, 64, 216, 216)
+				x = self.up4(x)  # (batch, 32, 432, 432)				
+			
+			x1 = self.last_conv(x)
+			if self.combined_prediction:
+				x2 = self.last_conv2(x)
+				return x1, x2
+			else:
+				return x1
+    
 
 class InitialConv(nn.Module):
 		def __init__(self, in_channels, out_channels):
@@ -274,7 +433,7 @@ class OutConv(nn.Module):
 					padding = 1
 				else:
 					padding= [1,0]
-				self.conv1 = PartialConv2d(in_channels, in_channels, kernel_size=3, padding= padding)
+				# self.conv1 = PartialConv2d(in_channels, in_channels, kernel_size=3, padding= padding)
 				if sigmoid:
 					self.conv2 = nn.Sequential(
 								LayerNorm(in_channels, eps=1e-6, data_format='channels_first'),

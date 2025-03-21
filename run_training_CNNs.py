@@ -11,11 +11,11 @@ import torch
 from torch.utils.data import DataLoader
 from torch.optim import lr_scheduler
 from models.unet import UNet, UNetLCL,UNet_NPS
-from models.unetconvnext import UNet2,UNet2_NPS
+from models.unetconvnext import UNet2,UNet2_NPS, UNet2_small, UNet2_NPS_small
 from models.cnn import CNN, RegCNN
 from losses import WeightedMSE, WeightedMSEGlobalLoss
 from losses import WeightedMSELowRess , WeightedMSEGlobalLossLowRess
-from preprocessing import align_data_and_targets, create_mask, pole_centric, reverse_pole_centric, segment, reverse_segment, pad_xarray
+from preprocessing import align_data_and_targets, create_mask, pole_centric, reverse_pole_centric, segment, reverse_segment, pad_xarray, smoother
 from preprocessing import AnomaliesScaler_v1_seasonal, AnomaliesScaler_v2_seasonal, Standardizer, Normalizer, PreprocessingPipeline, calculate_climatology, bias_adj, zeros_mask_gen
 from torch_datasets import XArrayDataset
 import torch.nn as nn
@@ -32,6 +32,9 @@ data_dir_forecast = LOC_FORECASTS_SI
 def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False,test_years = None,  n_runs=1, results_dir=None, numpy_seed=None, torch_seed=None, save = False):
     if lead_time is not None:
         assert lead_time <=lead_months, f"{lead_time} can not be greater than {lead_months}"
+
+    if not params['masked_weights']:
+        assert 'land_mask' in params['time_features']
 
     if params['subset_dims'] == 'Global':
         params['subset_dimensions'] = None
@@ -50,6 +53,8 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
             params['model'] = UNet_NPS
         if params["model"] == UNet2:
             params['model'] = UNet2_NPS
+        if params["model"] == UNet2_small:
+            params['model'] = UNet2_NPS_small
     else: 
         crs = '1x1'
 
@@ -73,6 +78,11 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
 
     if params['version'] == 'IceExtent':
         params['reg_scale'] = None
+        params['combined_prediction'] = False
+        assert params['multi_ress_loss_kernel_size']  is None
+        assert params['low_ress_loss_kernel_size']  is None
+        assert params['loss_reduction'] == 'mean', 'Loss reduction SUM not yet set in the loss ...'
+
 
     if params['lr_scheduler']:
         start_factor = params['start_factor']
@@ -81,9 +91,12 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
     else:
         start_factor = end_factor = total_iters = None
     
-    if params['low_ress_loss']:
+    if params['multi_ress_loss_kernel_size'] is not None:
         params['active_grid'] = False
-        print('Warning: active_grid turned off because low_ress_loss is on!')
+        print('Warning: active_grid turned off because multi_ress_loss is on!')
+        assert params['low_ress_loss_kernel_size'] is None
+    if params['low_ress_loss_kernel_size'] is not None:
+        assert params['multi_ress_loss_kernel_size'] is None
 
     print("Start training")
     print("Load observations")
@@ -175,7 +188,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
             model_mask = model_mask.where(model_mask.lat < -40, drop = True)
 
     ################################### apply the mask #######################
-    if params['model'] not in [UNet2, UNet2_NPS]:
+    if params['model'] not in [UNet2, UNet2_NPS, UNet2_small, UNet2_NPS_small]:
         # land_mask = land_mask.where(model_mask == 1, 0)
         obs_raw = obs_raw * land_mask
         ds_raw_ensemble_mean = ds_raw_ensemble_mean * land_mask
@@ -214,7 +227,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
     
     obs_clim = params["obs_clim"]
     active_grid = params['active_grid']
-    low_ress_loss = params['low_ress_loss']
+    multi_ress_loss_kernel_size = params['multi_ress_loss_kernel_size']
     DSC = params['DSC']
 
     if obs_clim:
@@ -248,7 +261,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
 
     
     if NPSProj is False:
-        if model in [UNet,UNetLCL, CNN,UNet2]:
+        if model in [UNet,UNetLCL, CNN,UNet2, UNet2_small]:
             ds_raw_ensemble_mean = pole_centric(ds_raw_ensemble_mean, subset_dimensions)
             obs_raw =  pole_centric(obs_raw, subset_dimensions)
             land_mask = pole_centric(land_mask, subset_dimensions)
@@ -298,7 +311,8 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
             f"observations_preprocessing_steps\t{[s[0] if observations_preprocessing_steps is not None else None for s in observations_preprocessing_steps]}\n" +
             f"loss_region\t{loss_region}\n" +
             f"active_grid\t{active_grid}\n" + 
-            f"low_ress_loss\t{low_ress_loss}\n" +
+            f"multi_ress_loss_kernel_size\t{multi_ress_loss_kernel_size}\n" +
+            f"low_ress_loss_kernel_size\t{params['low_ress_loss_kernel_size']}\n" +
             f"equal_weights\t{params['equal_weights']}\n" + 
             f"DSC\t{DSC}\n" + 
             f"subset_dimensions\t{subset_dimensions}\n" + 
@@ -385,11 +399,17 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                 if test_year*100 + month <= ds_raw_ensemble_mean.time[-1]:
                         ds_test = ds[n_train:n_train + params['forecast_range_months'],...]
                         obs_test = obs[n_train:n_train + params['forecast_range_months'],...]
-                
+
+                if params['masked_weights']:
+                    weights_mask = land_mask.copy()
+                    weights_mask[:] = smoother(land_mask, 5)
+                    weights_mask = weights_mask.where(weights_mask == 0 ,1).values
+                else:
+                    weights_mask = None
                 if NPSProj:
                     weights = (np.ones_like(ds_train.lon) * (np.ones_like(ds_train.lat.to_numpy()))[..., None])  # Moved this up
                     weights = xr.DataArray(weights, dims = ds_train.dims[-2:], name = 'weights').assign_coords({'lat': ds_train.lat, 'lon' : ds_train.lon})
-                    weights = weights * land_mask
+                    # weights = weights * land_mask
                     weights_ = weights * land_mask
                 else:
                     weights = np.cos(np.ones_like(ds_train.lon) * (np.deg2rad(ds_train.lat.to_numpy()))[..., None])  # Moved this up
@@ -399,7 +419,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                     if params['equal_weights']:
                         weights = xr.ones_like(weights)
                     # if any(['land_mask' not in time_features, model not in [UNet2]]):
-                    weights = weights * land_mask
+                    # weights = weights * land_mask
 
                 if loss_region is not None:
                     loss_region_indices, loss_area = get_coordinate_indices(ds_raw_ensemble_mean, loss_region, flat = False)  ### the function has to be editted for flat opeion!!!!! 
@@ -432,7 +452,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                 n_channels_x = len(ds_train.channels)
 
 
-                if model in [UNet,UNetLCL,UNet2, UNet_NPS, UNet2_NPS]:
+                if model in [UNet,UNetLCL,UNet2, UNet_NPS, UNet2_NPS, UNet2_small, UNet2_NPS_small]:
                     net = model(n_channels_x= n_channels_x+ add_feature_dim , bilinear = params['bilinear'], sigmoid = sigmoid_activation, skip_conv = params['skip_conv'], combined_prediction = params['combined_prediction'])
                 elif model in [ CNN]:
                     net = model(n_channels_x + add_feature_dim ,hidden_dims, kernel_size = kernel_size, decoder_kernel_size = decoder_kernel_size, DSC = DSC, sigmoid = sigmoid_activation )
@@ -456,16 +476,13 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                 if params['version'] == 'IceExtent':  
                         criterion = nn.BCELoss()
                 else:
-                    if reg_scale is None: ## PG: if no penalizing for negative anomalies
-                        if low_ress_loss:
-                            criterion = WeightedMSELowRess(weights=weights, device=device, hyperparam=1, reduction='mean', loss_area=loss_region_indices)
-                        else:
-                            criterion = WeightedMSE(weights=weights, device=device, hyperparam=1, reduction='mean', loss_area=loss_region_indices)
+                    # if reg_scale is None: ## PG: if no penalizing for negative anomalies
+                    if params['low_ress_loss_kernel_size'] is None:  
+                            criterion = WeightedMSE(weights=weights, device=device, weights_mask = weights_mask, hyperparam=1, reduction='mean', loss_area=loss_region_indices, multi_ress_loss_kernel_size = multi_ress_loss_kernel_size)
                     else:
-                        if low_ress_loss:
-                            criterion = WeightedMSEGlobalLossLowRess(weights=weights, device=device, hyperparam=1, reduction='mean', loss_area=loss_region_indices, scale=reg_scale, map = True)
-                        else:
-                            criterion = WeightedMSEGlobalLoss(weights=weights, device=device, hyperparam=1, reduction='mean', loss_area=loss_region_indices, scale=reg_scale, map = True)
+                            criterion = WeightedMSELowRess(weights=weights, device=device, weights_mask = weights_mask, hyperparam=1, reduction='mean', loss_area=loss_region_indices, kernel = params['low_ress_loss_kernel_size'])
+
+                            # criterion = WeightedMSEGlobalLoss(weights=weights, device=device, weights_mask = weights_mask, hyperparam=1, reduction='mean', loss_area=loss_region_indices, scale=reg_scale, map = True, multi_ress_loss = multi_ress_loss)
                 
                 if params['combined_prediction']:
                     criterion_extent = nn.BCELoss()
@@ -486,7 +503,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                             y = y.to(device)
                             m  = None
                         optimizer.zero_grad()
-                        if model in [UNet2, UNet2_NPS]:
+                        if model in [UNet2, UNet2_NPS, UNet2_small, UNet2_NPS_small]:
                             adjusted_forecast = net(x, torch.from_numpy(model_mask.to_numpy()).to(y))               
                         else:
                             adjusted_forecast = net(x)
@@ -501,7 +518,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                             if params['version'] == 'IceExtent':
                                 loss = criterion(adjusted_forecast, y)
                             else:
-                                loss = criterion(adjusted_forecast, y, mask = m)
+                                loss = criterion(adjusted_forecast, y, mask = m, print_loss=True)
 
                         batch_loss += loss.item()
                         loss.backward()
@@ -529,10 +546,8 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                     if params['version'] == 'IceExtent':   
                         criterion_test = nn.BCELoss()
                     else:
-                        if low_ress_loss:
-                            criterion_test =  WeightedMSELowRess(weights=weights_, device=device, hyperparam=1, reduction='mean', loss_area=loss_region_indices)
-                        else:    
-                            criterion_test =  WeightedMSE(weights=weights_, device=device, hyperparam=1, reduction='mean', loss_area=loss_region_indices)
+
+                        criterion_test =  WeightedMSE(weights=weights_, device=device, hyperparam=1, reduction='mean', loss_area=loss_region_indices)
 
                     if 'ensembles' in ds_test.dims:
                         if lead_time is None:
@@ -575,7 +590,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                             else:
                                 test_obs = target.unsqueeze(0).to(device)
                                 m = None
-                            if model in [UNet2, UNet2_NPS]:
+                            if model in [UNet2, UNet2_NPS, UNet2_small, UNet2_NPS_small]:
                                 test_adjusted = net(test_raw, torch.from_numpy(model_mask.to_numpy()).to(test_obs))
                             else:
                                 test_adjusted = net(test_raw)
@@ -632,17 +647,23 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                         pass
                     gc.collect()
 
-                    result = (result * land_mask) 
+                    # result = (result * land_mask) #########################################################################
+
                     if not NPSProj:
-                        if model in [UNet,UNetLCL, CNN,UNet2]:
+                        if model in [UNet,UNetLCL, CNN,UNet2, UNet2_small]:
                                 result = reverse_pole_centric(result, subset_dimensions)
+                                reverse_pole_centric(land_mask, subset_dimensions).to_dataset(name  = 'land_mask').to_netcdf(path=Path(results_dir, f'obs_land_mask.nc', mode='w'))
                         if model in [RegCNN]:
                                 result = reverse_segment(result)
+                                reverse_segment(land_mask).to_dataset(name  = 'land_mask').to_netcdf(path=Path(results_dir, f'obs_land_mask.nc', mode='w'))
+                    else:
+                            land_mask.to_dataset(name  = 'land_mask').to_netcdf(path=Path(results_dir, f'obs_land_mask.nc', mode='w'))
+
                     result = result.to_dataset(name = 'nn_adjusted')
                     ##############################################################################################################################################################
                     if active_grid:
                         if not NPSProj:
-                            if model in [UNet,  CNN,UNet2]:
+                            if model in [UNet,  CNN,UNet2, UNet2_small]:
                                 zeros_mask_test = reverse_pole_centric(zeros_mask_test)
                             if model in [RegCNN]:
                                 zeros_mask_test = reverse_segment(zeros_mask_test)
@@ -658,7 +679,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                     if params['combined_prediction']:
                         result_extent = (result_extent * land_mask)
                         if not NPSProj:
-                            if model in [UNet,UNetLCL, CNN,UNet2]:
+                            if model in [UNet,UNetLCL, CNN,UNet2, UNet2_small]:
                                     result_extent = reverse_pole_centric(result_extent, subset_dimensions)
                             if model in [RegCNN]:
                                     result_extent = reverse_segment(result_extent)
@@ -723,15 +744,15 @@ if __name__ == "__main__":
     n_runs = 1  # number of training runs
 
     params = {
-        "model": UNet2,
+        "model": UNet2_small,
         "hidden_dims": [64,128,128,64], #[16, 64, 128, 64, 32], ## only for (Reg)CNN 
-        "time_features": ['month_sin','month_cos', 'imonth_sin', 'imonth_cos'],
+        "time_features": ['month_sin','month_cos', 'imonth_sin', 'imonth_cos', 'land_mask'],
         "obs_clim" : False,
         "ensemble_features": False, ## PG
         'ensemble_list' : None, ## PG
         'ensemble_mode' : 'Mean',
-        "epochs": 100,
-        "batch_size": 10,
+        "epochs": 80,
+        "batch_size": 100,
         "reg_scale" : None,
         "optimizer": torch.optim.Adam,
         "lr": 0.001 ,
@@ -739,7 +760,9 @@ if __name__ == "__main__":
         "loss_region": None,
         "subset_dims": 'North',   ## North or South or Global
         'active_grid' : False,
-        'low_ress_loss' : False,
+        'multi_ress_loss_kernel_size' : None,
+        'low_ress_loss_kernel_size' : None,
+        'masked_weights' : True,
         'equal_weights' : False,
         "DSC" : False,  ## only for (Reg)CNN 
         "kernel_size" : 5, ## only for(Reg)CNN
@@ -757,7 +780,7 @@ if __name__ == "__main__":
     params['forecast_range_months'] = 12
 
     obs_ref = 'NASA'
-    NPSProj = True
+    NPSProj = False
     
     out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_3_convnext'
 
@@ -789,7 +812,12 @@ if __name__ == "__main__":
         out_dir = out_dir + '_skip_conv'   
     if params['combined_prediction']:
         out_dir = out_dir + '_combined'  
-                    
+    if params['multi_ress_loss_kernel_size'] is not None:
+        out_dir = out_dir + f'_multiressloss{params["multi_ress_loss_kernel_size"]}'
+    if params['low_ress_loss_kernel_size'] is not None:
+         out_dir = out_dir + f'_low_ress_loss{params["low_ress_loss_kernel_size"]}'
+    if not params['masked_weights']:
+        out_dir = out_dir + '_weightsnonmaked'  
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     Path(out_dir + '/Figures').mkdir(parents=True, exist_ok=True)
 

@@ -6,14 +6,14 @@ from torch.distributions import Normal, kl_divergence
 
 class WeightedMSE:
 
-    def __init__(self, weights, device, hyperparam=1.0, min_threshold=0, max_threshold=0, reduction='mean', loss_area=None):
+    def __init__(self, weights, device, weights_mask = None,  hyperparam=1.0, min_threshold=0, max_threshold=0, reduction='mean', loss_area=None, multi_ress_loss_kernel_size = None):
         self.reduction = reduction
         self.hyperparam = hyperparam
         self.min_threshold = min_threshold
         self.max_threshold = max_threshold
         self.loss_area = loss_area
         self.device = device
-
+        self.multi_ress_loss_kernel_size =  multi_ress_loss_kernel_size
         if self.loss_area is not None:
 
             if weights.ndim>1:
@@ -24,9 +24,13 @@ class WeightedMSE:
                  indices =  self.loss_area
                  self.weights = torch.from_numpy(weights[indices]).to(device)
         else:
+            if weights_mask is not None:
+                weights = weights * weights_mask
             self.weights = torch.from_numpy(weights).to(device)
+        if self.multi_ress_loss_kernel_size is not None:
+            self.mse_lowress = WeightedMSELowRess(weights=weights, device=device, weights_mask = weights_mask, hyperparam=hyperparam, reduction=reduction, loss_area=loss_area, kernel = self.multi_ress_loss_kernel_size)
 
-    def __call__(self, data, target, mask = None):
+    def __call__(self, data, target, mask = None, print_loss = False):
 
         if self.loss_area is not None:
 
@@ -62,13 +66,197 @@ class WeightedMSE:
             loss = torch.sum(loss * weight, dim = (-1,-2)).mean()
         elif self.reduction == 'none':
             loss = (y_hat - y)**2 * m * (weight / weight.sum())
+        if self.multi_ress_loss_kernel_size is not None:
+
+            loss = loss + self.mse_lowress(data, target, mask)
+            loss = loss / 2
+        if print_loss:
+            print(f'MSE : {loss}')
         return loss
     
 class WeightedMSEKLD:  ## PG: penalizing negative anomalies
-    def __init__(self, weights, device, hyperparam=2.0, min_threshold=0, max_threshold=0, reduction='mean', loss_area=None, exclude_zeros=True, scale=1, min_val=0, max_val=None):
-        self.mse = WeightedMSE(weights=weights, device=device, hyperparam=hyperparam, reduction=reduction, loss_area=loss_area)
+    def __init__(self, weights, device, weights_mask = None, hyperparam=2.0, min_threshold=0, max_threshold=0, reduction='mean', loss_area=None, exclude_zeros=True, scale=1, min_val=0, max_val=None, multi_ress_loss_kernel_size = None):
         self.reduction = reduction
         self.device = device
+        self.multi_ress_loss_kernel_size = multi_ress_loss_kernel_size
+        self.mse = WeightedMSE(weights=weights, device=device, weights_mask = weights_mask, hyperparam=hyperparam, reduction=reduction, loss_area=loss_area)
+        if multi_ress_loss_kernel_size is not None:
+            self.mse_lr = WeightedMSELowRess(weights=weights, device=device, weights_mask = weights_mask, hyperparam=hyperparam, reduction=reduction, loss_area=loss_area, kernel = multi_ress_loss_kernel_size)
+
+
+    def __call__(self, data, target, mu = None, log_var = None, cond_mu = None, cond_log_var = None, beta = 1, mask = None, return_ind_loss = False, print_loss = True, normalized_flow = None):
+        loss = 0
+        MSE = self.mse(data, target, mask)
+        if self.multi_ress_loss_kernel_size is not None :
+            MSE += self.mse_lr(data, target, mask)
+            MSE = MSE/2
+        loss += MSE#.mean()/(MSE.max() - MSE.min())
+        if print_loss:
+            print(f'MSE : {loss}')
+
+        if any([mu is not None, log_var is not None]):
+            assert all([mu is not None, log_var is not None])
+            var = (torch.exp(log_var) + 1e-4)
+            std = torch.sqrt(var)
+            shape = mu.shape
+
+            if all([cond_mu is None, cond_log_var is None]):
+                KL = kl_divergence(
+                                Normal(torch.flatten(mu, start_dim = 1, end_dim = -1), torch.flatten(std, start_dim = 1, end_dim = -1) ),
+                                Normal(torch.zeros_like(torch.flatten(mu, start_dim = 1, end_dim = -1)), torch.ones_like(torch.flatten(mu, start_dim = 1, end_dim = -1))))
+            else:
+                cond_var = (torch.exp(cond_log_var) + 1e-4)
+                cond_std = torch.sqrt(cond_var)
+                KL = kl_divergence(
+                                Normal(torch.flatten(mu, start_dim = 1, end_dim = -1),  torch.flatten(std, start_dim = 1, end_dim = -1)),
+                                Normal(torch.flatten(cond_mu, start_dim = 1, end_dim = -1),torch.flatten(cond_std, start_dim = 1, end_dim = -1) ))
+            if self.reduction == 'sum':
+                KL = KL.sum(dim=-1).mean()
+            if self.reduction == 'mean':
+                KL = KL.mean()
+            
+            loss += KL * beta 
+            if print_loss: 
+                print(f'KLD : {KL}')
+        else:
+            return_ind_loss = False
+        if return_ind_loss:
+            return loss, MSE, KL
+        else:
+            return loss
+        
+
+class BCElossKLD:  ## PG: penalizing negative anomalies
+    def __init__(self, device, reduction = 'mean'):
+        self.reduction = reduction
+        self.device = device
+        self.bce = nn.BCELoss(reduction = self.reduction)
+
+    def __call__(self, data, target, mu = None, log_var = None, cond_mu = None, cond_log_var = None, beta = 1, mask = None, return_ind_loss = False, print_loss = True, normalized_flow = None):
+        loss = 0
+        BCE = self.bce(data, target)
+        loss += BCE#.mean()/(MSE.max() - MSE.min())
+        if print_loss:
+            print(f'BCE : {loss}')
+
+        if any([mu is not None, log_var is not None]):
+            assert all([mu is not None, log_var is not None])
+            var = (torch.exp(log_var) + 1e-4)
+            std = torch.sqrt(var)
+            shape = mu.shape
+
+            if all([cond_mu is None, cond_log_var is None]):
+                KL = kl_divergence(
+                                Normal(torch.flatten(mu, start_dim = 1, end_dim = -1), torch.flatten(std, start_dim = 1, end_dim = -1) ),
+                                Normal(torch.zeros_like(torch.flatten(mu, start_dim = 1, end_dim = -1)), torch.ones_like(torch.flatten(mu, start_dim = 1, end_dim = -1))))
+            else:
+                cond_var = (torch.exp(cond_log_var) + 1e-4)
+                cond_std = torch.sqrt(cond_var)
+                KL = kl_divergence(
+                                Normal(torch.flatten(mu, start_dim = 1, end_dim = -1),  torch.flatten(std, start_dim = 1, end_dim = -1)),
+                                Normal(torch.flatten(cond_mu, start_dim = 1, end_dim = -1),torch.flatten(cond_std, start_dim = 1, end_dim = -1) ))
+            if self.reduction == 'sum':
+                KL = KL.sum(dim=-1).mean()
+            if self.reduction == 'mean':
+                KL = KL.mean()
+            
+            loss += KL * beta 
+            if print_loss: 
+                print(f'KLD : {KL}')
+        else:
+            return_ind_loss = False
+        if return_ind_loss:
+            return loss, BCE, KL
+        else:
+            return loss
+        
+
+class WeightedMSELowRess:
+
+    def __init__(self, weights, device, weights_mask = None, hyperparam=1.0, min_threshold=0, max_threshold=0, reduction='mean', loss_area=None, kernel = 4):
+        self.reduction = reduction
+        self.hyperparam = hyperparam
+        self.min_threshold = min_threshold
+        self.max_threshold = max_threshold
+        self.loss_area = loss_area
+        self.device = device
+        assert np.mod(kernel,2) == 0, 'choose even kernel size'
+        self.kernel = kernel
+
+        if self.loss_area is not None:
+
+            if weights.ndim>1:
+
+                lat_min, lat_max, lon_min, lon_max = self.loss_area
+                self.weights = torch.from_numpy(weights[lat_min:lat_max+1, lon_min:lon_max+1]).to(device)
+            else:
+                 indices =  self.loss_area
+                 self.weights = torch.from_numpy(weights[indices]).to(device)
+        else:
+            if weights_mask is not None:
+                weights_mask = torch.from_numpy(weights_mask).to(device)
+                krn = torch.ones(1, 1, self.kernel, self.kernel).to(weights_mask)
+                weights_mask = F.conv2d(weights_mask.unsqueeze(0).unsqueeze(0), krn, bias=None, stride=self.kernel//2 )[0,0]
+                weights_mask = torch.clamp(weights_mask, 0, 1)
+                del krn
+
+            self.weights = torch.from_numpy(weights).to(device) 
+        
+        self.weights = F.avg_pool2d(self.weights.unsqueeze(0).unsqueeze(0), kernel_size=self.kernel, stride=self.kernel//2)[0,0]
+        if weights_mask is not None:
+            self.weights = self.weights* weights_mask
+
+    def __call__(self, data, target, mask = None, print_loss = False):
+
+        if self.loss_area is not None:
+
+
+            if self.weights.ndim>1:
+
+                lat_min, lat_max, lon_min, lon_max = self.loss_area
+                y_hat = data[..., lat_min:lat_max+1, lon_min:lon_max+1]
+                y = target[..., lat_min:lat_max+1, lon_min:lon_max+1]
+
+            else:
+                
+                indices = self.loss_area
+                y_hat = data[..., indices]
+                y = target[..., indices]
+        else:
+            y_hat = data
+            y = target
+
+        if mask is not None:
+            weight= self.weights * F.avg_pool2d(mask, kernel_size=4, stride=2)
+        else:
+            weight= self.weights
+
+        y_lowress =  F.avg_pool2d(torch.flatten(y, start_dim = 0, end_dim = 1), kernel_size=self.kernel, stride=self.kernel//2)
+        y_hat_lowress =  F.avg_pool2d(torch.flatten(y_hat, start_dim = 0, end_dim = 1), kernel_size=self.kernel, stride=self.kernel//2)
+
+        m = torch.ones_like(y_lowress)
+        m[(y_lowress < self.min_threshold) & (y_hat_lowress >= 0)] *= self.hyperparam
+        m[(y_lowress > self.max_threshold) & (y_hat_lowress <= 0)] *= self.hyperparam
+
+
+        if self.reduction == 'mean':
+            loss = ((y_hat_lowress - y_lowress)**2 * m *weight).sum() / (torch.ones_like(y_lowress) * weight).sum()
+        elif self.reduction == 'sum':
+            loss = (y_hat_lowress - y_lowress)**2 * m
+            loss = torch.sum(loss * weight, dim = (-1,-2)).mean()
+        elif self.reduction == 'none':
+            loss = (y_hat_lowress - y_lowress)**2 * m * (weight / weight.sum())
+        if print_loss:
+            print(f'MSE : {loss}')
+        return loss
+
+class WeightedMSELowRessKLD:  ## PG: penalizing negative anomalies
+    def __init__(self, weights, device, weights_mask = None, hyperparam=2.0, min_threshold=0, max_threshold=0, reduction='mean', loss_area=None, exclude_zeros=True, scale=1, min_val=0, max_val=None, kernel = 4):
+        self.reduction = reduction
+        self.device = device
+        self.mse = WeightedMSELowRess(weights=weights, device=device, weights_mask = weights_mask, hyperparam=hyperparam, reduction=reduction, loss_area=loss_area, kernel = kernel)
+
+
     def __call__(self, data, target, mu = None, log_var = None, cond_mu = None, cond_log_var = None, beta = 1, mask = None, return_ind_loss = False, print_loss = True, normalized_flow = None):
         loss = 0
         MSE = self.mse(data, target, mask)
@@ -106,128 +294,6 @@ class WeightedMSEKLD:  ## PG: penalizing negative anomalies
             return loss, MSE, KL
         else:
             return loss
-        
-
-
-
-class WeightedMSELowRess:
-
-    def __init__(self, weights, device, hyperparam=1.0, min_threshold=0, max_threshold=0, reduction='mean', loss_area=None):
-        self.reduction = reduction
-        self.hyperparam = hyperparam
-        self.min_threshold = min_threshold
-        self.max_threshold = max_threshold
-        self.loss_area = loss_area
-        self.device = device
-
-        if self.loss_area is not None:
-
-            if weights.ndim>1:
-
-                lat_min, lat_max, lon_min, lon_max = self.loss_area
-                self.weights = torch.from_numpy(weights[lat_min:lat_max+1, lon_min:lon_max+1]).to(device)
-            else:
-                 indices =  self.loss_area
-                 self.weights = torch.from_numpy(weights[indices]).to(device)
-        else:
-            self.weights = torch.from_numpy(weights).to(device)
-        
-        self.weights = F.avg_pool2d(self.weights.unsqueeze(0).unsqueeze(0), kernel_size=2, stride=2)[0,0]
-
-    def __call__(self, data, target, mask = None):
-
-        if self.loss_area is not None:
-
-
-            if self.weights.ndim>1:
-
-                lat_min, lat_max, lon_min, lon_max = self.loss_area
-                y_hat = data[..., lat_min:lat_max+1, lon_min:lon_max+1]
-                y = target[..., lat_min:lat_max+1, lon_min:lon_max+1]
-
-            else:
-                
-                indices = self.loss_area
-                y_hat = data[..., indices]
-                y = target[..., indices]
-        else:
-            y_hat = data
-            y = target
-
-        if mask is not None:
-            weight= self.weights * F.avg_pool2d(mask, kernel_size=2, stride=2)
-        else:
-            weight= self.weights
-
-        y_lowress =  F.avg_pool2d(y, kernel_size=2, stride=2)
-        y_hat_lowress =  F.avg_pool2d(y_hat, kernel_size=2, stride=2)
-
-        m = torch.ones_like(y_lowress)
-        m[(y_lowress < self.min_threshold) & (y_hat_lowress >= 0)] *= self.hyperparam
-        m[(y_lowress > self.max_threshold) & (y_hat_lowress <= 0)] *= self.hyperparam
-
-
-        if self.reduction == 'mean':
-            loss = ((y_hat_lowress - y_lowress)**2 * m *weight).sum() / (torch.ones_like(y_lowress) * weight).sum()
-        elif self.reduction == 'sum':
-            loss = (y_hat - y)**2 * m
-            loss = torch.sum(loss * weight, dim = (-1,-2)).mean()
-        elif self.reduction == 'none':
-            loss = (y_hat_lowress - y_lowress)**2 * m * (weight / weight.sum())
-        return loss
-
-class WeightedMSEKLDLowRess:  ## PG: penalizing negative anomalies
-    def __init__(self, weights, device, hyperparam=2.0, min_threshold=0, max_threshold=0, reduction='mean', loss_area=None, exclude_zeros=True, scale=1, min_val=0, max_val=None):
-        self.mse = WeightedMSELowRess(weights=weights, device=device, hyperparam=hyperparam, reduction=reduction, loss_area=loss_area)
-        self.reduction = reduction
-        self.device = device
-    def __call__(self, data, target, mu = None, log_var = None, cond_mu = None, cond_log_var = None, beta = 1, mask = None, return_ind_loss = False, print_loss = True, normalized_flow = None):
-        loss = 0
-        MSE = self.mse(data, target, mask)
-        loss += MSE#.mean()/(MSE.max() - MSE.min())
-        if print_loss:
-            print(f'MSE : {loss}')
-        if any([mu is not None, log_var is not None]):
-            assert all([mu is not None, log_var is not None])
-            var = (torch.exp(log_var) + 1e-4)
-            std = torch.sqrt(var)
-            shape = mu.shape
-
-            if all([cond_mu is None, cond_log_var is None]):
-                KL = kl_divergence(
-                                Normal(torch.flatten(mu, start_dim = 1, end_dim = -1), torch.flatten(std, start_dim = 1, end_dim = -1) ),
-                                Normal(torch.zeros_like(torch.flatten(mu, start_dim = 1, end_dim = -1)), torch.ones_like(torch.flatten(mu, start_dim = 1, end_dim = -1))))
-            else:
-                cond_var = (torch.exp(cond_log_var) + 1e-4)
-                cond_std = torch.sqrt(cond_var)
-                KL = kl_divergence(
-                                Normal(torch.flatten(mu, start_dim = 1, end_dim = -1),  torch.flatten(std, start_dim = 1, end_dim = -1)),
-                                Normal(torch.flatten(cond_mu, start_dim = 1, end_dim = -1),torch.flatten(cond_std, start_dim = 1, end_dim = -1) ))
-            if self.reduction == 'sum':
-                KL = KL.sum(dim=-1).mean()
-            if self.reduction == 'mean':
-                KL = KL.mean()
-            loss += KL * beta 
-            if print_loss: 
-                print(f'KLD : {KL}')
-        else:
-            return_ind_loss = False
-        if return_ind_loss:
-            return loss, MSE, KL
-        else:
-            return loss
-
-# class WeightedMSESignLoss:  ## PG: penalizing negative anomalies
-#     def __init__(self, weights, device, hyperparam=1.0, min_threshold=0, max_threshold=0, reduction='mean', loss_area=None, exclude_zeros=True, scale=1, min_val=0, max_val=None):
-#         self.mse = WeightedMSE(weights=weights, device=device, hyperparam=hyperparam, reduction=reduction, loss_area=loss_area)
-#         self.sign_loss = SignLoss( device=device, scale=scale, min_val=min_val, max_val=max_val, weights=weights, loss_area=loss_area, exclude_zeros=exclude_zeros)
-
-#     def __call__(self, data, target, mask = None):
-#         loss = 0
-#         loss += self.mse(data, target, mask = mask)
-#         loss += self.sign_loss(data, target, mask = mask)
-#         return loss
-    
 
 
 class WeightedMSEGlobalLoss:  ## PG: penalizing negative anomalies

@@ -11,9 +11,8 @@ import torch
 from torch.utils.data import DataLoader
 from torch.optim import lr_scheduler
 from models.cvae_0226 import cVAE
-from losses import WeightedMSEKLD, WeightedMSE
-from losses import WeightedMSEKLDLowRess, WeightedMSELowRess
-from preprocessing import align_data_and_targets, create_mask, pole_centric, reverse_pole_centric, segment, reverse_segment, pad_xarray
+from losses import WeightedMSEKLD, WeightedMSE, BCElossKLD, WeightedMSELowRessKLD
+from preprocessing import align_data_and_targets, create_mask, pole_centric, reverse_pole_centric, segment, reverse_segment, pad_xarray, smoother
 from preprocessing import AnomaliesScaler_v1_seasonal, AnomaliesScaler_v2_seasonal, Standardizer, Normalizer, PreprocessingPipeline, calculate_climatology, bias_adj, zeros_mask_gen
 from torch_datasets import XArrayDataset
 import torch.nn as nn
@@ -31,6 +30,8 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
     if lead_time is not None:
         assert lead_time <=lead_months, f"{lead_time} can not be greater than {lead_months}"
 
+    if not params['masked_weights']:
+        assert 'land_mask' in params['time_features']
     
     if NPSProj:
         crs = 'NPS'  
@@ -60,8 +61,13 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
         print(' Warning!!! If you used Standardizer as a preprocessing step make sure to pass "VAE = True" as an argument to the initializer!!!')
     #####################################################################################################
 
-    # if params['version'] == 'IceExtent':
-    #     params['reg_scale'] = None
+    if params['version'] == 'IceExtent':
+        params['reg_scale'] = None
+        params['combined_prediction'] = False
+        assert params['multi_ress_loss_kernel_size']  is None
+        assert params['low_ress_loss_kernel_size']  is None
+        assert params['loss_reduction'] == 'mean', 'Loss reduction SUM not yet set in the loss ...'
+
 
     if params['lr_scheduler']:
         start_factor = params['start_factor']
@@ -70,9 +76,12 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
     else:
         start_factor = end_factor = total_iters = None
     
-    if params['low_ress_loss']:
+    if params['multi_ress_loss_kernel_size'] is not None:
         params['active_grid'] = False
-        print('Warning: active_grid turned off because low_ress_loss is on!')
+        print('Warning: active_grid turned off because multi_ress_loss is on!')
+        assert params['low_ress_loss_kernel_size'] is None
+    if params['low_ress_loss_kernel_size'] is not None:
+        assert params['multi_ress_loss_kernel_size'] is None
 
     print("Start training")
     print("Load observations")
@@ -201,7 +210,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
     
     obs_clim = params["obs_clim"]
     active_grid = params['active_grid']
-    low_ress_loss = params['low_ress_loss']
+    multi_ress_loss_kernel_size = params['multi_ress_loss_kernel_size']
 
     if obs_clim:
             
@@ -219,12 +228,12 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
             ds_raw_ensemble_mean = ds_raw_ensemble_mean.sel(time = clim.time)
             ds_raw_ensemble_mean = xr.concat([ds_raw_ensemble_mean, clim], dim = 'channels')
 
-    # if params['version'] == 'IceExtent':
-    #     obs_raw = obs_raw.where(obs_raw>=0.15,0)
-    #     obs_raw = obs_raw.where(obs_raw ==0 , 1)
-    #     # ds_raw_ensemble_mean = ds_raw_ensemble_mean.where(ds_raw_ensemble_mean>=0.15,0)
-    #     # ds_raw_ensemble_mean = ds_raw_ensemble_mean.where(ds_raw_ensemble_mean ==0 , 1)
-    #     params['loss_function'] = 'BCELoss'
+    if params['version'] == 'IceExtent':
+        obs_raw = obs_raw.where(obs_raw>=0.15,0)
+        obs_raw = obs_raw.where(obs_raw ==0 , 1)
+        params['loss_function'] = 'BCELoss'
+
+        
     if params['combined_prediction']:
         obs_raw_ = obs_raw.where(obs_raw>=0.15,0)
         obs_raw_ = obs_raw_.where(obs_raw_ ==0 , 1)
@@ -256,6 +265,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
     with open(Path(results_dir, "training_parameters.txt"), 'w') as f:
         f.write(
             f"model\t{model.__name__}\n" +
+            f"path_to_deterministic\t{params['path_to_deterministic']}\n" +
             f"reg_scale\t{reg_scale}\n" +  ## PG: The scale to be passed to Signloss regularization
             f"loss_function\t{params['loss_function']}\n" + 
             f"time_features\t{time_features}\n" +
@@ -273,7 +283,8 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
             f"observations_preprocessing_steps\t{[s[0] if observations_preprocessing_steps is not None else None for s in observations_preprocessing_steps]}\n" +
             f"loss_region\t{loss_region}\n" +
             f"active_grid\t{active_grid}\n" + 
-            f"low_ress_loss\t{low_ress_loss}\n" +
+            f"multi_ress_loss_kernel_size\t{multi_ress_loss_kernel_size}\n" +
+            f"low_ress_loss_kernel_size\t{params['low_ress_loss_kernel_size']}\n" +
             f"equal_weights\t{params['equal_weights']}\n" + 
             f"subset_dimensions\t{subset_dimensions}\n" + 
             f"L2_reg\t{l2_reg}\n" + 
@@ -366,11 +377,18 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                 if test_year*100 + month <= ds_raw_ensemble_mean.time[-1]:
                         ds_test = ds[n_train:n_train + params['forecast_range_months'],...]
                         obs_test = obs[n_train:n_train + params['forecast_range_months'],...]
-                
+
+                if params['masked_weights']:
+                    weights_mask = land_mask.copy()
+                    weights_mask[:] = smoother(land_mask, 5)
+                    weights_mask = weights_mask.where(weights_mask == 0 ,1).values
+                else:
+                    weights_mask = None
                 if NPSProj:
                     weights = (np.ones_like(ds_train.lon) * (np.ones_like(ds_train.lat.to_numpy()))[..., None])  # Moved this up
                     weights = xr.DataArray(weights, dims = ds_train.dims[-2:], name = 'weights').assign_coords({'lat': ds_train.lat, 'lon' : ds_train.lon})
-                    weights = weights * land_mask
+                    
+                    # weights = weights * land_mask_smooth   if params['masked_weights'] else weights
                     weights_ = weights * land_mask
                 else:
                     weights = np.cos(np.ones_like(ds_train.lon) * (np.deg2rad(ds_train.lat.to_numpy()))[..., None])  # Moved this up
@@ -380,8 +398,8 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                     if params['equal_weights']:
                         weights = xr.ones_like(weights)
                     # if any(['land_mask' not in time_features, model not in [cVAE]]):
-                    weights = weights * land_mask
-
+                    # weights = weights * land_mask_smooth   if params['masked_weights'] else weights
+                
                 if loss_region is not None:
                     loss_region_indices, loss_area = get_coordinate_indices(ds_raw_ensemble_mean, loss_region, flat = False)  ### the function has to be editted for flat opeion!!!!! 
                 
@@ -411,9 +429,38 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
 
 
                 n_channels_x = len(ds_train.channels)
+                
+                if params['path_to_deterministic'] is not None:
+                    from preprocessing import extract_params
+                    
+                    params_saved = extract_params(params['path_to_deterministic'])
+                    NPSProj_saved = False if '1x1' in params['path_to_deterministic'] else True          
+                    params_saved['combined_prediction'] = True if 'combined' in params['path_to_deterministic'] else False
+                    lead_time_saved = eval(params['path_to_deterministic'].split('_LT')[1].split('_')[0]) if 'LT' in params['path_to_deterministic'] else None
+                    saved_model_year = test_year * 100 + month -1
+                    assert NPSProj_saved == NPSProj, 'The saved deterministic model cannot have a trained for a different projection than your cVAE!'
+                    if params['version'] == 'IceExtent':
+                        assert eval(params['path_to_deterministic'].split('/')[-1].split('_')[3][1]) in  ['IceExtent', 1]
+                    else:
+                        assert eval(params['path_to_deterministic'].split('/')[-1].split('_')[3][1]) == params['version'], 'The saved deterministic model cannot have a different version than your cVAE!'
+                    assert lead_time_saved == lead_time, 'The saved deterministic model cannot have a trained for a different lead_time than your cVAE!'
+                    assert params['time_features'] == params_saved['time_features'], 'The saved deterministic model must have the same input as your cVAE for the model data and added features!'
+                    assert params_saved['combined_prediction'] == params['combined_prediction'], 'The saved deterministic model must have the same output type as your cVAE'
+ 
+                    from models.unetconvnext import UNet2,UNet2_NPS
+                    model = eval(params_saved['model'])
+                    unet = model(n_channels_x= n_channels_x+ add_feature_dim , bilinear = params_saved['bilinear'], sigmoid = sigmoid_activation, skip_conv = params_saved['skip_conv'], combined_prediction = params_saved['combined_prediction'])
+                    # try:
+                    unet.load_state_dict(torch.load(glob.glob(params['path_to_deterministic']+ f'/*-{saved_model_year}*.pth')[0], map_location=torch.device('cpu'))) 
+                    # except:
+                    #     unet.load_state_dict(torch.load(glob.glob(params['path_to_deterministic']+ f'/*final*.pth')[0], map_location=torch.device('cpu'))) 
+                   
+                    unet.to(device)
+                else:
+                    unet = None
 
-
-                net = cVAE(VAE_latent_size = params['VAE_latent_size'], n_channels_x= n_channels_x+ add_feature_dim , sigmoid = sigmoid_activation, NPS_proj = NPSProj, device=device, combined_prediction = params['combined_prediction'], VAE_MLP_encoder = params['VAE_MLP_encoder'], scale_factor_channels = params['scale_factor_channels'], skip_VAE_added_dim = params['skip_VAE_added_dim'])
+                net = cVAE(VAE_latent_size = params['VAE_latent_size'], n_channels_x= n_channels_x+ add_feature_dim , sigmoid = sigmoid_activation, NPS_proj = NPSProj, device=device, combined_prediction = params['combined_prediction'], VAE_MLP_encoder = params['VAE_MLP_encoder'],
+                            scale_factor_channels = params['scale_factor_channels'], skip_VAE_added_dim = params['skip_VAE_added_dim'], saved_deterministic_model = unet, freeze_deterministic = params['freeze_deterministic'])
 
                 net.to(device)
                 optimizer = torch.optim.Adam(net.parameters(), lr=lr, weight_decay = l2_reg)
@@ -431,15 +478,14 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
 
 
                 # if reg_scale is None: ## PG: if no penalizing for negative anomalies
-                if low_ress_loss:
-                    criterion = WeightedMSEKLDLowRess(weights=weights, device=device, hyperparam=1, reduction=params['loss_reduction'], loss_area=loss_region_indices, scale=reg_scale)
+                if params['version'] == 'IceExtent':
+                    criterion = BCElossKLD(device=device,  reduction=params['loss_reduction'])
+
                 else:
-                    criterion = WeightedMSEKLD(weights=weights, device=device, hyperparam=1, reduction=params['loss_reduction'], loss_area=loss_region_indices, scale=reg_scale)
-                # else:
-                #     if low_ress_loss:
-                #         criterion = WeightedMSEGlobalLossLowRess(weights=weights, device=device, hyperparam=1, reduction='mean', loss_area=loss_region_indices, scale=reg_scale, map = True)
-                #     else:
-                #         criterion = WeightedMSEGlobalLoss(weights=weights, device=device, hyperparam=1, reduction='mean', loss_area=loss_region_indices, scale=reg_scale, map = True)
+                    if params['low_ress_loss_kernel_size'] is None:  
+                        criterion = WeightedMSEKLD(weights=weights, device=device, weights_mask = weights_mask, hyperparam=1, reduction=params['loss_reduction'], loss_area=loss_region_indices, scale=reg_scale, multi_ress_loss_kernel_size = multi_ress_loss_kernel_size)
+                    else:
+                        criterion = WeightedMSELowRessKLD(weights=weights, device=device, weights_mask = weights_mask, hyperparam=1, reduction=params['loss_reduction'], loss_area=loss_region_indices, scale=reg_scale, kernel = params['low_ress_loss_kernel_size'])
                 if params['combined_prediction']:
                     criterion_extent = nn.BCELoss()
 
@@ -487,27 +533,28 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                         optimizer.zero_grad()
                         obs_mask = obs_mask.to(y).expand_as(y[0])
                         generated_output, _, mu, log_var , cond_mu, cond_log_var = net(y, obs_mask, x, model_mask_, sample_size = params['training_sample_size'] )
-                        if params['hybrid_weight'] is not None:
-                            generated_output_GCGN, _, _, _ , _, _ = net(y, obs_mask, x, model_mask_, sample_size = params['training_sample_size'], mode = 'GCGN' )   
-
                         if params['combined_prediction']:
                             (y, y_extent) = (y[:,0].unsqueeze(1), y[:,1].unsqueeze(1))
                             (generated_output, generated_output_extent) = generated_output
                             loss_extent = criterion_extent(generated_output_extent, y_extent.unsqueeze(0).expand_as(generated_output_extent))
-                            if params['hybrid_weight'] is not None:
+                            del generated_output_extent
+                        loss, MSE, KLD = criterion(generated_output, y.unsqueeze(0).expand_as(generated_output) ,mu, log_var, cond_mu = cond_mu, cond_log_var = cond_log_var ,beta = beta, mask = m, return_ind_loss=True , print_loss = True)
+                        del generated_output
+                        torch.cuda.empty_cache() 
+                        if params['hybrid_weight'] is not None:
+                            generated_output_GCGN, _, _, _ , _, _ = net(y, obs_mask, x, model_mask_, sample_size = params['training_sample_size'], mode = 'GCGN' )   
+                            if params['combined_prediction']:
                                 (generated_output_GCGN, generated_output_GCGN_extent) = generated_output_GCGN
                                 loss_extent_GCGN = criterion_extent(generated_output_GCGN_extent, y_extent.unsqueeze(0).expand_as(generated_output_extent))
                                 loss_extent = loss_extent * params['hybrid_weight'] + ( 1- params['hybrid_weight']) * loss_extent_GCGN
-                                del generated_output_GCGN_extent
-                            del generated_output_extent
-
-                        loss, MSE, KLD = criterion(generated_output, y.unsqueeze(0).expand_as(generated_output) ,mu, log_var, cond_mu = cond_mu, cond_log_var = cond_log_var ,beta = beta, mask = m, return_ind_loss=True , print_loss = True)
-                        if params['hybrid_weight'] is not None:
-                            loss_GCGN = criterion(generated_output_GCGN, y.unsqueeze(0).expand_as(generated_output) , mask = m , return_ind_loss=False , print_loss = False)
+                                del generated_output_GCGN_extent, y_extent
+                                torch.cuda.empty_cache() 
+                            
+                            loss_GCGN = criterion(generated_output_GCGN, y.unsqueeze(0).expand_as(generated_output_GCGN) , mask = m , return_ind_loss=False , print_loss = False)
                             print(f'GCGN : {loss_GCGN}')
                             loss = loss * params['hybrid_weight'] + ( 1- params['hybrid_weight']) * loss_GCGN
                             del generated_output_GCGN
-                         
+                            torch.cuda.empty_cache() 
                         if params['combined_prediction']:
                             loss = loss + loss_extent
 
@@ -522,9 +569,10 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
 
                     if params['lr_scheduler']:
                         scheduler.step()
-                del train_set, dataloader, ds_train, obs_train, generated_output, x, y , m, mu, log_var , cond_mu, cond_log_var 
+                del train_set, dataloader, ds_train, obs_train, x, y , m, mu, log_var , cond_mu, cond_log_var 
 
                 gc.collect()
+                torch.cuda.empty_cache() 
                 # EVALUATE MODEL
                 ##################################################################################################################################
                 if test_year*100 + month <= ds_raw_ensemble_mean.time[-1]:
@@ -538,12 +586,9 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
         
                     ## PG: Extract the number of years as well 
                     test_set = XArrayDataset(ds_test, obs_test, lead_time=lead_time,mask = None,zeros_mask = zeros_mask, time_features=time_features,ensemble_features =ensemble_features,  in_memory=False, aligned = True, month_min_max = month_min_max, model = 'UNet2')
-                    # if params['version'] == 'IceExtent':   
-                    #     criterion_test = nn.BCELoss()
-                    # else:
-                    if low_ress_loss:
-                        criterion_test =  WeightedMSELowRess(weights=weights_, device=device, hyperparam=1, reduction='mean', loss_area=loss_region_indices)
-                    else:    
+                    if params['version'] == 'IceExtent':   
+                        criterion_test = nn.BCELoss( reduction='mean')
+                    else:
                         criterion_test =  WeightedMSE(weights=weights_, device=device, hyperparam=1, reduction='mean', loss_area=loss_region_indices)
 
 
@@ -583,7 +628,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                                 m = None
                             del x, target
                             _,deterministic_output, _, _, cond_mu, cond_log_var = net(test_obs, obs_mask, test_raw, model_mask_, sample_size = 1 )
-                            basic_unet = net.unet(test_raw, model_mask_)
+                            basic_unet = net.unet(test_raw, model_mask_) if not net.loaded_unet else net.unet(test_raw, model_mask_[0,...])
                             cond_var = torch.exp(cond_log_var) + 1e-4
                             cond_std = torch.sqrt(cond_var)
 
@@ -598,19 +643,20 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                                 test_results_extent[:,i,] = generated_output_extent.squeeze().to(torch.device('cpu')).numpy()
                                 test_results_deterministic_extent[i,] = deterministic_output_extent.squeeze().to(torch.device('cpu')).numpy()
                             del z, out
+                            torch.cuda.empty_cache() 
                             if m is not None:
                                 m[m != 0] = 1
-                            # if params['version'] == 'IceExtent':
-                            #     loss = criterion_test(generated_output, test_obs)
-                            # else:
-                            loss = criterion_test(torch.mean(generated_output, 0), test_obs, mask = m)
+                            if params['version'] == 'IceExtent':
+                                loss = criterion_test(torch.mean(generated_output, 0).unsqueeze(0), test_obs)
+                            else:
+                                loss = criterion_test(torch.mean(generated_output, 0), test_obs, mask = m)
 
                             test_results[:,i,] = generated_output.squeeze().to(torch.device('cpu')).numpy()
                             test_results_deterministic[i,] = deterministic_output.squeeze().to(torch.device('cpu')).numpy()
                             test_loss[i] = loss.item()
                     del  test_set , test_raw, test_obs, m, deterministic_output,  generated_output , ds_test, obs_test, cond_mu, cond_var, cond_std, basic_unet
                     gc.collect()
-
+                    torch.cuda.empty_cache() 
                     ###################################################### has to be eddited for large ensembles!! #####################################################################
                     results_shape[:] = test_results[:]
                     results_shape_deterministic[:] = test_results_deterministic[:]
@@ -639,24 +685,28 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                     del  results_shape, test_results, test_results_untransformed,  results_shape_deterministic, test_results_deterministic, test_results_untransformed_deterministic
 
                     gc.collect()
-                    result = (result * land_mask)
-                    result_deterministic = (result_deterministic * land_mask)
-
+                    # if params['masked_weights']:
+                    #     result = (result * land_mask)
+                    #     result_deterministic = (result_deterministic * land_mask)
+                    
                     if not NPSProj:
                             result = reverse_pole_centric(result, subset_dimensions)
                             result_deterministic = reverse_pole_centric(result_deterministic, subset_dimensions)
+                            reverse_pole_centric(land_mask, subset_dimensions).to_dataset(name  = 'land_mask').to_netcdf(path=Path(results_dir, f'obs_land_mask.nc', mode='w'))
+                    else:
+                            land_mask.to_dataset(name  = 'land_mask').to_netcdf(path=Path(results_dir, f'obs_land_mask.nc', mode='w'))
 
                     ##############################################################################################################################################################
                     result = result.to_dataset(name = 'nn_adjusted') 
                     result_deterministic = result_deterministic.to_dataset(name = 'nn_adjusted')  
 
-                    # if params['version'] == 'IceExtent':
+                    if params['version'] == 'IceExtent':
                         
-                    #     result = result.where(result >= 0.5, 0)
-                    #     result = result.where(result ==0, 1)
+                        result = result.where(result >= 0.5, 0)
+                        result = result.where(result ==0, 1)
 
-                    #     result_deterministic = result_deterministic.where(result_deterministic >= 0.5, 0)
-                    #     result_deterministic = result_deterministic.where(result_deterministic ==0, 1)
+                        result_deterministic = result_deterministic.where(result_deterministic >= 0.5, 0)
+                        result_deterministic = result_deterministic.where(result_deterministic ==0, 1)
 
                     if active_grid:
                         if not NPSProj:
@@ -667,8 +717,9 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                         result_deterministic = xr.combine_by_coords([result_deterministic * zeros_mask_test, zeros_mask_test.to_dataset(name = 'active_grid')])
 
                     if params['combined_prediction']:
-                        result_extent = (result_extent * land_mask)
-                        result_extent_deterministic = (result_extent_deterministic * land_mask)
+                        # if params['masked_weights']:
+                        #     result_extent = (result_extent * land_mask)
+                        #     result_extent_deterministic = (result_extent_deterministic * land_mask)
                         if not NPSProj:
                             result_extent = reverse_pole_centric(result_extent, subset_dimensions)
                             result_extent_deterministic = reverse_pole_centric(result_extent_deterministic, subset_dimensions)
@@ -688,8 +739,9 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                     monthly_results_deterministic.append(result_deterministic)
                     
                     fig, ax = plt.subplots(1,1, figsize=(8,5))
+                    label = 'BCE' if params['version'] == 'IceExtent' else 'MSE' 
                     ax.plot(np.arange(1,epochs+1), epoch_loss, label = 'Epoch loss total')
-                    ax.plot(np.arange(1,epochs+1), epoch_MSE, linestyle = 'dashed', label = 'Epoch MSE only')
+                    ax.plot(np.arange(1,epochs+1), epoch_MSE, linestyle = 'dashed', label = f'Epoch {label} only')
                     ax.plot(np.arange(1,epochs+1), epoch_KLD, linestyle = 'dotted', label = 'Epoch KLD')
 
                     ax.set_title(f'Train Loss \n test loss (SIC only): {np.mean(test_loss)}') ###
@@ -704,7 +756,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                     del result,result_deterministic, net, optimizer
                     gc.collect()
                     torch.cuda.empty_cache() 
-                    torch.cuda.synchronize() 
+                     
                 else:
                     if lead_time is not None:
                         nameSave = f"MODEL_final_V{params['version']}_198101-{int(ds_raw_ensemble_mean.time[-lead_time])}.pth"
@@ -731,20 +783,22 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
 if __name__ == "__main__":
 
   
-    n_years =  4 # last n years to test consecutively
+    n_years =  5 # last n years to test consecutively
     lead_months = 12
     lead_time = None ## None for training using all available lead_times as indicated ny lead_months
     n_runs = 1  # number of training runs
 
     params = {
         "model": cVAE,
-        "time_features": ['month_sin','month_cos', 'imonth_sin', 'imonth_cos'],
+        "path_to_deterministic" : '/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/NASA/UNet2/run_set_3_convnext/N5_M12_F12_v1_1x1_North_lr0.001_batch100_e50_LNone_bilinear_low_ress_loss16', 
+        "freeze_deterministic" : True,
+        "time_features": ['month_sin','month_cos', 'imonth_sin', 'imonth_cos','land_mask'],
         "obs_clim" : False,
         "ensemble_features": False, ## PG
         'ensemble_list' : None, ## PG
         'ensemble_mode' : 'Mean',
         "epochs": 50,
-        "batch_size": 10,
+        "batch_size": 5,
         "reg_scale" : None,
         "beta" : 1,
         "optimizer": torch.optim.Adam,
@@ -753,30 +807,33 @@ if __name__ == "__main__":
         "loss_region": None,
         "subset_dims": 'North',   ## North or South or Global
         'active_grid' : False,
-        'low_ress_loss' : False,
+        'multi_ress_loss_kernel_size' : None,
+        'low_ress_loss_kernel_size' : None,
         'equal_weights' : False,
+        'masked_weights' : True,
         "decoder_kernel_size" : 1, ## only for (Reg)CNN
         "L2_reg": 0,
         'lr_scheduler' : False,
-        'VAE_latent_size' : 50,
-        'VAE_MLP_encoder' : False,
+        'VAE_latent_size' : 1000,
+        'VAE_MLP_encoder' : True,
         'scale_factor_channels' : None,
         'BVAE' : 50,
-        'training_sample_size' : 1, 
+        'training_sample_size' : 100, 
         'loss_reduction' : 'mean' , # mean or sum
         'combined_prediction' : False,
-        'hybrid_weight' : 0.5, ### CVAE weight
-        'skip_VAE_added_dim' : False,
+        'hybrid_weight' :   None, ### CVAE weight
+        'skip_VAE_added_dim' : True,
+        
     }
 
 
 
-    params['version'] =  1  ### 1 , 2 ,3 , 'IceExtent'
+    params['version'] =  'IceExtent'  ### 1 , 2 ,3 , 'IceExtent'
     params['forecast_range_months'] = 12
-    params['beta'] =   0.1 #dict(start = 0, end =1, start_epoch = 1 , end_epoch = params['epochs'])  
+    params['beta'] =  0.1 #dict(start = 0, end =0.1, start_epoch = 1 , end_epoch = params['epochs'])  
 
     obs_ref = 'NASA'
-    NPSProj = True
+    NPSProj = False
     
     out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_1_convnext'
     if type(params['beta']) == dict:
@@ -795,9 +852,9 @@ if __name__ == "__main__":
         model_type = 'skip-' + model_type
 
     if lead_time is None:
-        out_dir    = f'{out_dir_x}/N{n_years}_M{lead_months}_F{params["forecast_range_months"]}_v{params["version"]}_{beta_arg}_batch{params["batch_size"]}_e{params["epochs"]}_Cscale{params["scale_factor_channels"]}_{model_type}_{params["BVAE"]}-{params["training_sample_size"]}_LS{params["VAE_latent_size"]}'
+        out_dir    = f'{out_dir_x}/N{n_years}_M{lead_months}_F{params["forecast_range_months"]}_v{params["version"]}_*_{beta_arg}_batch{params["batch_size"]}_e{params["epochs"]}_Cscale{params["scale_factor_channels"]}_{model_type}_{params["BVAE"]}-{params["training_sample_size"]}_LS{params["VAE_latent_size"]}'
     else:
-        out_dir    = f'{out_dir_x}/N{n_years}_LT{lead_time}_F{params["forecast_range_months"]}_v{params["version"]}_{beta_arg}_batch{params["batch_size"]}_e{params["epochs"]}_Cscale{params["scale_factor_channels"]}_{model_type}_{params["BVAE"]}-{params["training_sample_size"]}_LS{params["VAE_latent_size"]}'
+        out_dir    = f'{out_dir_x}/N{n_years}_LT{lead_time}_F{params["forecast_range_months"]}_v{params["version"]}_*_{beta_arg}_batch{params["batch_size"]}_e{params["epochs"]}_Cscale{params["scale_factor_channels"]}_{model_type}_{params["BVAE"]}-{params["training_sample_size"]}_LS{params["VAE_latent_size"]}'
     
     if params['VAE_MLP_encoder']:
         out_dir = out_dir + '_Linear'
@@ -811,7 +868,7 @@ if __name__ == "__main__":
         params['total_iters'] = params['epochs']
 
 
-    out_dir  = out_dir + f'_{params["subset_dims"]}_lr{params["lr"]}_batch{params["batch_size"]}_e{params["epochs"]}_L{params["reg_scale"]}'
+    out_dir  = out_dir + f'_{params["subset_dims"]}_lr{params["lr"]}_batch{params["batch_size"]}_e{params["epochs"]}_L{params["reg_scale"]}_maskfeautures'
 
     if params['subset_dims'] == 'Global':
         params['subset_dimensions'] = None
@@ -822,6 +879,21 @@ if __name__ == "__main__":
         out_dir = out_dir + '_active_grid'
     if params['combined_prediction']:
         out_dir = out_dir + '_combined'  
+    if params['multi_ress_loss_kernel_size'] is not None:
+        out_dir = out_dir + f'_multiressloss{params["multi_ress_loss_kernel_size"]}'
+    if params['low_ress_loss_kernel_size'] is not None:
+         out_dir = out_dir + f'_low_ress_loss{params["low_ress_loss_kernel_size"]}'
+    if not params['masked_weights']:
+        out_dir = out_dir + '_weightsnonmaked'  
+    if params['path_to_deterministic'] is not None:
+        if 'low_ress_loss' in params['path_to_deterministic']:
+            out_dir = out_dir + '_pretrainedUNETlowress'
+        elif 'multi_ress_loss' in params['path_to_deterministic']:
+            out_dir = out_dir + '_pretrainedUNETmultiress'  
+        else:
+            out_dir = out_dir + '_pretrainedUNET'   
+        if not params['freeze_deterministic']:
+             out_dir = out_dir + 'notforzen'
 
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     Path(out_dir + '/Figures').mkdir(parents=True, exist_ok=True)
