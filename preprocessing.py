@@ -2,7 +2,7 @@ import numpy as np
 from xarray import DataArray
 import xarray as xr
 import math
-
+import glob
 def select_test_years(dataset, n_test_years=1, test_years=None):
     if test_years:
         years = np.sort([test_years]).flatten()
@@ -860,29 +860,56 @@ def smoother(ds, smoother_kernel = 10):
     # Print the smoothed data in latitude and longitude
     return smoothed_data_lon
 
-import glob
+
+# def extract_params(model_dir):
+#     params = {}
+#     path = glob.glob(model_dir + '/*.txt')[0]
+#     file = open(path)
+#     content=file.readlines()
+#     for line in content:
+#         key = line.split('\t')[0]
+#         try:
+#             value = line.split('\t')[1].split('\n')[0]
+#         except:
+#             value = line.split('\t')[1]
+#         try:    
+#             params[key] = eval(value)
+#         except:
+#             if key == 'ensemble_list':
+#                 ls = []
+#                 for item in value.split('[')[1].split(']')[0].split(' '):
+#                     try:
+#                         ls.append(eval(item))
+#                     except:
+#                         pass
+#                 params[key] = ls
+#             else:
+#                 params[key] = value
+#     return params
+
 def extract_params(model_dir):
     params = {}
     path = glob.glob(model_dir + '/*.txt')[0]
     file = open(path)
     content=file.readlines()
     for line in content:
-        key = line.split('\t')[0]
-        try:
-            value = line.split('\t')[1].split('\n')[0]
-        except:
-            value = line.split('\t')[1]
-        try:    
-            params[key] = eval(value)
-        except:
-            if key == 'ensemble_list':
-                ls = []
-                for item in value.split('[')[1].split(']')[0].split(' '):
-                    try:
-                        ls.append(eval(item))
-                    except:
-                        pass
-                params[key] = ls
-            else:
-                params[key] = value
+        if '\t' in line:
+            key = line.split('\t')[0]
+            try:
+                value = line.split('\t')[1].split('\n')[0]
+            except:
+                value = line.split('\t')[1]
+            try:    
+                params[key] = eval(value)
+            except:
+                if key == 'ensemble_list':
+                    ls = []
+                    for item in value.split('[')[1].split(']')[0].split(' '):
+                        try:
+                            ls.append(eval(item))
+                        except:
+                            pass
+                    params[key] = ls
+                else:
+                    params[key] = value
     return params

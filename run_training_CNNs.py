@@ -23,13 +23,15 @@ import torch.nn as nn
 from data_locations import LOC_FORECASTS_SI, LOC_OBSERVATIONS_SI
 import glob
 import gc
+import os
 # specify data directories
 data_dir_forecast = LOC_FORECASTS_SI
 
 
 
 
-def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False,test_years = None,  n_runs=1, results_dir=None, numpy_seed=None, torch_seed=None, save = False):
+def run_training(params, n_years, n_validation_years = 0, lead_months = 12, lead_time = None, NPSProj = False,test_years = None,  n_runs=1, results_dir=None, numpy_seed=None, torch_seed=None, save = False):
+
     if lead_time is not None:
         assert lead_time <=lead_months, f"{lead_time} can not be greater than {lead_months}"
 
@@ -63,7 +65,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
     else:
         data_dir_obs = glob.glob(LOC_OBSERVATIONS_SI+ '/uws*.nc')[0]
 
-    assert params['version'] in [1,2,3, 'IceExtent']
+    assert params['version'] in [1,2,3,1.1, 'IceExtent']
 
   
     if params['version'] == 2:
@@ -77,7 +79,6 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
         params['observations_preprocessing_steps'] = []
 
     if params['version'] == 'IceExtent':
-        params['reg_scale'] = None
         params['combined_prediction'] = False
         assert params['multi_ress_loss_kernel_size']  is None
         assert params['low_ress_loss_kernel_size']  is None
@@ -107,7 +108,6 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
     ensemble_list = params['ensemble_list']
     ###### PG: Add ensemble features to training features
     ensemble_mode = params['ensemble_mode'] ##
-    ensemble_features = params['ensemble_features']
 
     if params['version'] == 3:
 
@@ -140,9 +140,9 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
     if not NPSProj:
         ds_in = ds_in.where(ds_in<1000,np.nan)
     else:
-        mask_projection = (xr.open_dataset(data_dir_obs)['mask'].rename({'x':'lon','y':'lat'}))
-        obs_in = (obs_in.rename({'x':'lon','y':'lat'}))
-        ds_in = (ds_in.rename({'x':'lon','y':'lat'}))
+        mask_projection = (xr.open_dataset(data_dir_obs)['mask'].rename({'x':'lon','y':'lat'}))[...,:,64:-64]
+        obs_in = (obs_in.rename({'x':'lon','y':'lat'}))[...,:,64:-64]
+        ds_in = (ds_in.rename({'x':'lon','y':'lat'}))[...,:,64:-64]
 
 
     land_mask = obs_in.mean('time').where(np.isnan(obs_in.mean('time')),1).fillna(0)
@@ -199,7 +199,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
             test_years = test_years[:-1]
 
     if any([params['active_grid'],'active_mask' in params["time_features"], 'full_ice_mask' in params["time_features"]]):
-        zeros_mask_full = xr.concat([zeros_mask_gen(obs_raw.isel(lead_time = 0).drop('lead_time').where(obs_raw.time<test_year*100, drop = True ), 3) for test_year in test_years], dim = 'test_year').assign_coords(test_year = test_years)           
+        zeros_mask_full = xr.concat([zeros_mask_gen(obs_raw.isel(lead_time = 0).drop('lead_time').where((test_year - n_validation_years) *100, drop = True ), 3) for test_year in test_years], dim = 'test_year').assign_coords(test_year = test_years)           
         
         for item in ['active_mask', 'full_ice_mask']:
             zeros_mask_full = zeros_mask_full.drop(item) if item not in params["time_features"] else zeros_mask_full
@@ -208,23 +208,21 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
         zeros_mask_full = zeros_mask_full.expand_dims('channels', axis=-3)
         if 'ensembles' in ds_raw.dims:
              zeros_mask_full = zeros_mask_full.expand_dims('ensembles', axis=2)
-   
-    reg_scale = params["reg_scale"]
+
     model = params["model"]
     hidden_dims = params["hidden_dims"]
     time_features = params["time_features"]
     epochs = params["epochs"]
     batch_size = params["batch_size"]
+    grad_accumulation_steps = params['grad_accumulation_steps']
     kernel_size = params["kernel_size"]
     decoder_kernel_size = params["decoder_kernel_size"]
+    LocallyConnected = params['LocallyConnected']
     optimizer = params["optimizer"]
     lr = params["lr"]
     l2_reg = params["L2_reg"]
     forecast_preprocessing_steps = params["forecast_preprocessing_steps"]
     observations_preprocessing_steps = params["observations_preprocessing_steps"]
-
-    loss_region = params["loss_region"]
-    
     obs_clim = params["obs_clim"]
     active_grid = params['active_grid']
     multi_ress_loss_kernel_size = params['multi_ress_loss_kernel_size']
@@ -292,24 +290,23 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
         f.write(
             f"model\t{model.__name__}\n" +
             f"bilinear\t{params['bilinear']}\n" +
-            f"reg_scale\t{reg_scale}\n" +  ## PG: The scale to be passed to Signloss regularization
             f"hidden_dims\t{hidden_dims}\n" +
             f"loss_function\t{params['loss_function']}\n" + 
             f"time_features\t{time_features}\n" +
             f"obs_clim\t{obs_clim}\n" +
             f"ensemble_list\t{ensemble_list}\n" + ## PG: Ensemble list
             f"ensemble_mode\t{ensemble_mode}\n" + ## PG: Ensemble list
-            f"ensemble_features\t{ensemble_features}\n" + ## PG: Ensemble features
             f"epochs\t{epochs}\n" +
             f"batch_size\t{batch_size}\n" +
+            f"grad_accumulation_steps\t{grad_accumulation_steps}\n" + 
             f"optimizer\t{optimizer.__name__}\n" +
-            f"lr\t{0.001}\n" +
+            f"lr\t{params['lr']}\n" +
             f"lr_scheduler\t{params['lr_scheduler']}: {start_factor} --> {end_factor} in {total_iters} epochs\n" + 
             f"kernel_size\t{kernel_size}\n" +
+            f"LocallyConnected\t{LocallyConnected}\n" +
             f"decoder_kernel_size\t{decoder_kernel_size}\n" +
             f"forecast_preprocessing_steps\t{[s[0] if forecast_preprocessing_steps is not None else None for s in forecast_preprocessing_steps]}\n" +
             f"observations_preprocessing_steps\t{[s[0] if observations_preprocessing_steps is not None else None for s in observations_preprocessing_steps]}\n" +
-            f"loss_region\t{loss_region}\n" +
             f"active_grid\t{active_grid}\n" + 
             f"multi_ress_loss_kernel_size\t{multi_ress_loss_kernel_size}\n" +
             f"low_ress_loss_kernel_size\t{params['low_ress_loss_kernel_size']}\n" +
@@ -333,7 +330,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                 if test_year * 100 + month > ds_raw_ensemble_mean.time[-1]:
                     test_year, month = np.divmod(int(ds_raw_ensemble_mean.time[-1].values),  100)
                     test_year = test_year + np.divmod(month+1,13)[0]
-                    month = np.divmod(month+1,13)[1]
+                    month = max(np.divmod(month+1,13)[1],1)
                     print(f"\tStart run the final model ...")
                 else:
                     print(f"\tStart run month {month} - {month + params['forecast_range_months'] - 1}...")
@@ -344,7 +341,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                     zeros_mask = None
                 
 
-                train_years = ds_raw_ensemble_mean.time[ds_raw_ensemble_mean.time < test_year * 100 + month].to_numpy()
+                train_years = ds_raw_ensemble_mean.time[ds_raw_ensemble_mean.time < (test_year - n_validation_years) * 100 + month].to_numpy()
                 n_train = len(train_years)
                 train_mask = create_mask(ds_raw_ensemble_mean[:n_train,...]) if lead_time is None else create_mask(full_shape[:n_train,...])[:, lead_time - 1][..., None] ############
 
@@ -380,25 +377,26 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                 del ds_baseline, obs_baseline, preprocessing_mask_obs, preprocessing_mask_fct
                 gc.collect()
 
-                if params['version']  in [3]:
+                if params['version']  in [3, 1.1]:
                     sigmoid_activation = False
                 else:
                     sigmoid_activation = True
 
-                y0 = np.floor(ds[:n_train].time[0].values/100 )
-                yr, mn = np.divmod(int(ds[:n_train+params['forecast_range_months']].time[-1].values - y0*100),100)
-                month_min_max = [y0, yr * 12 + mn]
 
                 if 'land_mask' in time_features:
                     ds = xr.concat([ds, land_mask.expand_dims('channels', axis = 0)], dim = 'channels')
                 
-                # TRAIN MODEL
+                ############################################# Prepare data ###########################################
 
                 ds_train = ds[:n_train,...]
                 obs_train = obs[:n_train,...]
+
+                ds_validation = ds[n_train:n_train + n_validation_years*12,...]
+                obs_validation = obs[n_train:n_train + n_validation_years*12,...]     
+
                 if test_year*100 + month <= ds_raw_ensemble_mean.time[-1]:
-                        ds_test = ds[n_train:n_train + params['forecast_range_months'],...]
-                        obs_test = obs[n_train:n_train + params['forecast_range_months'],...]
+                        ds_test = ds[n_train  + n_validation_years*12 :n_train + n_validation_years*12 + params['forecast_range_months'],...]
+                        obs_test = obs[n_train  + n_validation_years*12 :n_train + n_validation_years*12 + params['forecast_range_months'],...]
 
                 if params['masked_weights']:
                     weights_mask = land_mask.copy()
@@ -406,10 +404,11 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                     weights_mask = weights_mask.where(weights_mask == 0 ,1).values
                 else:
                     weights_mask = None
+
                 if NPSProj:
                     weights = (np.ones_like(ds_train.lon) * (np.ones_like(ds_train.lat.to_numpy()))[..., None])  # Moved this up
                     weights = xr.DataArray(weights, dims = ds_train.dims[-2:], name = 'weights').assign_coords({'lat': ds_train.lat, 'lon' : ds_train.lon})
-                    # weights = weights * land_mask
+                    # weights = weights * land_mask_smooth   if params['masked_weights'] else weights
                     weights_ = weights * land_mask
                 else:
                     weights = np.cos(np.ones_like(ds_train.lon) * (np.deg2rad(ds_train.lat.to_numpy()))[..., None])  # Moved this up
@@ -418,15 +417,6 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                     weights_ = weights * land_mask
                     if params['equal_weights']:
                         weights = xr.ones_like(weights)
-                    # if any(['land_mask' not in time_features, model not in [UNet2]]):
-                    # weights = weights * land_mask
-
-                if loss_region is not None:
-                    loss_region_indices, loss_area = get_coordinate_indices(ds_raw_ensemble_mean, loss_region, flat = False)  ### the function has to be editted for flat opeion!!!!! 
-                
-                else:
-                    loss_region_indices = None
-
 
                 del ds, obs
                 gc.collect()
@@ -435,15 +425,24 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                 weights = weights.values
                 weights_ = weights_.values
 
+                ## PG: XArrayDataset now needs to know if we are adding ensemble features. The outputs are datasets that are maps or flattened in space depending on the model.
+                if lead_time is not None:
+                    mask =  create_mask(full_shape)[:n_train]  #create_mask(ds)[:n_train]
+                    val_mask = create_mask(full_shape[n_train:n_train + n_validation_years *12] )[:, lead_time - 1][..., None] ####create_mask(ds_raw_ensemble_mean)[n_train:n_train + num_val_years*12] 
+                else:
+                    val_mask = create_mask(ds_validation)
+                    mask = train_mask
+                                    
+                train_set = XArrayDataset(ds_train, obs_train, mask=mask, zeros_mask = zeros_mask, in_memory=False, lead_time=lead_time, time_features=time_features, aligned = True,  model = model.__name__) 
+                dataloader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
+                
+                validation_set = XArrayDataset(ds_validation, obs_validation, mask=val_mask, zeros_mask = zeros_mask, lead_time=lead_time, time_features=time_features, in_memory=False, aligned = True,  model = model.__name__) 
+                dataloader_val = DataLoader(validation_set, batch_size=batch_size, shuffle=False)                   
+                
+                ############################################## Prepare model #######################################
                 if time_features is None:
-                    if ensemble_features: ## PG: We can choose to add an ensemble feature.
-                        add_feature_dim = 1
-                    else:
                         add_feature_dim = 0
                 else:
-                    if ensemble_features:
-                        add_feature_dim = len(time_features) + 1
-                    else:
                         add_feature_dim = len(time_features)
                 if 'land_mask' in time_features:
                     add_feature_dim -= 1
@@ -453,45 +452,69 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
 
 
                 if model in [UNet,UNetLCL,UNet2, UNet_NPS, UNet2_NPS, UNet2_small, UNet2_NPS_small]:
-                    net = model(n_channels_x= n_channels_x+ add_feature_dim , bilinear = params['bilinear'], sigmoid = sigmoid_activation, skip_conv = params['skip_conv'], combined_prediction = params['combined_prediction'])
+                    net = model(n_channels_x= n_channels_x+ add_feature_dim , bilinear = params['bilinear'], sigmoid = sigmoid_activation, skip_conv = params['skip_conv'], combined_prediction = params['combined_prediction'], LocallyConnected = params['LocallyConnected'])
                 elif model in [ CNN]:
                     net = model(n_channels_x + add_feature_dim ,hidden_dims, kernel_size = kernel_size, decoder_kernel_size = decoder_kernel_size, DSC = DSC, sigmoid = sigmoid_activation )
                 elif model in [ RegCNN]: 
                     net = model(n_channels_x , add_feature_dim ,hidden_dimensions =hidden_dims,  kernel_size = kernel_size, decoder_kernel_size = decoder_kernel_size, DSC = DSC, sigmoid = sigmoid_activation )
 
+                if params['saved_checkpoint_dir'] is not None:
+                    if params['saved_checkpoint_dir'] == 'Same':
+                        saved_checkpoint_dir = results_dir
+                    if test_year*100  + month <= ds_raw_ensemble_mean.time[-1]:
+                        nameSave = f"MODEL_V{params['version']}_198101-{(test_year - n_validation_years) * 100 + month -1}*"
+                    else:
+                        if lead_time is not None:
+                                nameSave = f"MODEL_final_V{params['version']}_198101-{int(ds_raw_ensemble_mean.time[-lead_time]) - n_validation_years*100}*"
+                        else:
+                                nameSave = f"MODEL_final_V{params['version']}_198101-{int(ds_raw_ensemble_mean.time[-1])- n_validation_years*100}*"
+
+                    try:
+                        checkpoint_model_dir = glob.glob(saved_checkpoint_dir + '/Checkpoints/' + nameSave )[0]
+
+                        checkpoint_restart_epoch = int(checkpoint_model_dir.split('_epoch_')[1].split('.pth')[0])
+                        print(f'\nTest year {test_year} restart training from epoch {checkpoint_restart_epoch} ...\n')
+                        with open(Path(results_dir, "training_parameters.txt"), 'a') as f:
+                            f.write(f"\nTest year {test_year} restarted training from epoch {checkpoint_restart_epoch} ... \n")
+                            if params['saved_checkpoint_dir'] != 'Same':
+                                f.write(f"\nTest year {test_year} contintuing {params['saved_checkpoint_dir']} \n")
+
+                        net.load_state_dict(torch.load(checkpoint_model_dir, map_location=torch.device('cpu')))
+                    except:
+                        print("No checkpoints found !")
+                        break  
+
+                else:
+                    checkpoint_restart_epoch = 0
+
                 net.to(device)
                 optimizer = torch.optim.Adam(net.parameters(), lr=lr, weight_decay = l2_reg)
+
                 if params['lr_scheduler']:
                     scheduler = lr_scheduler.LinearLR(optimizer, start_factor=params['start_factor'], end_factor=params['end_factor'], total_iters=params['total_iters'])
 
-                ## PG: XArrayDataset now needs to know if we are adding ensemble features. The outputs are datasets that are maps or flattened in space depending on the model.
-                if lead_time is not None:
-                    mask =  create_mask(full_shape)[:n_train]  #create_mask(ds)[:n_train]
-                else:
-                    mask = train_mask
-                
-                train_set = XArrayDataset(ds_train, obs_train, mask=mask, zeros_mask = zeros_mask, in_memory=False, lead_time=lead_time, time_features=time_features,ensemble_features =ensemble_features, aligned = True, month_min_max = month_min_max, model = model.__name__) 
-                dataloader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
-
-                if params['version'] == 'IceExtent':  
+            
+                if params['version'] == 'IceExtent':
                         criterion = nn.BCELoss()
                 else:
                     # if reg_scale is None: ## PG: if no penalizing for negative anomalies
                     if params['low_ress_loss_kernel_size'] is None:  
-                            criterion = WeightedMSE(weights=weights, device=device, weights_mask = weights_mask, hyperparam=1, reduction='mean', loss_area=loss_region_indices, multi_ress_loss_kernel_size = multi_ress_loss_kernel_size)
+                            criterion = WeightedMSE(weights=weights, device=device, weights_mask = weights_mask, hyperparam=1, reduction='mean',  multi_ress_loss_kernel_size = multi_ress_loss_kernel_size)
                     else:
-                            criterion = WeightedMSELowRess(weights=weights, device=device, weights_mask = weights_mask, hyperparam=1, reduction='mean', loss_area=loss_region_indices, kernel = params['low_ress_loss_kernel_size'])
-
-                            # criterion = WeightedMSEGlobalLoss(weights=weights, device=device, weights_mask = weights_mask, hyperparam=1, reduction='mean', loss_area=loss_region_indices, scale=reg_scale, map = True, multi_ress_loss = multi_ress_loss)
-                
+                            criterion = WeightedMSELowRess(weights=weights, device=device, weights_mask = weights_mask, hyperparam=1, reduction='mean', kernel = params['low_ress_loss_kernel_size'])               
                 if params['combined_prediction']:
                     criterion_extent = nn.BCELoss()
 
                 epoch_loss = []
-                net.train()
+                epoch_loss_validation = []
                 num_batches = len(dataloader)
+                num_batches_val = len(dataloader_val)
+                step = 0
                 for epoch in tqdm.tqdm(range(epochs)):
+                    ################################# Train ###############################
+                    net.train()
                     batch_loss = 0
+                    optimizer.zero_grad()
                     for batch, (x, y) in enumerate(dataloader):
                         if (type(x) == list) or (type(x) == tuple):
                             x = (x[0].to(device), x[1].to(device))
@@ -519,35 +542,179 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                                 loss = criterion(adjusted_forecast, y)
                             else:
                                 loss = criterion(adjusted_forecast, y, mask = m, print_loss=True)
-
+                        
                         batch_loss += loss.item()
+                        loss = loss / grad_accumulation_steps
                         loss.backward()
-                        optimizer.step()
+
+                        if (batch + 1) % grad_accumulation_steps == 0:
+                                optimizer.step()
+                                optimizer.zero_grad()
+
+                    if (batch + 1) % grad_accumulation_steps != 0:
+                            optimizer.step()
+                            optimizer.zero_grad()
                     epoch_loss.append(batch_loss / num_batches)
 
                     if params['lr_scheduler']:
                         scheduler.step()
-                del train_set, dataloader, ds_train, obs_train, adjusted_forecast, x, y , m
-                try:
-                    del y_extent, adjusted_forecast_extent
-                except:
-                    pass
-                gc.collect()
-                # EVALUATE MODEL
-                ##################################################################################################################################
-                if test_year*100 + month <= ds_raw_ensemble_mean.time[-1]:
 
+                    ################################# Validation ###############################
+                    net.eval()
+                    batch_loss_validation = 0
+                    for batch, (x, y) in enumerate(dataloader_val):
+                        with torch.no_grad(): 
+                            if (type(x) == list) or (type(x) == tuple):
+                                x = (x[0].to(device), x[1].to(device))
+                            else:
+                                x = x.to(device)
+
+                            if (type(y) == list) or (type(y) == tuple):
+                                y, m = (y[0].to(device), y[1].to(device))
+                            else:
+                                y = y.to(device)
+                                m  = None
+                            optimizer.zero_grad()
+                            if model in [UNet2, UNet2_NPS, UNet2_small, UNet2_NPS_small]:
+                                adjusted_forecast = net(x, torch.from_numpy(model_mask.to_numpy()).to(y))               
+                            else:
+                                adjusted_forecast = net(x)
+
+                            if params['combined_prediction']:
+                                (y, y_extent) = (y[:,0].unsqueeze(1), y[:,1].unsqueeze(1))
+                                (adjusted_forecast, adjusted_forecast_extent) = adjusted_forecast
+                                loss_extent = criterion_extent(adjusted_forecast_extent, y_extent)
+                                loss = criterion(adjusted_forecast, y, mask = m)
+                                loss = loss + loss_extent
+                            else:
+                                if params['version'] == 'IceExtent':
+                                    loss = criterion(adjusted_forecast, y)
+                                else:
+                                    loss = criterion(adjusted_forecast, y, mask = m, print_loss=True)
+
+                            batch_loss_validation += loss.item()
+                    epoch_loss_validation.append(batch_loss_validation / num_batches_val)
+
+                    if epoch == 0:
+                        best_valScore = epoch_loss_validation[-1]
+                        earlystopping_counter = 0
+
+                    del adjusted_forecast, x, y , m
+                    try:
+                        del y_extent, adjusted_forecast_extent
+                    except:
+                        pass
+                    gc.collect()
+                    torch.cuda.empty_cache() 
+                    ################################# Save Checkpoints ###############################
+                    if np.mod(epoch + 1 + checkpoint_restart_epoch , 10) == 0:
+                            fig, ax = plt.subplots(1,1, figsize=(8,5))
+                            if params['version'] == 'IceExtent':
+                                label = 'BCE' 
+                            else:
+                                label = 'MSE' 
+                            if params['combined_prediction']:
+                                label = label + ' + BCE' 
+                            ax.plot(np.arange(1,len(epoch_loss)+1), epoch_loss, color = 'r', label = 'Epoch loss total')
+                            ax.plot(np.arange(1,len(epoch_loss)+1), epoch_loss_validation, color = 'r', linestyle = 'dashed', label = 'Val loss total')
+                            ax.set_title(f'Train/Val Loss ') ###
+                            ax.legend()
+                            ax.set_xlabel('Epoch')
+                            ax.set_ylabel('Loss')
+                            plt.show()
+                            try:
+                                plt.savefig(glob.glob(results_dir+f'/Figures/train_val_loss_198101-{(test_year - n_validation_years )* 100 + month -1}_epoch_{checkpoint_restart_epoch}_*.png')[0])
+                            except:
+                                pass
+                            plt.savefig(results_dir+f'/Figures/train_val_loss_198101-{(test_year - n_validation_years )* 100 + month -1}_epoch_{checkpoint_restart_epoch}_{len(epoch_loss) + checkpoint_restart_epoch}.png')
+                            plt.close()
+                            ################################# Early Stopping ###############################
+                    if epoch > 0:
+                        if epoch_loss_validation[-1] < best_valScore - ( 0.02 * best_valScore):  # if new score not 5% better than best val score
+                            best_valScore = epoch_loss_validation[-1]
+                            earlystopping_counter = 0
+                            if test_year*100 + month <= ds_raw_ensemble_mean.time[-1]:
+                                nameSave = f"MODEL_V{params['version']}_198101-{(test_year - n_validation_years) * 100 + month -1}"
+                            else:
+                                if lead_time is not None:
+                                        nameSave = f"MODEL_final_V{params['version']}_198101-{int(ds_raw_ensemble_mean.time[-lead_time]) - n_validation_years * 100}"
+                                else:
+                                        nameSave = f"MODEL_final_V{params['version']}_198101-{int(ds_raw_ensemble_mean.time[-1] - n_validation_years * 100 )}"
+                                        
+                            saved_model = glob.glob(results_dir + '/Checkpoints/' + nameSave + "*.pth")
+                            if len(saved_model) > 0:
+                                for link in saved_model:
+                                    os.remove(link)
+                            torch.save( net.state_dict(), results_dir + '/Checkpoints/' + nameSave + f"_epoch_{epoch + 1 + checkpoint_restart_epoch}.pth")
+                            Early_stop = False
+                        else:
+                            if params['earlystoppingbuffer'] is not None:
+                                earlystopping_counter += 1
+                                if (earlystopping_counter >= params['earlystoppingbuffer']) and (epoch >= 15 ):  # want to train for at least 20 epochs
+                                    print(f"Stopping early --> epoch val score {epoch_loss_validation[-1]} has not decreased over {params['earlystoppingbuffer']} epochs compared to best {best_valScore} ")
+                                    with open(Path(results_dir, "training_parameters.txt"), 'a') as f:
+                                            f.write(f"\n Test year {test_year}, stopping early at {epoch + 1 + checkpoint_restart_epoch} --> epoch val score {epoch_loss_validation[-1]} has not decreased over {params['earlystoppingbuffer']} epochs compared to best {best_valScore}")
+                                    Early_stop = True
+                                    break
+
+                del optimizer
+                gc.collect()
+                torch.cuda.empty_cache() 
+                ################################# Plot ###############################
+                fig, ax = plt.subplots(1,1, figsize=(8,5))
+                if params['version'] == 'IceExtent':
+                    label = 'BCE' 
+                else:
+                    label = 'MSE' 
+                if params['combined_prediction']:
+                        label = label + ' + BCE' 
+
+                ax.plot(np.arange(1,len(epoch_loss)+1), epoch_loss, color = 'r', label = 'Epoch total')
+                ax.plot(np.arange(1,len(epoch_loss)+1), epoch_loss_validation, color = 'r', linestyle = 'dashed', label = 'Val loss total')
+
+                ax.set_title(f'Train/Val Loss - best val loss : {best_valScore} ') ###
+                ax.legend()
+                ax.set_xlabel('Epoch')
+                ax.set_ylabel('Loss')
+                plt.show()
+                plt.savefig(results_dir+f'/Figures/train_val_loss_198101-{(test_year - n_validation_years )* 100 + month -1}_epoch_{checkpoint_restart_epoch}_{len(epoch_loss) + checkpoint_restart_epoch}.png')
+                plt.close()
+
+                del train_set, dataloader, ds_train, obs_train,
+                del validation_set, dataloader_val, ds_validation, obs_validation
+                gc.collect()
+                torch.cuda.empty_cache() 
+              
+                # Test years
+                ##################################################################################################################################
+                              
+                if test_year*100 + month <= ds_raw_ensemble_mean.time[-1]:
+                    
+                    # if all([save, not Early_stop ]):   ## Changed 0717 where only best model is saved in Checkpoints ###
+                    #     nameSave = f"MODEL_V{params['version']}_198101-{(test_year - n_validation_years) * 100 + month -1}_epoch_{epoch + 1 + checkpoint_restart_epoch}.pth"    
+                    #     torch.save( net.state_dict(),results_dir + '/' + nameSave)
+                    #     try:
+                    #         nameSave = f"MODEL_V{params['version']}_198101-{(test_year - n_validation_years) * 100 + month -1}*.pth"
+                    #         ls_checkpoints = glob.glob(results_dir + '/Checkpoints/' + nameSave)
+                    #         for link in ls_checkpoints:
+                    #             os.remove(link)
+                    #     except:
+                    #         pass
+                    if Early_stop:
+                        net.load_state_dict(torch.load(glob.glob(results_dir + '/Checkpoints/' + f"MODEL_V{params['version']}_198101-{(test_year - n_validation_years) * 100 + month -1}*.pth")[0], map_location=torch.device('cpu')))
+                        net.to(device)
+                        
                     test_years_list = np.arange(1, ds_test.shape[0] + 1)
                     test_lead_time_list = np.arange(1, ds_test.shape[1] + 1)
 
         
                     ## PG: Extract the number of years as well 
-                    test_set = XArrayDataset(ds_test, obs_test, lead_time=lead_time,mask = None,zeros_mask = zeros_mask, time_features=time_features,ensemble_features =ensemble_features,  in_memory=False, aligned = True, month_min_max = month_min_max, model = model.__name__)
+                    test_set = XArrayDataset(ds_test, obs_test, lead_time=lead_time,mask = None,zeros_mask = zeros_mask, time_features=time_features,  in_memory=False, aligned = True,  model = model.__name__)
                     if params['version'] == 'IceExtent':   
                         criterion_test = nn.BCELoss()
                     else:
 
-                        criterion_test =  WeightedMSE(weights=weights_, device=device, hyperparam=1, reduction='mean', loss_area=loss_region_indices)
+                        criterion_test =  WeightedMSE(weights=weights_, device=device, hyperparam=1, reduction='mean')
 
                     if 'ensembles' in ds_test.dims:
                         if lead_time is None:
@@ -691,21 +858,8 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                     
                     monthly_results.append(result)
                     
-                    fig, ax = plt.subplots(1,1, figsize=(8,5))
-                    ax.plot(np.arange(1,epochs+1), epoch_loss)
-                    ax.set_title(f'Train Loss \n test loss: {np.mean(test_loss)}') ###
-                    
-                    ax.set_xlabel('Epoch')
-                    ax.set_ylabel('Loss')
-                    plt.show()
-                    plt.savefig(results_dir+f'/Figures/train_loss_198101-{test_year * 100 + month -1}.png')
-                    plt.close()
-
-                    if save:
-                        nameSave = f"MODEL_V{params['version']}_198101-{test_year * 100 + month -1}.pth"
-                        torch.save( net.state_dict(),results_dir + '/' + nameSave)
-                    
-                    del result, net, optimizer
+                 
+                    del result, net
                     try:
                          del result_extent
                     except:
@@ -713,19 +867,24 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                     gc.collect()
                     torch.cuda.empty_cache() 
                     torch.cuda.synchronize() 
-                else:
-                    if lead_time is not None:
-                        nameSave = f"MODEL_final_V{params['version']}_198101-{int(ds_raw_ensemble_mean.time[-lead_time])}.pth"
-                    else:
-                        nameSave = f"MODEL_final_V{params['version']}_198101-{int(ds_raw_ensemble_mean.time[-1])}.pth"
-                    # Save locally
-                    torch.save( net.state_dict(),results_dir + '/' + nameSave)
-                    break
+                # else:   ## Changed 0717 where only best model is saved in Checkpoints ###
+                #     if not Early_stop:
+                #         if lead_time is not None:
+                #             nameSave = f"MODEL_final_V{params['version']}_198101-{int(ds_raw_ensemble_mean.time[-lead_time]) - n_validation_years * 100}_epoch_{epoch + 1 + checkpoint_restart_epoch}.pth"
+                #         else:
+                #             nameSave = f"MODEL_final_V{params['version']}_198101-{int(ds_raw_ensemble_mean.time[-1]) - n_validation_years * 100}_epoch_{epoch + 1 + checkpoint_restart_epoch}.pth"
+                #     # Save locally
+                #         torch.save( net.state_dict(),results_dir + '/' + nameSave)
+                #         try:
+                #             ls_checkpoints = glob.glob(results_dir + '/Checkpoints/' + nameSave.split('_epoch')[0] + '*.pth')
+                #             for link in ls_checkpoints:
+                #                     os.remove(link)             
+                #         except:
+                #             pass
+                #         break
             if len(monthly_results) >0 :
-                # if lead_time is None:
                     xr.concat(monthly_results, dim = 'time').to_netcdf(path=Path(results_dir, f'nn_adjusted_{test_year}_{run+1}.nc', mode='w'))
-                # else:
-                #     yearly_results.append(xr.concat(monthly_results, dim = 'time'))
+
             del monthly_results
             gc.collect() 
             torch.cuda.empty_cache() 
@@ -738,61 +897,65 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
 if __name__ == "__main__":
 
   
-    n_years =  5 # last n years to test consecutively
+    n_years =  2 # last n years to test consecutively
     lead_months = 12
     lead_time = None ## None for training using all available lead_times as indicated ny lead_months
     n_runs = 1  # number of training runs
+    n_validation_years = 3
 
     params = {
-        "model": UNet2_small,
+        "model": UNet2,
         "hidden_dims": [64,128,128,64], #[16, 64, 128, 64, 32], ## only for (Reg)CNN 
-        "time_features": ['month_sin','month_cos', 'imonth_sin', 'imonth_cos', 'land_mask'],
+        "time_features": ['month_sin','month_cos', 'lead_time'],
         "obs_clim" : False,
-        "ensemble_features": False, ## PG
         'ensemble_list' : None, ## PG
         'ensemble_mode' : 'Mean',
-        "epochs": 80,
+        "epochs": 100,
         "batch_size": 100,
-        "reg_scale" : None,
+        "grad_accumulation_steps" : 1,  # default 1
         "optimizer": torch.optim.Adam,
         "lr": 0.001 ,
         "loss_function" :'MSE',
-        "loss_region": None,
         "subset_dims": 'North',   ## North or South or Global
         'active_grid' : False,
         'multi_ress_loss_kernel_size' : None,
-        'low_ress_loss_kernel_size' : None,
+        'low_ress_loss_kernel_size' : 4,
         'masked_weights' : True,
-        'equal_weights' : False,
+        'equal_weights' : True,
         "DSC" : False,  ## only for (Reg)CNN 
         "kernel_size" : 5, ## only for(Reg)CNN
         "decoder_kernel_size" : 1, ## only for (Reg)CNN
+        "LocallyConnected" : False,
         "bilinear" : True, ## only for UNet
         "L2_reg": 0,
-        'lr_scheduler' : False,
+        'lr_scheduler' : True,
         'skip_conv' : False,
-        'combined_prediction' : False
+        'combined_prediction' : False,
+        'saved_checkpoint_dir' : None,   # None, 'same', or dir to model
+        'earlystoppingbuffer' : 10, ## buffer number
     }
 
 
 
-    params['version'] =  1  ### 1 , 2 ,3, 'IceExtent'
+    params['version'] =  1.1  ### 1 , 2 ,3, 'IceExtent'
     params['forecast_range_months'] = 12
 
     obs_ref = 'NASA'
     NPSProj = False
     
-    out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_3_convnext'
+    out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_4_convnext'
 
     # for lead_time in np.arange(10,13):
     if lead_time is None:
-        out_dir    = f'{out_dir_x}/N{n_years}_M{lead_months}_F{params["forecast_range_months"]}_v{params["version"]}'
+        out_dir    = f'{out_dir_x}/N{n_years}_M{lead_months}_VAL{n_validation_years}'
     else:
-        out_dir    = f'{out_dir_x}/N{n_years}_LT{lead_time}_F{params["forecast_range_months"]}_v{params["version"]}'
-    
-    out_dir = out_dir + '_NPSproj' if NPSProj else out_dir + '_1x1'
-    out_dir  = out_dir + f'_{params["subset_dims"]}_lr{params["lr"]}_batch{params["batch_size"]}_e{params["epochs"]}_L{params["reg_scale"]}'
+        out_dir    = f'{out_dir_x}/N{n_years}_LT{lead_time}_VAL{n_validation_years}'
 
+    if type(params["grad_accumulation_steps"]) != int:
+        params["grad_accumulation_steps"] = 1
+
+    out_dir  = out_dir + f'_F{params["forecast_range_months"]}_v{params["version"]}_{params["subset_dims"]}_lr{params["lr"]}_batch{params["batch_size"]}x{params["grad_accumulation_steps"]}_e{params["epochs"]}_equalweights'
+    out_dir = out_dir + '_NPSproj' if NPSProj else out_dir + '_1x1'
 
     if params['lr_scheduler']:
         out_dir = out_dir + '_lr_scheduler'
@@ -803,6 +966,8 @@ if __name__ == "__main__":
     if params['model'] in  [CNN, RegCNN]:
         out_dir = out_dir + f'_{params["kernel_size"]}{params["decoder_kernel_size"]}'
         params['skip_conv'] = False
+    if params['LocallyConnected']:
+        out_dir = out_dir + '_LC2D'
 
     if params['active_grid']:
         out_dir = out_dir + '_active_grid'
@@ -818,13 +983,32 @@ if __name__ == "__main__":
          out_dir = out_dir + f'_low_ress_loss{params["low_ress_loss_kernel_size"]}'
     if not params['masked_weights']:
         out_dir = out_dir + '_weightsnonmaked'  
-    Path(out_dir).mkdir(parents=True, exist_ok=True)
-    Path(out_dir + '/Figures').mkdir(parents=True, exist_ok=True)
+    if params['saved_checkpoint_dir'] != 'Same':
+        if params['saved_checkpoint_dir'] is not None:
+            out_dir = out_dir + '_FromCheckPoint'
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+        Path(out_dir + '/Figures').mkdir(parents=True, exist_ok=True)
+        Path(out_dir + '/Checkpoints').mkdir(parents=True, exist_ok=True)
+    else:
+        out_dir_sub_paths = out_dir.split(f'e{params["epochs"]}')
+        out_dir = out_dir_sub_paths[0]
+        for sub_path in out_dir_sub_paths[1:]:
+          out_dir = out_dir + '*' + sub_path  
+        out_dir = glob.glob(out_dir)
+        out_dir.sort()
+        out_dir = out_dir[-1]    
+    
+    try:
+        run_training(params, n_years=n_years, n_validation_years =n_validation_years, lead_months=lead_months,lead_time = lead_time, NPSProj  = NPSProj, test_years = None, n_runs=n_runs, results_dir=out_dir, numpy_seed=1, torch_seed=1, save = True)
+        print(f'Output dir: {out_dir}')
+        print('Training done.')
+    except Exception as e:
+        import shutil
+        shutil.rmtree(out_dir)
+        print("Terminated due to the follwoing error:\n", e)
+        raise  # 
 
-    run_training(params, n_years=n_years, lead_months=lead_months,lead_time = lead_time, NPSProj  = NPSProj, test_years = None, n_runs=n_runs, results_dir=out_dir, numpy_seed=1, torch_seed=1, save = True)
 
-    print(f'Output dir: {out_dir}')
-    print('Training done.')
 
 
 

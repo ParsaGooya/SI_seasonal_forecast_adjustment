@@ -95,9 +95,9 @@ def HP_congif(params, obs_ref, lead_months, y_start, y_end, NPSProj = False):
     if not NPSProj:
         ds_in = ds_in.where(ds_in<1000,np.nan)
     else:
-        mask_projection = (xr.open_dataset(data_dir_obs)['mask'].rename({'x':'lon','y':'lat'}))
-        obs_in = (obs_in.rename({'x':'lon','y':'lat'}))
-        ds_in = (ds_in.rename({'x':'lon','y':'lat'}))
+        mask_projection = (xr.open_dataset(data_dir_obs)['mask'].rename({'x':'lon','y':'lat'}))[...,:,64:-64]
+        obs_in = (obs_in.rename({'x':'lon','y':'lat'}))[...,:,64:-64]
+        ds_in = (ds_in.rename({'x':'lon','y':'lat'}))[...,:,64:-64]
 
 
     land_mask = obs_in.mean('time').where(np.isnan(obs_in.mean('time')),1).fillna(0)
@@ -232,7 +232,7 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
     if not params['masked_weights']:
         assert 'land_mask' in params['time_features']
 
-    assert params['version'] in [1,2,3, 'IceExtent']
+    assert params['version'] in [1,2,3,1.1, 'IceExtent']
 
     if params['version'] == 2:
 
@@ -357,7 +357,7 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
     del ds_baseline, obs_baseline, preprocessing_mask_obs, preprocessing_mask_fct
     gc.collect()
 
-    if params['version']  in [3]:
+    if params['version']  in [3, 1.1]:
         sigmoid_activation = False
     else:
         sigmoid_activation = True

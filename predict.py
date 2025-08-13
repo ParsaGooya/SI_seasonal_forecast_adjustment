@@ -7,16 +7,17 @@ import dask
 import xarray as xr
 from pathlib import Path
 import glob
+from torch.distributions import Normal
 import torch
 from torch.utils.data import DataLoader
 from torch.optim import lr_scheduler
-from models.autoencoder import Autoencoder
+from torch.distributions.multivariate_normal import MultivariateNormal
 from models.unet import UNet, UNetLCL,UNet_NPS
-from models.unetconvnext import UNet2,UNet2_NPS
+from models.unetconvnext import UNet2,UNet2_NPS, UNet2_small, UNet2_NPS_small
 from models.cnn import CNN, RegCNN
 from losses import WeightedMSE, WeightedMSEGlobalLoss
 from losses import WeightedMSELowRess , WeightedMSEGlobalLossLowRess
-from preprocessing import align_data_and_targets, create_mask, pole_centric, reverse_pole_centric, segment, reverse_segment, pad_xarray
+from preprocessing import align_data_and_targets, create_mask, pole_centric, reverse_pole_centric, segment, reverse_segment, pad_xarray, smoother
 from preprocessing import AnomaliesScaler_v1_seasonal, AnomaliesScaler_v2_seasonal, Standardizer, Normalizer, PreprocessingPipeline, calculate_climatology, bias_adj, zeros_mask_gen
 from torch_datasets import XArrayDataset
 import torch.nn as nn
@@ -34,15 +35,18 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
 
 
     if model_year is None:
-        model_year_ = np.min(test_years) - 1
+        n_val_year = int(model_dir.split('_VAL')[1][:1]) if '_VAL' in model_dir else 0
+        model_year_ = np.min(test_years) - n_val_year
     else:
         model_year_ = model_year
-        
-    if params["model"] != Autoencoder:
-        params["append_mode"] = None
-    else:   
-        params["obs_clim"] = False
 
+    
+    try:
+        scale_factor_channels = params['scale_factor_channels']
+    except:
+        scale_factor_channels = None
+
+    params["obs_clim"] = False
     params['forecast_range_months'] = eval(model_dir.split('_F')[1].split('_')[0])
     if 'LT' in model_dir:
         lead_time = eval(model_dir.split('_LT')[1].split('_')[0])
@@ -64,15 +68,15 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
         params['forecast_preprocessing_steps'] = []
         params['observations_preprocessing_steps'] = []
 
+
+    print(f"Model year = {model_year_}: Start run for test year {test_years}...")
     if params['version'] == 'IceExtent':
         params['reg_scale'] = None
-
-
-    print(f"Start run for test year {test_years}...")
+        params['combined_prediction'] = False
+        params['loss_function'] = 'combined'
 
     ############################################## load data ##################################
     ensemble_list = params['ensemble_list']
-    ensemble_features = params['ensemble_features']
     time_features = params["time_features"]
     model = params['model']
     hidden_dims = params['hidden_dims']
@@ -82,6 +86,7 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
         ensemble_mode = params['ensemble_mode']
     except:
         params['ensemble_mode'] = 'Mean'
+
     try:
         batch_normalization = params["batch_normalization"]
         dropout_rate = params["dropout_rate"]
@@ -89,10 +94,19 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
         obs_clim = params["obs_clim"]
         kernel_size = params["kernel_size"]
         decoder_kernel_size = params["decoder_kernel_size"]
+    try:
+        LocallyConnected = params['LocallyConnected']
+    except:
+        LocallyConnected = False
 
     print("Load forecasts")
     if params['version'] == 3:
         ds_in = xr.open_dataset('/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/NASA/Bias_Adjusted/bias_adjusted_North_1983-2020_1x1.nc')['SICN']
+        #####################################################################################################
+        ### if you used Standardizer make sure to pass VAE = True as an argument to the initializer below ###
+        if params['version'] == 3:
+            print(' Warning!!! If you used Standardizer as a preprocessing step make sure to pass "VAE = True" as an argument to the initializer!!!')
+        #####################################################################################################
     else:
         if ensemble_list is not None: ## PG: calculate the mean if ensemble mean is none
             ds_in = fct.sel(ensembles = ensemble_list)['SICN']
@@ -111,9 +125,9 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
     if not NPSProj:
         ds_in = ds_in.where(ds_in<1000,np.nan) ### land is masked in model data with a large number
     else:
-        mask_projection = (xr.open_dataset(data_dir_obs)['mask'].rename({'x':'lon','y':'lat'}))
-        observation = (observation.rename({'x':'lon','y':'lat'}))
-        ds_in = (ds_in.rename({'x':'lon','y':'lat'}))
+        mask_projection = (xr.open_dataset(data_dir_obs)['mask'].rename({'x':'lon','y':'lat'}))[...,:,64:-64]
+        observation = (observation.rename({'x':'lon','y':'lat'}))[...,:,64:-64]
+        ds_in = (ds_in.rename({'x':'lon','y':'lat'}))[...,:,64:-64]
     land_mask = observation.mean('time').where(np.isnan(observation.mean('time')),1).fillna(0)
     model_mask = ds_in.mean('time')[0].where(np.isnan(ds_in.mean('time')[0]),1).fillna(0).drop('lead_time')
     observation = observation.clip(0,1)
@@ -121,7 +135,6 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
     observation = observation.fillna(0)
     ds_in = ds_in.fillna(0)
     ############################################
-    
     obs_in = observation.expand_dims('channels', axis=1)
 
     if 'ensembles' in ds_in.dims: ### PG: add channels dimention to the correct axis based on whether we have ensembles or not
@@ -133,7 +146,7 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
     max_year = (np.min(test_years) + 1 )*100 if len(test_years) <2 else (np.max(test_years) + 1)*100
     ds_in_ = ds_in.where((ds_in.time >= min_year)&(ds_in.time <= max_year) , drop = True).isel(lead_time = np.arange(0,lead_months ))
 
-    ds_raw, obs_raw = align_data_and_targets(ds_in.where(ds_in.time <= (model_year_ + 1)*100, drop = True), obs_in, lead_months)  # extract valid lead times and usable years ## used to be np.min(test_years)
+    ds_raw, obs_raw = align_data_and_targets(ds_in.where(ds_in.time <= (model_year_)*100, drop = True), obs_in, lead_months)  # extract valid lead times and usable years ## used to be np.min(test_years)
     del ds_in, obs_in
     gc.collect()
 
@@ -149,7 +162,7 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
         ds_in_ = ds_in_.transpose('time','lead_time',...)
     
 
-    train_years = ds_raw_ensemble_mean.time[ds_raw_ensemble_mean.time <= (model_year_ + 1)*100].to_numpy()    
+    train_years = ds_raw_ensemble_mean.time[ds_raw_ensemble_mean.time <= (model_year_)*100].to_numpy()    
     ds_raw_ensemble_mean = xr.concat([ds_raw_ensemble_mean,ds_in_ ], dim = 'time')
     subset_dimensions = params["subset_dimensions"]
     del ds_in_
@@ -168,7 +181,7 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
             model_mask = model_mask.where(model_mask.lat < -40, drop = True)
 
     ################################### apply the mask #######################
-    if params['model'] not in [UNet2, UNet2_NPS]:
+    if params['model'] not in [UNet2, UNet2_NPS, UNet2_small, UNet2_NPS_small]:
         # land_mask = land_mask.where(model_mask == 1, 0)
         obs_raw = obs_raw * land_mask
         ds_raw_ensemble_mean = ds_raw_ensemble_mean * land_mask
@@ -237,7 +250,7 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     if any([params['active_grid'],'active_mask' in params["time_features"], 'full_ice_mask' in params["time_features"]]):
-        zeros_mask = zeros_mask_full.sel(test_year = model_year_ + 1).drop('test_year')
+        zeros_mask = zeros_mask_full.sel(test_year = np.min(test_years) ).drop('test_year')
     else:
         zeros_mask = None
     
@@ -269,14 +282,11 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
 
     del ds_baseline, obs_baseline, preprocessing_mask_obs, preprocessing_mask_fct
     gc.collect()
-    if params['version']  in [3]:
+    if params['version']  in [3,1.1]:
         sigmoid_activation = False
     else:
         sigmoid_activation = True
 
-    y0 = np.floor(ds[:n_train].time[0].values/100 )
-    yr, mn = np.divmod(int(ds[:n_train].time[-1].values - y0*100),100)
-    month_min_max = [y0, yr * 12 + mn]
     if 'land_mask' in time_features:
             ds = xr.concat([ds, land_mask.expand_dims('channels', axis = 0)], dim = 'channels')
 
@@ -305,14 +315,8 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
     gc.collect()
     weights = weights.values
     if time_features is None:
-        if ensemble_features: ## PG: We can choose to add an ensemble feature.
-            add_feature_dim = 1
-        else:
             add_feature_dim = 0
     else:
-        if ensemble_features:
-            add_feature_dim = len(time_features) + 1
-        else:
             add_feature_dim = len(time_features)
     if 'land_mask' in time_features:
         add_feature_dim -= 1
@@ -329,23 +333,28 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
 
     params['bilinear'] = False if 'bilinear' not in params.keys() else ...
 
-    if model in [UNet,UNetLCL,UNet2, UNet_NPS, UNet2_NPS]:
-        net = model(n_channels_x= n_channels_x+ add_feature_dim , bilinear = params['bilinear'], sigmoid = sigmoid_activation, skip_conv = params['skip_conv'], combined_prediction = params['combined_prediction'])
+    if model in [UNet,UNetLCL,UNet2, UNet_NPS, UNet2_NPS, UNet2_small, UNet2_NPS_small]:
+        net = model(n_channels_x= n_channels_x+ add_feature_dim , bilinear = params['bilinear'], sigmoid = sigmoid_activation, skip_conv = params['skip_conv'], combined_prediction = params['combined_prediction'], LocallyConnected = LocallyConnected)
     elif model in [ CNN]:
         net = model(n_channels_x + add_feature_dim ,hidden_dims, kernel_size = kernel_size, decoder_kernel_size = decoder_kernel_size, sigmoid = sigmoid_activation )
     elif model in [ RegCNN]: 
         net = model(n_channels_x , add_feature_dim ,hidden_dimensions =hidden_dims,  kernel_size = kernel_size, decoder_kernel_size = decoder_kernel_size, DSC = DSC, sigmoid = sigmoid_activation )
 
-    print('Loading model ....')
-    net.load_state_dict(torch.load(glob.glob(model_dir + f'/*-{model_year_}*.pth')[0], map_location=torch.device('cpu'))) 
+    print('Loading model ....')   ### Changed 0717 where the best model is saved in Checkpoints ######
+    # model_links = glob.glob(model_dir + f'/*-{model_year_}*.pth')  ## Changed 0717 where only best model is saved in Checkpoints ###
+    # if len(model_links) == 0:
+    #     model_links = glob.glob(model_dir + f'/*final*-{model_year_ - 1}*.pth') 
+    #     if len(model_links) == 0:
+    model_links = glob.glob(model_dir + f'/Checkpoints/*-{model_year_}*.pth')
+    model_links.sort()
+    net.load_state_dict(torch.load(model_links[0], map_location=torch.device('cpu'))) 
     net.to(device)
     net.eval()
     ##################################################################################################################################
 
     test_years_list = np.arange(1, ds_test.shape[0] + 1)
     test_lead_time_list = np.arange(1, ds_test.shape[1] + 1)
-    test_set = XArrayDataset(ds_test, xr.ones_like(ds_test), lead_time=lead_time,mask = None,zeros_mask = zeros_mask, time_features=time_features,ensemble_features =ensemble_features,  in_memory=False, aligned = True, month_min_max = month_min_max, model = model.__name__)
-                    
+    test_set = XArrayDataset(ds_test, xr.ones_like(ds_test), lead_time=lead_time,mask = None,zeros_mask = zeros_mask, time_features=time_features,  in_memory=False, aligned = True, model = model.__name__)                  
     if lead_time is None:
         lead_times = ds_test.lead_time.values
     else:
@@ -357,18 +366,24 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
         #     results_shape = xr.full_like(ds_test.sel(lead_time = lead_times).transpose('time','ensembles','channels',...), fill_value = np.nan)
         #     test_time_list =  np.arange(1, results_shape.shape[0] + 1)
         # else:
-            test_loss = np.zeros(shape=(ds_test.stack(flattened=('time','lead_time')).sel(lead_time = lead_times).transpose('flattened',...).shape[:2]))
+            # test_loss = np.zeros(shape=(ds_test.stack(flattened=('time','lead_time')).sel(lead_time = lead_times).transpose('flattened',...).shape[:2]))
             test_results = np.zeros_like(ds_test.stack(flattened=('time','lead_time')).sel(lead_time = lead_times).transpose('flattened',...).data)
             results_shape = xr.full_like(ds_test.stack(flattened=('time','lead_time')).sel(lead_time = lead_times).transpose('flattened',...), fill_value = np.nan)
     else:
-        test_loss = np.zeros(shape=(test_set.target.shape[0]))
+        # test_loss = np.zeros(shape=(test_set.target.shape[0]))
         test_results = np.zeros_like(test_set.target.isel(channels = slice(0,1)))
         results_shape = xr.full_like(test_set.target.isel(channels = slice(0,1)), fill_value = np.nan)
-   
+    
+
     test_time_list =  np.arange(1, ds_test.shape[0] + 1) ########?
     if params['combined_prediction']:
             test_results_extent = test_results.copy()
             results_shape_extent = results_shape.copy()
+
+    if params['output_sampling'] is not None:
+        results_shape = xr.concat([results_shape.expand_dims('ensembles', 0) for _ in range(params['output_sampling_num'])], dim = 'ensembles')
+        test_results = np.zeros(results_shape.shape)
+   
 
     if params['active_grid']:
         if 'ensembles' in ds_test.dims: 
@@ -377,37 +392,122 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
         else:
             zeros_mask_test = results_shape.copy()
             zeros_mask_test[:] = test_set.zeros_mask[:len(test_time_list)]
-        # if model == UNetLSTM:
-        #     zeros_mask_test = zeros_mask_test.transpose('time','lead_time','channels','lat','lon')
-        # else:
         zeros_mask_test = zeros_mask_test.unstack('flattened').transpose('time','lead_time',...)
 
-    dataloader = DataLoader(test_set, batch_size=len(lead_times), shuffle=False)
+    
+    weights_mask = land_mask.copy()
+    weights_mask[:] = smoother(land_mask, 5)
+    weights_mask = weights_mask.where(weights_mask == 0 ,1).values
 
-    for time_id, (x, target) in enumerate(dataloader): 
+
+    dataloader = DataLoader(test_set, batch_size=len(lead_times), shuffle=False)
+######################################################################### Sampling decoder Noise ###################################################################
+    if params['output_sampling'] is not None:
+        if 'normal_based_train_sampling' in params['output_sampling']:
+            if lead_time is not None:
+                mask =  create_mask(full_shape)[:n_train]  #create_mask(ds)[:n_train]
+            else:
+                mask = train_mask
+            train_set = XArrayDataset(ds_train, obs_train, mask=mask, zeros_mask = zeros_mask, in_memory=False, lead_time=lead_time, time_features=time_features, aligned = True,  model = 'UNet2') 
+            x_in = torch.from_numpy(train_set.data.to_numpy()).float().to(device)
+            target = torch.from_numpy(train_set.target.to_numpy()).float().to(device)
+            features = torch.from_numpy(train_set.time_features).float().to(device)
+            target_month  = np.mod(train_set.data.time.to_numpy(),100) + train_set.data.lead_time.to_numpy() - 1
+            target_month = np.mod(target_month - 0.5, 12) + 0.5
+            
+            residuals_list = []
+            residual_covs = {}
+
+            print('Estimating error covaraites ...')
+            for ltind, month in enumerate(np.arange(1,13)):
+                with torch.no_grad():
+                    inds = target_month == month
+                    x = x_in[inds]
+                    y = target[inds]
+                    if params['time_features'] is not None:
+                        x = (x, features[inds])
+
+                    if model in [UNet2, UNet2_NPS, UNet2_small, UNet2_NPS_small]:
+                        adjusted_forecast = net(x, torch.from_numpy(model_mask.to_numpy()).to(y)) 
+                    else:
+                        adjusted_forecast = net(x)
+                    if params['combined_prediction']:             
+                        adjusted_forecast = adjusted_forecast[0]
+                    if params['version'] != 2:
+                        adjusted_forecast = torch.clip(adjusted_forecast , 0,1)
+
+
+                    residuals = (y[:,0:1] - adjusted_forecast)  * torch.from_numpy(weights_mask).to(y)
+                    residuals = torch.flatten(residuals, start_dim = 0, end_dim = 1)
+                    residuals_list.append(residuals)
+
+                    del residuals, x, y, adjusted_forecast
+
+                if params['output_sampling'] == 'conditional_multinormal_based_train_sampling':
+                    # residuals = torch.cat(residuals_list,dim = 0)
+                    residual_covs[month] = torch.cov(residuals_list[ltind].flatten( start_dim = -2, end_dim = -1).T)    
+                    try:
+                        torch.linalg.cholesky(residual_covs[month])
+                    except:
+                        try:
+                            print(f'\n Cholesky test failed, epsilon = 1e-5 added to the diagonal of covariance matrix month {month}! \n')
+                            residual_covs[month] += torch.eye(residual_covs[month].shape[0]).to(residual_covs[month]) * 1e-5
+                        except:
+                            raise RuntimeError("Covariance matrix is not positive definite!")
+
+                elif params['output_sampling'] == 'conditional_normal_based_train_sampling':
+                    residual_covs[month] = torch.std(residuals_list[ltind], dim = 0) + 1e-5
+
+            del train_set, x_in, target, residuals_list
+
+##############################################################################################################################################################
+
+    for time_id, (x, target) in tqdm(enumerate(dataloader)): 
         if 'ensembles' in ds_test.dims:  ## PG: If we have large ensembles:
                 ens_id, time_id = np.divmod(time_id, len(test_time_list))  ## PG: find out ensemble index
         with torch.no_grad():
             if (type(x) == list) or (type(x) == tuple):
-                # ind = x[2] if model == PNet else None    
                 test_raw = (x[0].to(device), x[1].to(device))
             else:
                 test_raw = x.to(device)
 
-            if model in [UNet2, UNet2_NPS]:
+            if model in [UNet2, UNet2_NPS, UNet2_small, UNet2_NPS_small]:
                 test_adjusted = net(test_raw, torch.from_numpy(model_mask.to_numpy()).to(device))
+                
             else:
                 test_adjusted = net(test_raw)
+            if params['output_sampling'] is not None:
+                     
+                if params['output_sampling'] in ['Gaussian_noise']:
+                    stds = torch.ones(test_adjusted.shape[-2:]).to(device)
+                    epsilon =  torch_normal_sampling(torch.zeros(test_adjusted.shape[-2:]).to(device), stds, num_samples= params['output_sampling_num'] *  test_adjusted.shape[0] ).to(device).unsqueeze(-3)
+                    epsilon = torch.unflatten(epsilon, dim = 0, sizes = (params['output_sampling_num'] ,test_adjusted.shape[0]))                                        
+
+                elif 'conditional' in params['output_sampling']:
+                    target_months = np.mod(np.mod(time_id + 0.5,12 ) + np.arange(1,len(lead_times) + 1) - 1,12) + 0.5
+                    if 'multi' in  params['output_sampling']:
+                        epsilon = [torch_normal_sampling(torch.zeros(residual_covs[lt].shape[0]).to(device), residual_covs[lt], num_samples=  params['output_sampling_num'], multivariate=True ).to(device) for lt in target_months]
+                        epsilon = [torch.unflatten(item, dim = -1, sizes = test_adjusted.shape[-2:]).unsqueeze(-3) for item in epsilon]
+                    else:
+                        epsilon = [torch_normal_sampling(torch.zeros(test_adjusted.shape[-2:]).to(device), residual_covs[lt], num_samples=  params['output_sampling_num'] ).to(device).unsqueeze(-3) for lt in target_months]
+                    ####################################################################### EDITT!!!!!!!!! #############
+                    epsilon = torch.cat(epsilon, dim = 1).unsqueeze(-3) ####
+                    ################################################################## ############# ############# #############
+            else:
+                epsilon = torch.zeros(test_adjusted.shape).to(device)
 
             if params['combined_prediction']:
-                (test_adjusted, test_adjusted_extent) = test_adjusted
+                (test_adjusted , test_adjusted_extent) = (test_adjusted[0] + epsilon, test_adjusted[1])
                 if 'ensembles' in ds_test.dims: 
                     test_results_extent[ens_id,time_id * len(lead_times) : (time_id+1) * len(lead_times)] = test_adjusted_extent.to(torch.device('cpu')).numpy()  ## PG: write back to test_results
                 else:
                     test_results_extent[time_id * len(lead_times) : (time_id+1) * len(lead_times)] = test_adjusted.to(torch.device('cpu')).numpy()
-            
+            else:
+                test_adjusted = test_adjusted + epsilon
             if 'ensembles' in ds_test.dims:   
                 test_results[ens_id, time_id * len(lead_times) : (time_id+1) * len(lead_times)] = test_adjusted.to(torch.device('cpu')).numpy()  ## PG: write back to test_results
+            elif params['output_sampling'] is not None:
+                test_results[:, time_id * len(lead_times) : (time_id+1) * len(lead_times)] = test_adjusted.to(torch.device('cpu')).numpy()  ## PG: write back to test_results
             else:
                 test_results[time_id * len(lead_times) : (time_id+1) * len(lead_times)] = test_adjusted.to(torch.device('cpu')).numpy()
 
@@ -419,11 +519,6 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
     gc.collect()
     ###################################################### has to be eddited for large ensembles!! #####################################################################
     results_shape[:] = test_results[:]
-
-    # if model in [UNet,UNetLCL,CNN]:    ## PG: if the output is already a map
-    # if model == UNetLSTM:
-    #     test_results = results_shape.transpose('time','lead_time',...)
-    # else:
     test_results = results_shape.unstack('flattened').transpose('time','lead_time',...)
     test_results_untransformed = obs_pipeline.inverse_transform(test_results.values)
     result = xr.DataArray(test_results_untransformed, test_results.coords, test_results.dims, name='nn_adjusted')
@@ -443,13 +538,22 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
         pass
     gc.collect()
 
-    result = (result * land_mask)
+    # result = (result * land_mask)
     if not NPSProj:
         if model in [UNet,UNetLCL, CNN, UNet2]:
             result = reverse_pole_centric(result, subset_dimensions)
+            reverse_pole_centric(land_mask, subset_dimensions).to_dataset(name  = 'land_mask').to_netcdf(path=Path(model_dir, f'obs_land_mask.nc', mode='w'))
         if model in [RegCNN]:
             result = reverse_segment(result)
+            reverse_segment(land_mask).to_dataset(name  = 'land_mask').to_netcdf(path=Path(model_dir, f'obs_land_mask.nc', mode='w'))
+    else:
+          land_mask.to_dataset(name  = 'land_mask').to_netcdf(path=Path(model_dir, f'obs_land_mask.nc', mode='w'))            
     result = result.to_dataset(name = 'nn_adjusted') 
+
+
+    if params['version'] == 'IceExtent':
+        result = result.where(result >= 0.5, 0)
+        result = result.where(result ==0, 1)
 
 
     if params['active_grid']:
@@ -462,9 +566,7 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
             zeros_mask_test = zeros_mask_test.rename({'lon':'x', 'lat':'y'})
         result = xr.combine_by_coords([result * zeros_mask_test, zeros_mask_test.to_dataset(name = 'active_grid')])
 
-    if params['version'] == 'IceExtent':
-            result = result.where(result >= 0.5, 0)
-            result = result.where(result ==0, 1)
+
 
     if params['combined_prediction']:
             result_extent = (result_extent * land_mask)
@@ -497,44 +599,82 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
 
     return result
 
+def torch_normal_sampling( mu, std, num_samples = 1, truncated_dist = None, multivariate = False ):
+    if truncated_dist is not None:
+        samples = []
+        while len(samples) < num_samples:
+            if multivariate:
+                sample =  MultivariateNormal(mu, covariance_matrix=std).rsample(sample_shape=(num_samples,))
+            else:
+                sample =  Normal(mu, std).rsample(sample_shape=(num_samples,))
+            # Keep only samples within the bounds
+ 
+            if isinstance(truncated_dist, np.ndarray):
+                truncated_dist = torch.from_numpy(truncated_dist)
 
+            sample_dists =  np.sqrt(((sample - sample.mean(axis = 0))**2).sum(-1))
+            sample = sample[sample_dists <= truncated_dist]
+
+            samples.append(sample)
+        # Concatenate all valid samples and return the required number
+        return torch.cat(samples)[:num_samples]
+    else:
+        if multivariate:
+                z =  MultivariateNormal(mu, covariance_matrix=std).rsample(sample_shape=(num_samples,))
+        else:
+                z =  Normal(mu, std).rsample(sample_shape=(num_samples,))
+        return z
+    
 def extract_params(model_dir):
     params = {}
     path = glob.glob(model_dir + '/*.txt')[0]
     file = open(path)
     content=file.readlines()
     for line in content:
-        key = line.split('\t')[0]
-        try:
-            value = line.split('\t')[1].split('\n')[0]
-        except:
-            value = line.split('\t')[1]
-        try:    
-            params[key] = eval(value)
-        except:
-            if key == 'ensemble_list':
-                ls = []
-                for item in value.split('[')[1].split(']')[0].split(' '):
-                    try:
-                        ls.append(eval(item))
-                    except:
-                        pass
-                params[key] = ls
-            else:
-                params[key] = value
+        if '\t' in line:
+            key = line.split('\t')[0]
+            try:
+                value = line.split('\t')[1].split('\n')[0]
+            except:
+                value = line.split('\t')[1]
+            try:    
+                params[key] = eval(value)
+            except:
+                if key == 'ensemble_list':
+                    ls = []
+                    for item in value.split('[')[1].split(']')[0].split(' '):
+                        try:
+                            ls.append(eval(item))
+                        except:
+                            pass
+                    params[key] = ls
+                else:
+                    params[key] = value
     return params
 
 if __name__ == "__main__":
 
     ############################################## Set_up ############################################
 
-    out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/NASA/UNet2/run_set_2_convnext'
-    out_dir    = f'{out_dir_x}/N5_M12_F12_v1_NPSproj_North_lr0.001_batch10_e100_LNone_bilinear' 
+    out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/NASA/UNet2/run_set_3_convnext'
+    out_dir    = f'{out_dir_x}/N2_M12_VAL3_F12_v1.1_North_lr0.001_batch100_e100_1x1_bilinear_multiressloss4' 
+
+
+    params = extract_params(out_dir)
+    print(f'loaded configuration: \n')
+
+    for key, values in params.items():
+        print(f'{key} : {values} \n')
+    version = eval(out_dir.split('/')[-1].split('_')[3][1:]) if 'VAL' not in out_dir else eval(out_dir.split('/')[-1].split('_')[4][1:])
+    params["version"] = version
+    print( f'Version: {version}')
+
 
     lead_months = 12
     bootstrap = False
-    test_years = np.arange(2016,2022)
-
+    test_years = np.arange(2017,2022)
+    params['output_sampling'] = 'conditional_multinormal_based_train_sampling'  # None, Gaussian_noise,  conditional_normal_based_train_sampling, conditional_multinormal_based_train_sampling
+    params['output_sampling_num'] = 50
     #################################################################################################
     obs_ref = out_dir_x.split('/')[-3]
     if '1x1' in out_dir:
@@ -559,19 +699,6 @@ if __name__ == "__main__":
     ##################################################################################################
     # for i in range(1,13):
     #     out_dir    = f'{out_dir_x}/N5_LT{i}_F12_v3_1x1_North_lr0.001_batch25_e100_LNone_bilinear_combined'  
-    params = extract_params(out_dir)
-    print(f'loaded configuration: \n')
-    for key, values in params.items():
-        print(f'{key} : {values} \n')
-    
-    try:
-        version = int(out_dir.split('/')[-1].split('_')[3][1])
-    except:
-        version = (out_dir.split('/')[-1].split('_')[3][1])
-
-    
-    params["version"] = version
-    print( f'Version: {version}')
 
     
     if bootstrap:

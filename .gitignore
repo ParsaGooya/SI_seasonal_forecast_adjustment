@@ -164,6 +164,7 @@ data_utils/
 linear_adjustment.py
 module_FINAL_*
 ice_conc_nh_ease2-250_cdr-v2p0_197901021200.nc
+run_training_backup.py
 run_training_old.py
 data_prep.ipynb
 Jobs/
@@ -177,4 +178,18 @@ BashHelloJob.out
 mjob.sh
 mjob2.sh
 output.txt
+output2.txt
 qstat.txt
+
+run_training_CVAE_0226_offlineres_2.py
+run_training_CVAE_0226_offlineres.py
+assim_data_prep.py
+
+models/cvae_0417.py
+run_training_CVAE_0417.py
+run_training_CVAE_0417_parallel.py
+run_training_CVAE_0717_assimilation.py
+run_training_CVAE_0717_parallel_assimilation.py
+
+test_Reinel.ipynb
+test_parallel.ipynb

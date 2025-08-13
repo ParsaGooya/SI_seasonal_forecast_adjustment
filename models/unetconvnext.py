@@ -11,7 +11,7 @@ from timm.models.registry import register_model
 class UNet2(nn.Module):
 	
     
-		def __init__( self,  n_channels_x=1 ,  bilinear=False, sigmoid = True,skip_connection = True,  skip_conv = False, combined_prediction = False ):
+		def __init__( self,  n_channels_x=1 ,  bilinear=False, sigmoid = True,skip_connection = True,  skip_conv = False, combined_prediction = False, LocallyConnected = False ):
 			
 			super().__init__()
 			self.n_channels_x = n_channels_x
@@ -45,9 +45,9 @@ class UNet2(nn.Module):
 				self.up3 = Up(64, 32, concat_channel= 32, bilinear= False, up_kernel = 2)
 				self.up4 = Up(32, 16, concat_channel= 16, bilinear= False, up_kernel = 2)
 			# self last layer:
-			self.last_conv = OutConv(16, 1, sigmoid = sigmoid)
+			self.last_conv = OutConv(16, 1, sigmoid = sigmoid, LocallyConnected = LocallyConnected)
 			if combined_prediction:
-				self.last_conv2 = OutConv(16, 1, sigmoid = True, NPS_proj = True)
+				self.last_conv2 = OutConv(16, 1, sigmoid = True, NPS_proj = True, LocallyConnected = LocallyConnected)
 
 
 		def forward(self, x, mask, ind = None):
@@ -57,27 +57,27 @@ class UNet2(nn.Module):
 			else:
 				x_in = x
 			mask = mask.unsqueeze(0)#.expand_as(x_in[0])      # uncomment if multichannel is True
-			x1, mask1 = self.initial_conv(x_in, mask)  # (batch, 32, 100, 180)
+			x1, mask1 = self.initial_conv(x_in, mask)  # (batch, 16, 100, 180)
 
 		# Downsampling
-			x2, x2_bm, mask2, mask2_bm  = self.d1(x1, mask1)  # (batch, 64, 50, 90) (batch, 32, 100, 180)
-			x3, x3_bm, mask3, mask3_bm  = self.d2(x2, mask2)  # (batch, 128, 25, 45) (batch, 64, 50, 90)
-			x4, x4_bm, mask4, mask4_bm = self.d3(x3, mask3)  # (batch, 256, 12, 22) (batch, 128, 25, 45)
-			x5, x5_bm, mask5, mask5_bm  = self.d4(x4, mask4)  # (batch, 512, 6, 11) (batch, 256, 12, 22)
+			x2, x2_bm, mask2, mask2_bm  = self.d1(x1, mask1)  # (batch, 32, 50, 90) (batch, 32, 100, 180)
+			x3, x3_bm, mask3, mask3_bm  = self.d2(x2, mask2)  # (batch, 64, 25, 45) (batch, 64, 50, 90)
+			x4, x4_bm, mask4, mask4_bm = self.d3(x3, mask3)  # (batch, 128, 12, 22) (batch, 128, 25, 45)
+			x5, x5_bm, mask5, mask5_bm  = self.d4(x4, mask4)  # (batch, 256, 6, 11) (batch, 256, 12, 22)
 			
-			x6 = self.last_conv_down(x5, mask5)  # (batch, 512, 6, 11)
+			x6 = self.last_conv_down(x5, mask5)  # (batch, 256, 6, 11)
 			
 			# Upsampling
 			if self.skip_connection:
-				x = self.up1(x6, x5_bm, mask5_bm)  # (batch, 256, 12, 22)
-				x = self.up2(x, x4_bm, mask4_bm)  # (batch, 128, 25, 45)
-				x = self.up3(x, x3_bm, mask3_bm)  # (batch, 64, 50, 90)
-				x = self.up4(x, x2_bm, mask2_bm)  # (batch, 32, 100, 180)
+				x = self.up1(x6, x5_bm, mask5_bm)  # (batch, 128, 12, 22)
+				x = self.up2(x, x4_bm, mask4_bm)  # (batch, 64, 25, 45)
+				x = self.up3(x, x3_bm, mask3_bm)  # (batch, 32, 50, 90)
+				x = self.up4(x, x2_bm, mask2_bm)  # (batch, 16, 100, 180)
 			else:
-				x = self.up1(x6)  # (batch, 256, 12, 22)
-				x = self.up2(x)  # (batch, 128, 25, 45)
-				x = self.up3(x)  # (batch, 64, 50, 90)
-				x = self.up4(x)  # (batch, 32, 100, 180)	
+				x = self.up1(x6)  # (batch, 128, 12, 22)
+				x = self.up2(x)  # (batch, 64, 25, 45)
+				x = self.up3(x)  # (batch, 32, 50, 90)
+				x = self.up4(x)  # (batch, 16, 100, 180)	
 			
 			x1 = self.last_conv(x)
 			if self.combined_prediction:
@@ -89,7 +89,7 @@ class UNet2(nn.Module):
 class UNet2_small(nn.Module):
 	
     
-		def __init__( self,  n_channels_x=1 ,  bilinear=False, sigmoid = True,skip_connection = True,  skip_conv = False, combined_prediction = False ):
+		def __init__( self,  n_channels_x=1 ,  bilinear=False, sigmoid = True,skip_connection = True,  skip_conv = False, combined_prediction = False, LocallyConnected = False ):
 			
 			super().__init__()
 			self.n_channels_x = n_channels_x
@@ -123,9 +123,9 @@ class UNet2_small(nn.Module):
 				self.up2 = Up(64, 32, concat_channel= 32, bilinear= False, up_kernel = 2)
 				self.up3 = Up(32, 16, concat_channel= 16, bilinear= False, up_kernel = 2)
 			# self last layer:
-			self.last_conv = OutConv(16, 1, sigmoid = sigmoid)
+			self.last_conv = OutConv(16, 1, sigmoid = sigmoid, LocallyConnected = LocallyConnected)
 			if combined_prediction:
-				self.last_conv2 = OutConv(16, 1, sigmoid = True, NPS_proj = True)
+				self.last_conv2 = OutConv(16, 1, sigmoid = True, NPS_proj = True, LocallyConnected = LocallyConnected)
 
 
 		def forward(self, x, mask, ind = None):
@@ -135,26 +135,26 @@ class UNet2_small(nn.Module):
 			else:
 				x_in = x
 			mask = mask.unsqueeze(0)#.expand_as(x_in[0])      # uncomment if multichannel is True
-			x1, mask1 = self.initial_conv(x_in, mask)  # (batch, 32, 100, 180)
+			x1, mask1 = self.initial_conv(x_in, mask)  # (batch, 16, 100, 180)
 
 		# Downsampling
-			x2, x2_bm, mask2, mask2_bm  = self.d1(x1, mask1)  # (batch, 64, 50, 90) (batch, 32, 100, 180)
-			x3, x3_bm, mask3, mask3_bm  = self.d2(x2, mask2)  # (batch, 128, 25, 45) (batch, 64, 50, 90)
-			x4, x4_bm, mask4, mask4_bm = self.d3(x3, mask3)  # (batch, 256, 12, 22) (batch, 128, 25, 45)
+			x2, x2_bm, mask2, mask2_bm  = self.d1(x1, mask1)  # (batch, 32, 50, 90) (batch, 32, 100, 180)
+			x3, x3_bm, mask3, mask3_bm  = self.d2(x2, mask2)  # (batch, 64, 25, 45) (batch, 64, 50, 90)
+			x4, x4_bm, mask4, mask4_bm = self.d3(x3, mask3)  # (batch, 128, 12, 22) (batch, 128, 25, 45)
 			# x5, x5_bm, mask5, mask5_bm  = self.d4(x4, mask4)  # (batch, 512, 6, 11) (batch, 256, 12, 22)
 			
-			x5 = self.last_conv_down(x4, mask4)  # (batch, 512, 6, 11)
+			x5 = self.last_conv_down(x4, mask4)  # (batch, 128,12, 22)
 			
 			# Upsampling
 			if self.skip_connection:
-				x = self.up1(x5, x4_bm, mask4_bm)  # (batch, 256, 12, 22)
-				x = self.up2(x, x3_bm, mask3_bm)  # (batch, 128, 25, 45)
-				x = self.up3(x, x2_bm, mask2_bm)  # (batch, 64, 50, 90)
+				x = self.up1(x5, x4_bm, mask4_bm)  # (batch, 64, 25, 45)
+				x = self.up2(x, x3_bm, mask3_bm)  # (batch, 32, 50, 90)
+				x = self.up3(x, x2_bm, mask2_bm)  # (batch, 16, 100, 180)
 				# x = self.up4(x, x2_bm, mask2_bm)  # (batch, 32, 100, 180)
 			else:
-				x = self.up1(x5)  # (batch, 256, 12, 22)
-				x = self.up2(x)  # (batch, 128, 25, 45)
-				x = self.up3(x)  # (batch, 64, 50, 90)
+				x = self.up1(x5)  # (batch, 64, 12, 22)
+				x = self.up2(x)  # (batch, 32, 25, 45)
+				x = self.up3(x)  # (batch, 16, 50, 90)
 				# x = self.up4(x)  # (batch, 32, 100, 180)	
 
 			x1 = self.last_conv(x)
@@ -168,7 +168,7 @@ class UNet2_small(nn.Module):
 class UNet2_NPS(nn.Module):
 	
     
-		def __init__( self,  n_channels_x=1 ,  bilinear=False, sigmoid = True,skip_connection = True, skip_conv = False, combined_prediction = False ):
+		def __init__( self,  n_channels_x=1 ,  bilinear=False, sigmoid = True,skip_connection = True, skip_conv = False, combined_prediction = False, LocallyConnected = False ):
 			
 			super().__init__()
 			self.n_channels_x = n_channels_x
@@ -205,9 +205,9 @@ class UNet2_NPS(nn.Module):
 
 
 			# self last layer:
-			self.last_conv = OutConv(16, 1, sigmoid = sigmoid, NPS_proj = True)
+			self.last_conv = OutConv(16, 1, sigmoid = sigmoid, NPS_proj = True, LocallyConnected = LocallyConnected)
 			if combined_prediction:
-				self.last_conv2 = OutConv(16, 1, sigmoid = True, NPS_proj = True)
+				self.last_conv2 = OutConv(16, 1, sigmoid = True, NPS_proj = True, LocallyConnected = LocallyConnected)
 			
 
 		def forward(self, x, mask, ind = None):
@@ -217,30 +217,30 @@ class UNet2_NPS(nn.Module):
 			else:
 				x_in = x
 			mask = mask.unsqueeze(0)#.expand_as(x_in[0])   # uncomment if multichannel is True
-			x1, mask1 = self.initial_conv(x_in, mask)  # (batch, 32, 432, 432)
+			x1, mask1 = self.initial_conv(x_in, mask)  # (batch, 16, 432, 304)
 
 		# Downsampling
-			x2, x2_bm, mask2, mask2_bm  = self.d1(x1, mask1)  # (batch, 64, 216, 216) (batch, 32, 432, 432)
-			x3, x3_bm, mask3, mask3_bm  = self.d2(x2, mask2)  # (batch, 128, 108, 108) (batch, 64, 216, 216)
-			x4, x4_bm, mask4, mask4_bm = self.d3(x3, mask3)  # (batch, 256, 54, 54)  (batch, 128, 108, 108)
-			x5, x5_bm, mask5, mask5_bm  = self.d4(x4, mask4)  # (batch, 512, 27, 27) (batch, 256, 54, 54)
-			x6, x6_bm, mask6, mask6_bm  = self.d5(x5, mask5)  # (batch, 1024, 13, 13) (batch, 512, 27, 27)
+			x2, x2_bm, mask2, mask2_bm  = self.d1(x1, mask1)  # (batch, 32, 216, 152) (batch, 32, 432, 304)
+			x3, x3_bm, mask3, mask3_bm  = self.d2(x2, mask2)  # (batch, 64, 108, 76) (batch, 64, 216, 152)
+			x4, x4_bm, mask4, mask4_bm = self.d3(x3, mask3)  # (batch, 128, 54, 38)  (batch, 128, 108, 76)
+			x5, x5_bm, mask5, mask5_bm  = self.d4(x4, mask4)  # (batch, 256, 27, 19) (batch, 256, 54, 38)
+			x6, x6_bm, mask6, mask6_bm  = self.d5(x5, mask5)  # (batch, 512, 13, 9) (batch, 512, 27, 19)
 
-			x7 = self.last_conv_down(x6, mask6)  # (batch, 1024, 13, 13)
+			x7 = self.last_conv_down(x6, mask6)  # (batch, 512,  13, 9)
 
 			# Upsampling
 			if self.skip_connection:
-				x = self.up1(x7, x6_bm, mask6_bm)  # (batch, 512, 27, 27)
-				x = self.up2(x, x5_bm, mask5_bm)  # (batch, 256, 54, 54)
-				x = self.up3(x, x4_bm, mask4_bm)  # (batch, 128, 108, 108)
-				x = self.up4(x, x3_bm, mask3_bm)  # (batch, 64, 216, 216)
-				x = self.up5(x, x2_bm, mask2_bm)  # (batch, 32, 432, 432)
+				x = self.up1(x7, x6_bm, mask6_bm)  # (batch, 256, 27, 19)
+				x = self.up2(x, x5_bm, mask5_bm)  # (batch, 128, 54, 38)
+				x = self.up3(x, x4_bm, mask4_bm)  # (batch, 64, 108, 76)
+				x = self.up4(x, x3_bm, mask3_bm)  # (batch, 32, 216, 152)
+				x = self.up5(x, x2_bm, mask2_bm)  # (batch, 16, 432, 304)
 			else:
-				x = self.up1(x7)  # (batch, 512, 27, 27)
-				x = self.up2(x)  # (batch, 256, 54, 54)
-				x = self.up3(x)  # (batch, 128, 108, 108)
-				x = self.up4(x)  # (batch, 64, 216, 216)
-				x = self.up5(x)  # (batch, 32, 432, 432)				
+				x = self.up1(x7)  # (batch, 256, 27, 19)
+				x = self.up2(x)  # (batch, 128, 54, 38)
+				x = self.up3(x)  # (batch, 64, 108, 76)
+				x = self.up4(x)  # (batch, 32, 216, 152)
+				x = self.up5(x)  # (batch, 16, 432, 304)				
 			
 			x1 = self.last_conv(x)
 			if self.combined_prediction:
@@ -253,7 +253,7 @@ class UNet2_NPS(nn.Module):
 class UNet2_NPS_small(nn.Module):
 	
     
-		def __init__( self,  n_channels_x=1 ,  bilinear=False, sigmoid = True,skip_connection = True, skip_conv = False, combined_prediction = False ):
+		def __init__( self,  n_channels_x=1 ,  bilinear=False, sigmoid = True,skip_connection = True, skip_conv = False, combined_prediction = False, LocallyConnected = False ):
 			
 			super().__init__()
 			self.n_channels_x = n_channels_x
@@ -289,9 +289,9 @@ class UNet2_NPS_small(nn.Module):
 
 
 			# self last layer:
-			self.last_conv = OutConv(16, 1, sigmoid = sigmoid, NPS_proj = True)
+			self.last_conv = OutConv(16, 1, sigmoid = sigmoid, NPS_proj = True, LocallyConnected = LocallyConnected)
 			if combined_prediction:
-				self.last_conv2 = OutConv(16, 1, sigmoid = True, NPS_proj = True)
+				self.last_conv2 = OutConv(16, 1, sigmoid = True, NPS_proj = True, LocallyConnected = LocallyConnected)
 			
 
 		def forward(self, x, mask, ind = None):
@@ -301,28 +301,28 @@ class UNet2_NPS_small(nn.Module):
 			else:
 				x_in = x
 			mask = mask.unsqueeze(0)#.expand_as(x_in[0])   # uncomment if multichannel is True
-			x1, mask1 = self.initial_conv(x_in, mask)  # (batch, 32, 432, 432)
+			x1, mask1 = self.initial_conv(x_in, mask)  # (batch, 16, 432, 304)
 
 		# Downsampling
-			x2, x2_bm, mask2, mask2_bm  = self.d1(x1, mask1)  # (batch, 64, 216, 216) (batch, 32, 432, 432)
-			x3, x3_bm, mask3, mask3_bm  = self.d2(x2, mask2)  # (batch, 128, 108, 108) (batch, 64, 216, 216)
-			x4, x4_bm, mask4, mask4_bm = self.d3(x3, mask3)  # (batch, 256, 54, 54)  (batch, 128, 108, 108)
-			x5, x5_bm, mask5, mask5_bm  = self.d4(x4, mask4)  # (batch, 512, 27, 27) (batch, 256, 54, 54)
-			# x6, x6_bm, mask6, mask6_bm  = self.d5(x5, mask5)  # (batch, 1024, 13, 13) (batch, 512, 27, 27)
+			x2, x2_bm, mask2, mask2_bm  = self.d1(x1, mask1)  # (batch, 32, 216, 152) (batch, 32, 432, 304)
+			x3, x3_bm, mask3, mask3_bm  = self.d2(x2, mask2)  # (batch, 64, 108, 76) (batch, 64, 216, 152)
+			x4, x4_bm, mask4, mask4_bm = self.d3(x3, mask3)  # (batch, 128, 54, 38)  (batch, 128, 108, 76)
+			x5, x5_bm, mask5, mask5_bm  = self.d4(x4, mask4)  # (batch, 256, 27, 19) (batch, 256, 54, 38)
+			# x6, x6_bm, mask6, mask6_bm  = self.d5(x5, mask5)  # (batch, 512, 13, 9) (batch, 512, 27, 19)
 
-			x6 = self.last_conv_down(x5, mask5)  # (batch, 1024, 13, 13)
+			x6 = self.last_conv_down(x5, mask5)  # (batch, 256, 27, 19)
 
 			# Upsampling
 			if self.skip_connection:
-				x = self.up1(x6, x5_bm, mask5_bm)  # (batch, 256, 54, 54)
-				x = self.up2(x, x4_bm, mask4_bm)  # (batch, 128, 108, 108)
-				x = self.up3(x, x3_bm, mask3_bm)  # (batch, 64, 216, 216)
-				x = self.up4(x, x2_bm, mask2_bm)  # (batch, 32, 432, 432)
+				x = self.up1(x6, x5_bm, mask5_bm)  # (batch, 128, 54, 38)
+				x = self.up2(x, x4_bm, mask4_bm)  # (batch, 64, 108, 76)
+				x = self.up3(x, x3_bm, mask3_bm)  # (batch, 32, 216, 152)
+				x = self.up4(x, x2_bm, mask2_bm)  # (batch, 16, 432, 304)
 			else:
-				x = self.up1(x6)  # (batch, 256, 54, 54)
-				x = self.up2(x)  # (batch, 128, 108, 108)
-				x = self.up3(x)  # (batch, 64, 216, 216)
-				x = self.up4(x)  # (batch, 32, 432, 432)				
+				x = self.up1(x6)  # (batch, 128, 54, 38)
+				x = self.up2(x)  # (batch, 64, 108, 76)
+				x = self.up3(x)  # (batch, 32, 216, 152)
+				x = self.up4(x)  # (batch, 16, 432, 304)				
 			
 			x1 = self.last_conv(x)
 			if self.combined_prediction:
@@ -339,14 +339,14 @@ class InitialConv(nn.Module):
 				self.firstconv = PartialConv2d(in_channels, out_channels ,kernel_size=3, padding= [1,0], multi_channel=False, return_mask=True)
 				# self.BN = nn.BatchNorm2d(out_channels)
 				self.BN = LayerNorm(out_channels, eps=1e-6, data_format='channels_first')
-				self.activation = nn.ReLU(inplace=True)
+				# self.activation = nn.ReLU(inplace=True)  ######## Changed 0717 ######
 				
 		def forward(self, x, mask):
 				x1 = pad_ice(x, [0,1])
 				mask1 = pad_ice(mask, [0,1])
 				x1, mask1 = self.firstconv(x1, mask1)
 				x1 = self.BN(x1)
-				x1 = self.activation(x1)
+				# x1 = self.activation(x1)  ######## Changed 0717 ######
 				return x1, mask1
 
 
@@ -365,6 +365,7 @@ class Up(nn.Module):
 
 				else:
 						self.up = nn.ConvTranspose2d(in_channels+ concat_channel, out_channels , kernel_size=up_kernel, stride=2)
+						self.norm =  LayerNorm(in_channels, eps=1e-6, data_format="channels_first")   ######## Changed 0717 ######
 						self.conv = DoubleConvNext(out_channels,  multi_channel=True, return_mask=False)
 						self.up.apply(weights_init)
 
@@ -394,6 +395,8 @@ class Up(nn.Module):
 				# input is CHW
 				if self.bilinear:
 					x, mask1 = self.conv_mid(x, mask1)
+				else:  ######## Changed 0717 ######
+					x = self.norm(x)   ######## Changed 0717 ######
 
 				x = self.conv(x, mask1)
 
@@ -406,6 +409,7 @@ class Down(nn.Module):
 				super().__init__()
 				self.skip_conv = False
 				self.doubleconv = DoubleConvNext(in_channels, multi_channel=False, return_mask=True)
+				self.norm = LayerNorm(in_channels, eps=1e-6, data_format="channels_first")   ######## Changed 0717 ######
 				self.pool = PartialConv2d(in_channels, out_channels, kernel_size=2, stride = 2, padding=pooling_padding,  multi_channel=False, return_mask=True)
 				# self.maxpool = nn.MaxPool2d(2,stride = 2, padding = pooling_padding)
 				
@@ -417,6 +421,7 @@ class Down(nn.Module):
 			
 		def forward(self, x, mask):
 				x1, mask1 = self.doubleconv(x, mask)
+				x1 = self.norm(x1)   ######## Changed 0717 ######
 				x2,mask2 = self.pool(x1, mask1)
 				# mask2 = self.maxpool(mask1)
 				if self.skip_conv:
@@ -426,32 +431,38 @@ class Down(nn.Module):
 
 
 class OutConv(nn.Module):
-		def __init__(self, in_channels, out_channels, sigmoid = True, NPS_proj = False):
+		def __init__(self, in_channels, out_channels, sigmoid = True, NPS_proj = False, LocallyConnected = False):
 				super().__init__()
 				self.NPS_proj = NPS_proj
 				if NPS_proj:
 					padding = 1
+					output_size = (432, 304)
 				else:
 					padding= [1,0]
-				# self.conv1 = PartialConv2d(in_channels, in_channels, kernel_size=3, padding= padding)
+					output_size = (100,180)
+
+				if LocallyConnected:
+					conv = 	LocallyConnected2d(in_channels, out_channels,output_size = output_size, kernel_size=1)
+				else:
+					conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+
 				if sigmoid:
-					self.conv2 = nn.Sequential(
+					self.conv2 = nn.Sequential(   
 								LayerNorm(in_channels, eps=1e-6, data_format='channels_first'),
-								nn.ReLU(inplace=True),
-								nn.Conv2d(in_channels, out_channels, kernel_size=1), nn.Sigmoid())
+								nn.ReLU(inplace=True),  
+								conv,
+								nn.Sigmoid())
 					
 				else:
-					self.conv2 = nn.Sequential(
-								LayerNorm(in_channels, eps=1e-6, data_format='channels_first'),
-								nn.ReLU(inplace=True),
-								nn.Conv2d(in_channels, out_channels, kernel_size=1))
+					self.conv2 = nn.Sequential(   
+								LayerNorm(in_channels, eps=1e-6, data_format='channels_first'),   
+								nn.ReLU(inplace=True), 
+								conv)
 					
 				self.conv2.apply(weights_init)
 
 		def forward(self, x):
-				# if not self.NPS_proj:
-				# 	x = pad_ice(x, [0,1])
-				# x = self.conv1(x)
+
 				return self.conv2(x)
 		
 		

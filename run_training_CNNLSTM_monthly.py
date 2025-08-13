@@ -279,7 +279,7 @@ def run_training(params, n_years, lead_time, n_runs=1, results_dir=None, numpy_s
                 if test_year * 100 + month > ds_raw_ensemble_mean.time[-1]:
                     test_year, month = np.divmod(int(ds_raw_ensemble_mean.time[-1].values),  100)
                     test_year = test_year + np.divmod(month+1,13)[0]
-                    month = np.divmod(month+1,13)[1]
+                    month = max(np.divmod(month+1,13)[1],1)
                     print(f"\tStart run the final model ...")
                 else:
                     print(f"\tStart run month {month} - {month + params['forecast_range_months'] - 1}...")
@@ -700,10 +700,14 @@ if __name__ == "__main__":
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     Path(out_dir + '/Figures').mkdir(parents=True, exist_ok=True)
 
-    run_training(params, n_years=n_years, lead_time=lead_time, n_runs=n_runs, results_dir=out_dir, numpy_seed=1, torch_seed=1)
-
-    print(f'Output dir: {out_dir}')
-    print('Training done.')
-
+    try:
+        run_training(params, n_years=n_years, lead_time=lead_time, n_runs=n_runs, results_dir=out_dir, numpy_seed=1, torch_seed=1)
+        print(f'Output dir: {out_dir}')
+        print('Training done.')
+    except Exception as e:
+        import shutil
+        shutil.rmtree(out_dir)
+        print("Terminated due to the follwoing error:\n", e)
+        raise  # 
 
 

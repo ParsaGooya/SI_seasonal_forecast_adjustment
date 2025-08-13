@@ -323,7 +323,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                 if test_year * 100 + month > ds_raw_ensemble_mean.time[-1]:
                     test_year, month = np.divmod(int(ds_raw_ensemble_mean.time[-1].values),  100)
                     test_year = test_year + np.divmod(month+1,13)[0]
-                    month = np.divmod(month+1,13)[1]
+                    month = max(np.divmod(month+1,13)[1],1)
                     print(f"\tStart run the final model ...")
                 else:
                     print(f"\tStart run month {month} - {month + params['forecast_range_months'] - 1}...")
@@ -819,43 +819,47 @@ if __name__ == "__main__":
     if params['model'] in  [CNN, RegCNN, CNNLSTM]:
         out_dir = out_dir + f'_{params["kernel_size"]}{params["decoder_kernel_size"]}'
 
+    try:
+        if type(params['subset_dims']) == list:
+            for element in params['subset_dims']:
 
-    if type(params['subset_dims']) == list:
-        for element in params['subset_dims']:
+                params['subset_dimensions'] = element
+                out_dir  = out_dir + f'_{element}_lr{params["lr"]}_batch{params["batch_size"]}_e{params["epochs"]}_L{params["reg_scale"]}'
+                if params['active_grid']:
+                    out_dir = out_dir + '_active_grid'
+                if params['_bilinear']:
+                    out_dir = out_dir + '_bilinear'
 
-            params['subset_dimensions'] = element
-            out_dir  = out_dir + f'_{element}_lr{params["lr"]}_batch{params["batch_size"]}_e{params["epochs"]}_L{params["reg_scale"]}'
-            if params['active_grid']:
-                out_dir = out_dir + '_active_grid'
-            if params['_bilinear']:
-                out_dir = out_dir + '_bilinear'
+                Path(out_dir).mkdir(parents=True, exist_ok=True)
+                Path(out_dir + '/Figures').mkdir(parents=True, exist_ok=True)
 
-            Path(out_dir).mkdir(parents=True, exist_ok=True)
-            Path(out_dir + '/Figures').mkdir(parents=True, exist_ok=True)
-
-            run_training(params, n_years=n_years, lead_months=lead_months, n_runs=n_runs, results_dir=out_dir, numpy_seed=1, torch_seed=1)
-         
-    else:
+                run_training(params, n_years=n_years, lead_months=lead_months, n_runs=n_runs, results_dir=out_dir, numpy_seed=1, torch_seed=1)
             
-            out_dir  = out_dir + f'_{params["subset_dims"]}_lr{params["lr"]}_batch{params["batch_size"]}_e{params["epochs"]}_L{params["reg_scale"]}_new'
+        else:
+                
+                out_dir  = out_dir + f'_{params["subset_dims"]}_lr{params["lr"]}_batch{params["batch_size"]}_e{params["epochs"]}_L{params["reg_scale"]}_new'
 
-            if params['subset_dims'] == 'Global':
-                params['subset_dimensions'] = None
-            else:
-                params['subset_dimensions'] = params['subset_dims']
+                if params['subset_dims'] == 'Global':
+                    params['subset_dimensions'] = None
+                else:
+                    params['subset_dimensions'] = params['subset_dims']
 
-            if params['active_grid']:
-                out_dir = out_dir + '_active_grid'
-            if params['bilinear']:
-                out_dir = out_dir + '_bilinear'
+                if params['active_grid']:
+                    out_dir = out_dir + '_active_grid'
+                if params['bilinear']:
+                    out_dir = out_dir + '_bilinear'
 
-            Path(out_dir).mkdir(parents=True, exist_ok=True)
-            Path(out_dir + '/Figures').mkdir(parents=True, exist_ok=True)
+                Path(out_dir).mkdir(parents=True, exist_ok=True)
+                Path(out_dir + '/Figures').mkdir(parents=True, exist_ok=True)
+                
+                
+                run_training(params, n_years=n_years, lead_months=lead_months,lead_time = lead_time, NPSProj  = NPSProj, test_years = None,  n_runs=n_runs, results_dir=out_dir, numpy_seed=1, torch_seed=1)
 
-            run_training(params, n_years=n_years, lead_months=lead_months,lead_time = lead_time, NPSProj  = NPSProj, test_years = None,  n_runs=n_runs, results_dir=out_dir, numpy_seed=1, torch_seed=1)
-
-    print(f'Output dir: {out_dir}')
-    print('Training done.')
-
-
+        print(f'Output dir: {out_dir}')
+        print('Training done.')
+    except Exception as e:
+        import shutil
+        shutil.rmtree(out_dir)
+        print("Terminated due to the follwoing error:\n", e)
+        raise  # 
 

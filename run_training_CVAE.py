@@ -44,7 +44,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
     else:
         data_dir_obs = glob.glob(LOC_OBSERVATIONS_SI+ '/uws*.nc')[0]
 
-    assert params['version'] in [1,2,3, 'IceExtent']
+    assert params['version'] in [1,2,3,1.1, 'IceExtent']
 
   
     if params['version'] == 2:
@@ -121,9 +121,9 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
     if not NPSProj:
         ds_in = ds_in.where(ds_in<1000,np.nan)
     else:
-        mask_projection = (xr.open_dataset(data_dir_obs)['mask'].rename({'x':'lon','y':'lat'}))
-        obs_in = (obs_in.rename({'x':'lon','y':'lat'}))
-        ds_in = (ds_in.rename({'x':'lon','y':'lat'}))
+        mask_projection = (xr.open_dataset(data_dir_obs)['mask'].rename({'x':'lon','y':'lat'}))[...,:,64:-64]
+        obs_in = (obs_in.rename({'x':'lon','y':'lat'}))[...,:,64:-64]
+        ds_in = (ds_in.rename({'x':'lon','y':'lat'}))[...,:,64:-64]
 
 
     land_mask = obs_in.mean('time').where(np.isnan(obs_in.mean('time')),1).fillna(0)
@@ -271,7 +271,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
             f"epochs\t{epochs}\n" +
             f"batch_size\t{batch_size}\n" +
             f"optimizer\t{optimizer.__name__}\n" +
-            f"lr\t{0.001}\n" +
+            f"lr\t{params['lr']}\n" +
             f"lr_scheduler\t{params['lr_scheduler']}: {start_factor} --> {end_factor} in {total_iters} epochs\n" + 
             f"decoder_kernel_size\t{decoder_kernel_size}\n" +
             f"forecast_preprocessing_steps\t{[s[0] if forecast_preprocessing_steps is not None else None for s in forecast_preprocessing_steps]}\n" +
@@ -352,7 +352,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                 del ds_baseline, obs_baseline, preprocessing_mask_obs, preprocessing_mask_fct
                 gc.collect()
 
-                if params['version']  in [3]:
+                if params['version']  in [3, 1.1]:
                     sigmoid_activation = False
                 else:
                     sigmoid_activation = True

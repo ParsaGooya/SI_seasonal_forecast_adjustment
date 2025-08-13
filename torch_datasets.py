@@ -6,7 +6,7 @@ from torch.utils.data import Dataset
 
 class XArrayDataset(Dataset):
 
-    def __init__(self, data: xr.DataArray, target: xr.DataArray, mask=None, zeros_mask = None, lead_time=None, time_features=None, ensemble_features = False, in_memory=True, to_device=None, aligned = False, month_min_max = None, model = 'Autoencoder'):
+    def __init__(self, data: xr.DataArray, target: xr.DataArray, mask=None, zeros_mask = None, lead_time=None, time_features=None,  in_memory=True, to_device=None, aligned = False, model = 'Autoencoder',  month_min_max = None):
         assert data.time.equals(target.time)
         self.model = model
         self.mask = mask
@@ -35,17 +35,18 @@ class XArrayDataset(Dataset):
         else:
             target_idx = (years_in_months + self.data.lead_time - 1).to_numpy()
         self.target = self.target[target_idx,...]
-        
 
+        if all(['ensembles' in self.target.dims, 'ensembles' in self.data.dims]):
+            assert len(self.target.ensembles) == len(self.data.ensembles)
+        
 
         if time_features is not None:
             self.use_time_features = True
             time_features = np.array([time_features]).flatten()
-            feature_indices = {'year': 0, 'lead_time': 1, 'month_sin': 2, 'month_cos': 3, 'imonth_sin' : 4, 'imonth_cos' : 5}
+            feature_indices = {'lead_time': 0, 'month_sin': 1, 'month_cos': 2, 'imonth_sin' : 3, 'imonth_cos' : 4}
             # y = self.data.year.to_numpy() / np.max(self.data.year.to_numpy())
-            yr, mn = np.divmod((self.data.time.to_numpy().astype(int) - month_min_max[0].astype(int)*100),100)
-            y = ((yr * 12 + mn )/month_min_max[1])
-            
+            # yr, mn = np.divmod((self.data.time.to_numpy().astype(int) - month_min_max[0].astype(int)*100),100)
+            # y = ((yr * 12 + mn )/month_min_max[1])
  
             lt = self.data.lead_time.to_numpy() / np.max(self.data.lead_time.to_numpy())
             # msin = np.sin(2 * np.pi * lt/12.0)
@@ -56,14 +57,14 @@ class XArrayDataset(Dataset):
             if model == 'PNet':
                 isin = np.stack([isin for _ in range(12)], axis=1)
                 icos = np.stack([icos for _ in range(12)], axis=1)
-                y = np.stack([y for _ in range(12)], axis=1)
+                # y = np.stack([y for _ in range(12)], axis=1)
                 lt = np.stack([lt for _ in range(12)], axis=1)
                 target_month  = np.mod(self.data.time.to_numpy(),100)[...,None] + np.arange(1,13) - 1
             else:
                 target_month  = np.mod(self.data.time.to_numpy(),100) + self.data.lead_time.to_numpy() - 1
             msin = np.sin(2 * np.pi * target_month/12.0)
             mcos = np.cos(2 * np.pi * target_month/12.0)
-            self.time_features = np.stack([y, lt, msin, mcos, isin, icos], axis=1)
+            self.time_features = np.stack([lt, msin, mcos, isin, icos], axis=1)
             self.time_features = self.time_features[:, [feature_indices[k] for k in time_features if k not in ['active_mask', 'full_ice_mask', 'land_mask']],...]
             if self.time_features.shape[1] == 0:
                 self.use_time_features = False
@@ -126,16 +127,45 @@ class XArrayDataset(Dataset):
             if 'ensembles' in self.data.dims:
                 self.data['time'] = np.arange(0,len(self.data.time))  ## PG: create new coords for the ('year','lead_time') multi-index that shows indices
                 self.data = self.data.stack(flattened=('ensembles','time')).transpose('flattened',...) ## PG: Unwrap the ensemble dim
-                target_idx = self.data.time.values ## PG: Extract target indices based on the unwrapped ensemble dim
-                self.target = self.target[target_idx,...] ## PG: Sample the target at the new unwrapped indices
-                self.zeros_mask = self.zeros_mask.stack(flattened=('ensembles','time')).transpose('flattened',...)           
-        
+                if 'ensembles' in self.target.dims:
+                     self.target = self.target.stack(flattened=('ensembles','time')).transpose('flattened',...) 
+                else:
+                    target_idx = self.data.time.values ## PG: Extract target indices based on the unwrapped ensemble dim
+                    self.target = self.target[target_idx,...] ## PG: Sample the target at the new unwrapped indices
+                self.zeros_mask = self.zeros_mask.stack(flattened=('ensembles','time')).transpose('flattened',...)  
+
+            elif 'ensembles' in self.target.dims:         
+                self.target['time'] = np.arange(0,len(self.target.time))  ## PG: create new coords for the ('year','lead_time') multi-index that shows indices
+                self.target = self.target.stack(flattened=('ensembles','time')).transpose('flattened',...) ## PG: Unwrap the ensemble dim
+                target_idx = self.target.time.values ## PG: Extract target indices based on the unwrapped ensemble dim
+                self.data = self.data[target_idx,...] ## PG: Sample the target at the new unwrapped indices
+                self.zeros_mask = self.zeros_mask.stack(flattened=('ensembles','time')).transpose('flattened',...)  
+                   
         elif 'ensembles' in self.data.dims: ## PG: if not ensemble mean:
             self.data = self.data.reset_index('lead_time','time').rename({'flattened':'flat'})  ## PG: Change the flattened multi-index coord with a simple coord
             self.data['flat'] = np.arange(0,len(self.data.flat))  ## PG: create new coords for the ('year','lead_time') multi-index that shows indices
             self.data = self.data.stack(flattened=('ensembles','flat')).transpose('flattened',...) ## PG: Unwrap the ensemble dim
-            target_idx = self.data.flat.values ## PG: Extract target indices based on the unwrapped ensemble dim
-            self.target = self.target[target_idx,...] ## PG: Sample the target at the new unwrapped indices
+            if 'ensembles' in self.target.dims:
+                self.target = self.target.reset_index('lead_time','time').rename({'flattened':'flat'})  ## PG: Change the flattened multi-index coord with a simple coord
+                self.target['flat'] = np.arange(0,len(self.target.flat))  ## PG: create new coords for the ('year','lead_time') multi-index that shows indices
+                self.target = self.target.stack(flattened=('ensembles','flat')).transpose('flattened',...) 
+            else:
+                target_idx = self.data.flat.values ## PG: Extract target indices based on the unwrapped ensemble dim
+                self.target = self.target[target_idx,...] ## PG: Sample the target at the new unwrapped indices
+            self.lead_time_indices = self.lead_time_indices[target_idx,...]
+            if self.use_time_features:
+                self.time_features = self.time_features[target_idx,...] ## PG: sample time features with the same indices due to the unwrapping the ensemble dim
+            if self.zeros_mask is not None:
+                self.zeros_mask = self.zeros_mask.reset_index('lead_time','time').rename({'flattened':'flat'}) 
+                self.zeros_mask['flat'] = np.arange(0,len(self.zeros_mask.flat)) 
+                self.zeros_mask = self.zeros_mask.stack(flattened=('ensembles','flat')).transpose('flattened',...)
+
+        elif 'ensembles' in self.target.dims: ## PG: if not ensemble mean:
+            self.target = self.target.reset_index('lead_time','time').rename({'flattened':'flat'})  ## PG: Change the flattened multi-index coord with a simple coord
+            self.target['flat'] = np.arange(0,len(self.target.flat))  ## PG: create new coords for the ('year','lead_time') multi-index that shows indices
+            self.target = self.target.stack(flattened=('ensembles','flat')).transpose('flattened',...) ## PG: Unwrap the ensemble dim
+            target_idx = self.target.flat.values ## PG: Extract target indices based on the unwrapped ensemble dim
+            self.data = self.data[target_idx,...] ## PG: Sample the target at the new unwrapped indices
             self.lead_time_indices = self.lead_time_indices[target_idx,...]
             if self.use_time_features:
                 self.time_features = self.time_features[target_idx,...] ## PG: sample time features with the same indices due to the unwrapping the ensemble dim
@@ -227,7 +257,7 @@ class XArrayDataset(Dataset):
 
 class ConvLSTMDataset(Dataset):
 
-    def __init__(self, data: xr.DataArray, target: xr.DataArray, mask=None, n_timesteps = 12, moving_window=1, zeros_mask = None, lead_time=1, time_features=None, ensemble_features = False, in_memory=True, to_device=None,  month_min_max = None):
+    def __init__(self, data: xr.DataArray, target: xr.DataArray, mask=None, n_timesteps = 12, moving_window=1, zeros_mask = None, lead_time=1, time_features=None,  in_memory=True, to_device=None,  month_min_max = None):
         assert data.time.equals(target.time)
         assert lead_time is not None, 'Specify lead_time of prediction'
         self.mask = mask

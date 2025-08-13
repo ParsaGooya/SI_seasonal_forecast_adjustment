@@ -11,7 +11,8 @@ import torch
 from torch.utils.data import DataLoader
 from torch.optim import lr_scheduler
 from models.cvae_0226 import cVAE
-from losses import WeightedMSEKLD, WeightedMSE, BCElossKLD, WeightedMSELowRessKLD
+from losses import WeightedMSE, BCElossKLD #, WeightedMSEKLD, WeightedMSELowRessKLD
+from losses_new import VAElossLowRess, VAEloss
 from preprocessing import align_data_and_targets, create_mask, pole_centric, reverse_pole_centric, segment, reverse_segment, pad_xarray, smoother
 from preprocessing import AnomaliesScaler_v1_seasonal, AnomaliesScaler_v2_seasonal, Standardizer, Normalizer, PreprocessingPipeline, calculate_climatology, bias_adj, zeros_mask_gen
 from torch_datasets import XArrayDataset
@@ -43,7 +44,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
     else:
         data_dir_obs = glob.glob(LOC_OBSERVATIONS_SI+ '/uws*.nc')[0]
 
-    assert params['version'] in [1,2,3, 'IceExtent']
+    assert params['version'] in [1,2,3,1.1, 'IceExtent']
 
   
     if params['version'] == 2:
@@ -64,6 +65,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
     if params['version'] == 'IceExtent':
         params['reg_scale'] = None
         params['combined_prediction'] = False
+        params['learned_decoder_variance'] = False
         assert params['multi_ress_loss_kernel_size']  is None
         assert params['low_ress_loss_kernel_size']  is None
         assert params['loss_reduction'] == 'mean', 'Loss reduction SUM not yet set in the loss ...'
@@ -125,9 +127,9 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
     if not NPSProj:
         ds_in = ds_in.where(ds_in<1000,np.nan)
     else:
-        mask_projection = (xr.open_dataset(data_dir_obs)['mask'].rename({'x':'lon','y':'lat'}))
-        obs_in = (obs_in.rename({'x':'lon','y':'lat'}))
-        ds_in = (ds_in.rename({'x':'lon','y':'lat'}))
+        mask_projection = (xr.open_dataset(data_dir_obs)['mask'].rename({'x':'lon','y':'lat'}))[...,:,64:-64]
+        obs_in = (obs_in.rename({'x':'lon','y':'lat'}))[...,:,64:-64]
+        ds_in = (ds_in.rename({'x':'lon','y':'lat'}))[...,:,64:-64]
 
 
     land_mask = obs_in.mean('time').where(np.isnan(obs_in.mean('time')),1).fillna(0)
@@ -266,6 +268,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
         f.write(
             f"model\t{model.__name__}\n" +
             f"path_to_deterministic\t{params['path_to_deterministic']}\n" +
+            f"learned_decoder_variance\t{params['learned_decoder_variance']}\n" +
             f"reg_scale\t{reg_scale}\n" +  ## PG: The scale to be passed to Signloss regularization
             f"loss_function\t{params['loss_function']}\n" + 
             f"time_features\t{time_features}\n" +
@@ -276,7 +279,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
             f"epochs\t{epochs}\n" +
             f"batch_size\t{batch_size}\n" +
             f"optimizer\t{optimizer.__name__}\n" +
-            f"lr\t{0.001}\n" +
+            f"lr\t{params['lr']}\n" +
             f"lr_scheduler\t{params['lr_scheduler']}: {start_factor} --> {end_factor} in {total_iters} epochs\n" + 
             f"decoder_kernel_size\t{decoder_kernel_size}\n" +
             f"forecast_preprocessing_steps\t{[s[0] if forecast_preprocessing_steps is not None else None for s in forecast_preprocessing_steps]}\n" +
@@ -311,7 +314,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                 if test_year * 100 + month > ds_raw_ensemble_mean.time[-1]:
                     test_year, month = np.divmod(int(ds_raw_ensemble_mean.time[-1].values),  100)
                     test_year = test_year + np.divmod(month+1,13)[0]
-                    month = np.divmod(month+1,13)[1]
+                    month = max(np.divmod(month+1,13)[1],1)
                     print(f"\tStart run the final model ...")
                 else:
                     print(f"\tStart run month {month} - {month + params['forecast_range_months'] - 1}...")
@@ -358,7 +361,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                 del ds_baseline, obs_baseline, preprocessing_mask_obs, preprocessing_mask_fct
                 gc.collect()
 
-                if params['version']  in [3]:
+                if params['version']  in [3, 1.1]:
                     sigmoid_activation = False
                 else:
                     sigmoid_activation = True
@@ -437,12 +440,15 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                     NPSProj_saved = False if '1x1' in params['path_to_deterministic'] else True          
                     params_saved['combined_prediction'] = True if 'combined' in params['path_to_deterministic'] else False
                     lead_time_saved = eval(params['path_to_deterministic'].split('_LT')[1].split('_')[0]) if 'LT' in params['path_to_deterministic'] else None
-                    saved_model_year = test_year * 100 + month -1
+                    if test_year*100 + month <= ds_raw_ensemble_mean.time[-1]:
+                        saved_model_year_dir = f'/*-{test_year * 100 + month -1}*.pth'
+                    else:
+                        saved_model_year_dir = f'/*final*.pth'  
                     assert NPSProj_saved == NPSProj, 'The saved deterministic model cannot have a trained for a different projection than your cVAE!'
                     if params['version'] == 'IceExtent':
-                        assert eval(params['path_to_deterministic'].split('/')[-1].split('_')[3][1]) in  ['IceExtent', 1]
+                        assert eval(params['path_to_deterministic'].split('/')[-1].split('_')[3][1:]) in  ['IceExtent', 1]
                     else:
-                        assert eval(params['path_to_deterministic'].split('/')[-1].split('_')[3][1]) == params['version'], 'The saved deterministic model cannot have a different version than your cVAE!'
+                        assert eval(params['path_to_deterministic'].split('/')[-1].split('_')[3][1:]) == params['version'], 'The saved deterministic model cannot have a different version than your cVAE!'
                     assert lead_time_saved == lead_time, 'The saved deterministic model cannot have a trained for a different lead_time than your cVAE!'
                     assert params['time_features'] == params_saved['time_features'], 'The saved deterministic model must have the same input as your cVAE for the model data and added features!'
                     assert params_saved['combined_prediction'] == params['combined_prediction'], 'The saved deterministic model must have the same output type as your cVAE'
@@ -450,17 +456,17 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                     from models.unetconvnext import UNet2,UNet2_NPS
                     model = eval(params_saved['model'])
                     unet = model(n_channels_x= n_channels_x+ add_feature_dim , bilinear = params_saved['bilinear'], sigmoid = sigmoid_activation, skip_conv = params_saved['skip_conv'], combined_prediction = params_saved['combined_prediction'])
-                    # try:
-                    unet.load_state_dict(torch.load(glob.glob(params['path_to_deterministic']+ f'/*-{saved_model_year}*.pth')[0], map_location=torch.device('cpu'))) 
-                    # except:
-                    #     unet.load_state_dict(torch.load(glob.glob(params['path_to_deterministic']+ f'/*final*.pth')[0], map_location=torch.device('cpu'))) 
-                   
+                    try:
+                        unet.load_state_dict(torch.load(glob.glob(params['path_to_deterministic']+ saved_model_year_dir)[0], map_location=torch.device('cpu'))) 
+                    except:
+                        print(f'No saved deterministic model found for test year {test_year}')
+                        break
                     unet.to(device)
                 else:
                     unet = None
 
                 net = cVAE(VAE_latent_size = params['VAE_latent_size'], n_channels_x= n_channels_x+ add_feature_dim , sigmoid = sigmoid_activation, NPS_proj = NPSProj, device=device, combined_prediction = params['combined_prediction'], VAE_MLP_encoder = params['VAE_MLP_encoder'],
-                            scale_factor_channels = params['scale_factor_channels'], skip_VAE_added_dim = params['skip_VAE_added_dim'], saved_deterministic_model = unet, freeze_deterministic = params['freeze_deterministic'])
+                            scale_factor_channels = params['scale_factor_channels'], skip_VAE_added_dim = params['skip_VAE_added_dim'], saved_deterministic_model = unet, freeze_deterministic = params['freeze_deterministic'], learned_decoder_variance = params['learned_decoder_variance'])
 
                 net.to(device)
                 optimizer = torch.optim.Adam(net.parameters(), lr=lr, weight_decay = l2_reg)
@@ -483,9 +489,16 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
 
                 else:
                     if params['low_ress_loss_kernel_size'] is None:  
-                        criterion = WeightedMSEKLD(weights=weights, device=device, weights_mask = weights_mask, hyperparam=1, reduction=params['loss_reduction'], loss_area=loss_region_indices, scale=reg_scale, multi_ress_loss_kernel_size = multi_ress_loss_kernel_size)
+                        # criterion = WeightedMSEKLD(weights=weights, device=device, weights_mask = weights_mask, hyperparam=1, reduction=params['loss_reduction'], loss_area=loss_region_indices, scale=reg_scale, multi_ress_loss_kernel_size = multi_ress_loss_kernel_size)
+                        criterion = VAEloss(weights=weights, device=device, weights_mask = weights_mask,  reduction=params['loss_reduction'], loss_area=loss_region_indices, scale=reg_scale, 
+                                            multi_ress_loss_kernel_size = multi_ress_loss_kernel_size, learned_decoder_variance = params['learned_decoder_variance'])
+                   
                     else:
-                        criterion = WeightedMSELowRessKLD(weights=weights, device=device, weights_mask = weights_mask, hyperparam=1, reduction=params['loss_reduction'], loss_area=loss_region_indices, scale=reg_scale, kernel = params['low_ress_loss_kernel_size'])
+                        # criterion = WeightedMSELowRessKLD(weights=weights, device=device, weights_mask = weights_mask, hyperparam=1, reduction=params['loss_reduction'], loss_area=loss_region_indices, scale=reg_scale, kernel = params['low_ress_loss_kernel_size'])
+                        criterion = VAElossLowRess(weights=weights, device=device, weights_mask = weights_mask, reduction=params['loss_reduction'], loss_area=loss_region_indices, scale=reg_scale,
+                                                       kernel = params['low_ress_loss_kernel_size'], learned_decoder_variance = params['learned_decoder_variance'])
+                
+                
                 if params['combined_prediction']:
                     criterion_extent = nn.BCELoss()
 
@@ -532,17 +545,33 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
 
                         optimizer.zero_grad()
                         obs_mask = obs_mask.to(y).expand_as(y[0])
-                        generated_output, _, mu, log_var , cond_mu, cond_log_var = net(y, obs_mask, x, model_mask_, sample_size = params['training_sample_size'] )
+
+                        if params['learned_decoder_variance']:
+                            generated_output, output_logvar, _, mu, log_var , cond_mu, cond_log_var = net(y, obs_mask, x, model_mask_, sample_size = params['training_sample_size'] )
+                        else:
+                            generated_output, _, mu, log_var , cond_mu, cond_log_var = net(y, obs_mask, x, model_mask_, sample_size = params['training_sample_size'] )
+                            output_logvar = None
+
                         if params['combined_prediction']:
                             (y, y_extent) = (y[:,0].unsqueeze(1), y[:,1].unsqueeze(1))
                             (generated_output, generated_output_extent) = generated_output
                             loss_extent = criterion_extent(generated_output_extent, y_extent.unsqueeze(0).expand_as(generated_output_extent))
                             del generated_output_extent
-                        loss, MSE, KLD = criterion(generated_output, y.unsqueeze(0).expand_as(generated_output) ,mu, log_var, cond_mu = cond_mu, cond_log_var = cond_log_var ,beta = beta, mask = m, return_ind_loss=True , print_loss = True)
+                        
+                        loss, MSE, KLD = criterion(y.unsqueeze(0).expand_as(generated_output), generated_output, output_logvar ,mu, log_var, cond_mu = cond_mu, cond_log_var = cond_log_var ,beta = beta, mask = m, return_ind_loss=True , print_loss = True)
+                        
                         del generated_output
+                        if params['learned_decoder_variance']:
+                            del output_logvar
                         torch.cuda.empty_cache() 
+
                         if params['hybrid_weight'] is not None:
-                            generated_output_GCGN, _, _, _ , _, _ = net(y, obs_mask, x, model_mask_, sample_size = params['training_sample_size'], mode = 'GCGN' )   
+                            if params['learned_decoder_variance']:
+                                generated_output_GCGN, output_logvar_GCGN, _, _, _ , _, _ = net(y, obs_mask, x, model_mask_, sample_size = params['training_sample_size'], mode = 'GCGN' )   
+                            else:
+                                generated_output_GCGN, _, _, _ , _, _ = net(y, obs_mask, x, model_mask_, sample_size = params['training_sample_size'], mode = 'GCGN' )  
+                                output_logvar_GCGN = None
+
                             if params['combined_prediction']:
                                 (generated_output_GCGN, generated_output_GCGN_extent) = generated_output_GCGN
                                 loss_extent_GCGN = criterion_extent(generated_output_GCGN_extent, y_extent.unsqueeze(0).expand_as(generated_output_extent))
@@ -550,11 +579,14 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                                 del generated_output_GCGN_extent, y_extent
                                 torch.cuda.empty_cache() 
                             
-                            loss_GCGN = criterion(generated_output_GCGN, y.unsqueeze(0).expand_as(generated_output_GCGN) , mask = m , return_ind_loss=False , print_loss = False)
+                            loss_GCGN = criterion(y.unsqueeze(0).expand_as(generated_output_GCGN), generated_output_GCGN,output_logvar_GCGN , mask = m , return_ind_loss=False , print_loss = False)
                             print(f'GCGN : {loss_GCGN}')
                             loss = loss * params['hybrid_weight'] + ( 1- params['hybrid_weight']) * loss_GCGN
                             del generated_output_GCGN
+                            if params['learned_decoder_variance']:
+                                output_logvar_GCGN
                             torch.cuda.empty_cache() 
+
                         if params['combined_prediction']:
                             loss = loss + loss_extent
 
@@ -589,6 +621,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                     if params['version'] == 'IceExtent':   
                         criterion_test = nn.BCELoss( reduction='mean')
                     else:
+                        
                         criterion_test =  WeightedMSE(weights=weights_, device=device, hyperparam=1, reduction='mean', loss_area=loss_region_indices)
 
 
@@ -627,7 +660,11 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                                 test_obs = target.unsqueeze(0).to(device)
                                 m = None
                             del x, target
-                            _,deterministic_output, _, _, cond_mu, cond_log_var = net(test_obs, obs_mask, test_raw, model_mask_, sample_size = 1 )
+                            if params['learned_decoder_variance']:
+                                _, _, deterministic_output, _, _, cond_mu, cond_log_var = net(test_obs, obs_mask, test_raw, model_mask_, sample_size = 1 )
+                            else:
+                                _, deterministic_output, _, _, cond_mu, cond_log_var = net(test_obs, obs_mask, test_raw, model_mask_, sample_size = 1 )
+
                             basic_unet = net.unet(test_raw, model_mask_) if not net.loaded_unet else net.unet(test_raw, model_mask_[0,...])
                             cond_var = torch.exp(cond_log_var) + 1e-4
                             cond_std = torch.sqrt(cond_var)
@@ -636,6 +673,8 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                             # z = torch.unflatten(z , dim = -1, sizes = cond_std.shape[-3:])
                             out = net.generation(z) + basic_unet.squeeze() 
                             generated_output = net.last_conv(out)
+                            output_logvar = net.last_conv_var(out) if params['learned_decoder_variance'] else None
+
                             if params['combined_prediction']:
                                 generated_output_extent = net.last_conv2(out)
                                 (deterministic_output, deterministic_output_extent) = deterministic_output
@@ -644,12 +683,19 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                                 test_results_deterministic_extent[i,] = deterministic_output_extent.squeeze().to(torch.device('cpu')).numpy()
                             del z, out
                             torch.cuda.empty_cache() 
+
+                            if params['learned_decoder_variance']:
+                                epsilon = torch_normal_sampling(torch.zeros(generated_output.shape).to(generated_output), torch.sqrt(torch.exp(output_logvar) + 1e-4), num_samples=  1 ).to(device)[0]
+                                generated_output = generated_output + epsilon
+
                             if m is not None:
                                 m[m != 0] = 1
                             if params['version'] == 'IceExtent':
                                 loss = criterion_test(torch.mean(generated_output, 0).unsqueeze(0), test_obs)
                             else:
-                                loss = criterion_test(torch.mean(generated_output, 0), test_obs, mask = m)
+                                loss = criterion_test(test_obs, torch.mean(generated_output, 0).unsqueeze(0) , mask = m)
+
+
 
                             test_results[:,i,] = generated_output.squeeze().to(torch.device('cpu')).numpy()
                             test_results_deterministic[i,] = deterministic_output.squeeze().to(torch.device('cpu')).numpy()
@@ -779,6 +825,34 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
         # if lead_time is not None:
         #     xr.concat(yearly_results, dim = 'time').to_netcdf(path=Path(results_dir, f'nn_adjusted_lead_time_{lead_time}_{int(ds_raw_ensemble_mean.time[0])}-{int(ds_raw_ensemble_mean.time[-1])}_{run+1}.nc', mode='w'))
     
+def torch_normal_sampling( mu, std, num_samples = 1, truncated_dist = None, multivariate = False ):
+    from torch.distributions.multivariate_normal import MultivariateNormal
+
+    if truncated_dist is not None:
+        samples = []
+        while len(samples) < num_samples:
+            if multivariate:
+                sample =  MultivariateNormal(mu, covariance_matrix=std).rsample(sample_shape=(num_samples,))
+            else:
+                sample =  Normal(mu, std).rsample(sample_shape=(num_samples,))
+            # Keep only samples within the bounds
+ 
+            if isinstance(truncated_dist, np.ndarray):
+                truncated_dist = torch.from_numpy(truncated_dist)
+
+            sample_dists =  np.sqrt(((sample - sample.mean(axis = 0))**2).sum(-1))
+            sample = sample[sample_dists <= truncated_dist]
+
+            samples.append(sample)
+        # Concatenate all valid samples and return the required number
+        return torch.cat(samples)[:num_samples]
+    else:
+        if multivariate:
+                z =  MultivariateNormal(mu, covariance_matrix=std).rsample(sample_shape=(num_samples,))
+        else:
+                z =  Normal(mu, std).rsample(sample_shape=(num_samples,))
+        return z
+    
 
 if __name__ == "__main__":
 
@@ -790,15 +864,16 @@ if __name__ == "__main__":
 
     params = {
         "model": cVAE,
-        "path_to_deterministic" : '/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/NASA/UNet2/run_set_3_convnext/N5_M12_F12_v1_1x1_North_lr0.001_batch100_e50_LNone_bilinear_low_ress_loss16', 
+        "path_to_deterministic" : None, #'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/NASA/UNet2/run_set_3_convnext/N5_M12_F12_v1.1_1x1_North_lr0.001_batch100_e50_LNone_bilinear_low_ress_loss16', 
         "freeze_deterministic" : True,
+        "learned_decoder_variance" : True, 
         "time_features": ['month_sin','month_cos', 'imonth_sin', 'imonth_cos','land_mask'],
         "obs_clim" : False,
         "ensemble_features": False, ## PG
         'ensemble_list' : None, ## PG
         'ensemble_mode' : 'Mean',
-        "epochs": 50,
-        "batch_size": 5,
+        "epochs": 100,
+        "batch_size": 100,
         "reg_scale" : None,
         "beta" : 1,
         "optimizer": torch.optim.Adam,
@@ -809,7 +884,7 @@ if __name__ == "__main__":
         'active_grid' : False,
         'multi_ress_loss_kernel_size' : None,
         'low_ress_loss_kernel_size' : None,
-        'equal_weights' : False,
+        'equal_weights' : True,
         'masked_weights' : True,
         "decoder_kernel_size" : 1, ## only for (Reg)CNN
         "L2_reg": 0,
@@ -818,7 +893,7 @@ if __name__ == "__main__":
         'VAE_MLP_encoder' : True,
         'scale_factor_channels' : None,
         'BVAE' : 50,
-        'training_sample_size' : 100, 
+        'training_sample_size' : 1, 
         'loss_reduction' : 'mean' , # mean or sum
         'combined_prediction' : False,
         'hybrid_weight' :   None, ### CVAE weight
@@ -828,7 +903,7 @@ if __name__ == "__main__":
 
 
 
-    params['version'] =  'IceExtent'  ### 1 , 2 ,3 , 'IceExtent'
+    params['version'] =  1.1  ### 1 , 2 ,3 , 'IceExtent'
     params['forecast_range_months'] = 12
     params['beta'] =  0.1 #dict(start = 0, end =0.1, start_epoch = 1 , end_epoch = params['epochs'])  
 
@@ -850,6 +925,8 @@ if __name__ == "__main__":
         model_type = 'CVAE'
     if params['skip_VAE_added_dim']:
         model_type = 'skip-' + model_type
+    if params['learned_decoder_variance']:
+        model_type = model_type + '-DecoderVar'
 
     if lead_time is None:
         out_dir    = f'{out_dir_x}/N{n_years}_M{lead_months}_F{params["forecast_range_months"]}_v{params["version"]}_*_{beta_arg}_batch{params["batch_size"]}_e{params["epochs"]}_Cscale{params["scale_factor_channels"]}_{model_type}_{params["BVAE"]}-{params["training_sample_size"]}_LS{params["VAE_latent_size"]}'
@@ -868,7 +945,7 @@ if __name__ == "__main__":
         params['total_iters'] = params['epochs']
 
 
-    out_dir  = out_dir + f'_{params["subset_dims"]}_lr{params["lr"]}_batch{params["batch_size"]}_e{params["epochs"]}_L{params["reg_scale"]}_maskfeautures'
+    out_dir  = out_dir + f'_{params["subset_dims"]}_lr{params["lr"]}_batch{params["batch_size"]}_e{params["epochs"]}_L{params["reg_scale"]}_maskfeautures_equalweights'
 
     if params['subset_dims'] == 'Global':
         params['subset_dimensions'] = None
@@ -898,10 +975,13 @@ if __name__ == "__main__":
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     Path(out_dir + '/Figures').mkdir(parents=True, exist_ok=True)
     
-    run_training(params, n_years=n_years, lead_months=lead_months,lead_time = lead_time, NPSProj  = NPSProj, test_years = None, n_runs=n_runs, results_dir=out_dir, numpy_seed=1, torch_seed=1, save = True)
+    try:
+        run_training(params, n_years=n_years, lead_months=lead_months,lead_time = lead_time, NPSProj  = NPSProj, test_years = None, n_runs=n_runs, results_dir=out_dir, numpy_seed=1, torch_seed=1, save = True)
+        print(f'Output dir: {out_dir}')
+        print('Training done.')
 
-    print(f'Output dir: {out_dir}')
-    print('Training done.')
-
-
-
+    except Exception as e:
+        import shutil
+        shutil.rmtree(out_dir)
+        print("An error occurred:\n", e)
+        raise  # 
