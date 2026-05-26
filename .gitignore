@@ -191,6 +191,8 @@ run_training_CVAE_0127.py
 run_training_CVAE_0226*.py
 run_training_CVAE_0417*.py
 run_training_CVAE_0717*.py
+run_training_CVAE_0707*.py
+run_training_CVAE_0911*.py
 run_training_CVAE.py
 run_training_AE.py
 
