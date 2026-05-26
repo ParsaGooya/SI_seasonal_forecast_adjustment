@@ -10,8 +10,8 @@ The **deterministic bias adjustment** can be performed using:
 
 The **probabilistic bias adjustment** is based on the **4-way conditional generative model** from Sohn et al. (2015), implemented with **partial convolution ConvNeXt blocks**.
 
-Latest version is cVAE_1031 which includes the cVAE-CRPS model where the Gaussian decoder is replaced with a probabilstic generator. The training script is run_training_CVAE_1031.py and 
-predict_cVAE.py can be used for inference. The deterministic UNet-based initial guess can be trained using run_training_CNNs.py and inference can be made using predict.py. 
+Latest version is cVAE_1031 which includes the cVAE-CRPS model where the Gaussian decoder is replaced with a probabilstic generator. The training script is run_training_CVAE_1031_NOAA.py and 
+predict_cVAE.py can be used for inference. The deterministic UNet-based initial guess can be trained using run_training_CNNs_NOAA.py and inference can be made using predict.py. 
 
 **Note:** This repository is intended for internal script sharing and does not include final, cleaned versions of the codes and scripts.
 
