@@ -11,6 +11,21 @@ V0707 increases number of noise injections.  Also clips the deterministic initia
 V0717 adds validation and grad accumulation. Also clips the deterministic initial guess to (0,1). Makes the NPS proj model shallower. 
 Removes Relu before latent space and input convs. Only best model is saved in Checkpoints (DecoderSamplerV17) (see run_set_2_convnext)
 
-Run_set_4_convnext removes Relu bfore the first conv in UNet2. Also adds layernormalization before downsampling convolution.
+V0911 has three noise injection levels, removes the extra singleconvnext layer unless skip-conv is on. Removes double and singleconvnext noise injection into the skip module. Edits Up blocks for adding noise. (run_set_3_convnext)
+
+V1001 mainly injects noise in the mid_conv in Up blocks rather than ConvNext blocks and adds pad_ice in the last up block.(run_set_3_convnext)
+
+V1031 is a change in code to incorporate cyclical beta annealing and the addition of ensemble spread as a conditioning field. Also, the lr scheduler is now cosine in place of linear! (could run wuth cvae_1001.py in run_set_4_convnext)
+
+It also removes the cliping of the deterministic initial guess to (0,1) unless the UNet is pretrained and freeze deterministic is on. Finally, the low ress losses are used with stride 1. (runs with cvae_1031.py run_set_final_convnext)
+
+## UNet2
+
+Run_set_4_convnext in "UNet2" removes Relu bfore the first conv in UNet2. Also adds layernormalization before downsampling convolution.
 Only best model is saved in Checkpoints
+
+Run_set_5_convnext in "UNet2" can use ensmeble spread as input and uses cosine annealing for learning rate scheduler. 
+
+
+Nore that clamped option is not added to the 1031 version in parallel modes.
 

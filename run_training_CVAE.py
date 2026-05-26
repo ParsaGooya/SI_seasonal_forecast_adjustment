@@ -94,7 +94,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
 
         params['forecast_preprocessing_steps'] = []
         params['observations_preprocessing_steps'] = []
-        ds_in = xr.open_dataset('/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/NASA/Bias_Adjusted/bias_adjusted_North_1983-2020_1x1.nc')['SICN'].clip(0,1)
+        ds_in = xr.open_dataset('/space/hall7/sitestore/eccc/crd/cccma/users/rpg002/output/SI/Full/results/NASA/Bias_Adjusted/bias_adjusted_North_1983-2020_1x1.nc')['SICN'].clip(0,1)
         if ensemble_list is not None:
             raise RuntimeError('With version 3 you are reading the bias adjusted ensemble mean as input. Set ensemble_list to None to proceed.')
 
@@ -102,7 +102,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
 
         if ensemble_list is not None: ## PG: calculate the mean if ensemble mean is none
             print("Load forecasts")
-            ls = [xr.open_dataset(glob.glob(LOC_FORECASTS_SI + f'/*_initial_month_{intial_month}_*{crs}*.nc')[0])['SICN'] for intial_month in range(1,13) ]
+            ls = [xr.open_dataset(glob.glob(LOC_FORECASTS_SI + f'/*_initial_month_{intial_month}_{obs_ref}*{crs}*.nc')[0])['SICN'] for intial_month in range(1,13) ]
             ds_in = xr.concat(ls, dim = 'time').sortby('time').sel(ensembles = ensemble_list)
             if ensemble_mode == 'Mean': 
                 ds_in = ds_in.mean('ensembles') 
@@ -112,7 +112,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
 
         else:    ## Load specified members
             print("Load forecasts") 
-            ls = [xr.open_dataset(glob.glob(LOC_FORECASTS_SI + f'/*_initial_month_{intial_month}_*{crs}*.nc')[0])['SICN'].mean('ensembles').load() for intial_month in range(1,13) ]
+            ls = [xr.open_dataset(glob.glob(LOC_FORECASTS_SI + f'/*_initial_month_{intial_month}_{obs_ref}*{crs}*.nc')[0])['SICN'].mean('ensembles').load() for intial_month in range(1,13) ]
             ds_in = xr.concat(ls, dim = 'time').sortby('time')
         del ls
     gc.collect()
@@ -794,7 +794,7 @@ if __name__ == "__main__":
     obs_ref = 'NASA'
     NPSProj = True
     
-    out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_2_convnext'
+    out_dir_x  = f'/space/hall7/sitestore/eccc/crd/cccma/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_2_convnext'
     if type(params['beta']) == dict:
         beta_arg = 'Banealing'
     else:

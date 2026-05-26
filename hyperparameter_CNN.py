@@ -69,7 +69,7 @@ def HP_congif(params, obs_ref, lead_months, y_start, y_end, NPSProj = False):
 
         params['forecast_preprocessing_steps'] = []
         params['observations_preprocessing_steps'] = []
-        ds_in = xr.open_dataset('/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/NASA/Bias_Adjusted/global_mean_bias_adjusted_1983-2020.nc')['SICN']
+        ds_in = xr.open_dataset('/space/hall7/sitestore/eccc/crd/cccma/users/rpg002/output/SI/Full/results/NASA/Bias_Adjusted/global_mean_bias_adjusted_1983-2020.nc')['SICN']
         if params['ensemble_list'] is not None:
             raise RuntimeError('With version 3 you are reading the bias adjusted ensemble mean as input. Set ensemble_list to None to proceed.')
 
@@ -856,7 +856,7 @@ if __name__ == "__main__":
     hyperparameterspace = config_grid(config_dict).full_grid()
 
     ##################################################################  Adjust the path if necessary #############3##############################################
-    out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_3_convnext/Model_tunning/'
+    out_dir_x  = f'/space/hall7/sitestore/eccc/crd/cccma/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_3_convnext/Model_tunning/'
     if lead_time is None:
         out_dir = out_dir_x + f'NV{params["num_val_years"]}_M{lead_months}_{params["subset_dimensions"]}_v{params["version"]}'
     else:

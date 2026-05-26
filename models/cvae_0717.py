@@ -7,7 +7,7 @@ from timm.models.layers import trunc_normal_, DropPath
 class cVAE(nn.Module):
 	
     def __init__( self, VAE_latent_size, n_channels_x=1 ,  sigmoid = True, NPS_proj = False,scale_factor_channels = None, combined_prediction = False, VAE_MLP_encoder = False, LocallyConnected = False,
-                 skip_VAE_added_dim = False, saved_deterministic_model = None, freeze_deterministic = True, learn_decoder_variance = False, noise_injection_std = None, device = torch.device('cpu') ): # temporarily not input to check whether sending the net to device does automatically take care of this
+                 skip_VAE_added_dim = False, saved_deterministic_model = None, freeze_deterministic = True, learn_decoder_variance = False, noise_injection_std = None, noise_injection_level = 'medium', device = torch.device('cpu') ): # temporarily not input to check whether sending the net to device does automatically take care of this
         super().__init__()
         self.combined_prediction = combined_prediction
         self.VAE_MLP_encoder = VAE_MLP_encoder
@@ -48,7 +48,7 @@ class cVAE(nn.Module):
             self.prior = prior_recognition_NPS(n_channels_x + num_obs_channels, sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder, scale_factor_channels = scale_factor_channels)
             self.generation = generation_NPS(sigmoid = sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder, scale_factor_channels = scale_factor_channels, skip_VAE_added_dim = skip_VAE_added_dim, noise_injection_std = noise_injection_std, device = device)	
 		
-        if saved_deterministic_model:
+        if saved_deterministic_model is not None:
             self.last_conv = saved_deterministic_model.last_conv
             if freeze_deterministic:
                 for param in self.last_conv.parameters():
@@ -65,14 +65,14 @@ class cVAE(nn.Module):
                         for param in self.last_conv_var.parameters():
                             param.requires_grad = False    
                 except:
-                    self.last_conv_var = OutConv(16 , 1, sigmoid = False, NPS_proj = True, LocallyConnected = LocallyConnected)
+                    self.last_conv_var = OutConv(16 , 1, sigmoid = False, NPS_proj = NPS_proj, LocallyConnected = LocallyConnected)
                     print('Saved model does not have decoder variance learned')                 
         else:		
             self.last_conv = OutConv(16  , 1, sigmoid = sigmoid, NPS_proj= NPS_proj, LocallyConnected = LocallyConnected)
             if combined_prediction:
-                self.last_conv2 = OutConv(16 , 1, sigmoid = True, NPS_proj = True, LocallyConnected = LocallyConnected)
+                self.last_conv2 = OutConv(16 , 1, sigmoid = True, NPS_proj = NPS_proj, LocallyConnected = LocallyConnected)
             if learn_decoder_variance:
-                 self.last_conv_var = OutConv(16 , 1, sigmoid = False, NPS_proj = True, LocallyConnected = LocallyConnected)
+                 self.last_conv_var = OutConv(16 , 1, sigmoid = False, NPS_proj = NPS_proj, LocallyConnected = LocallyConnected)
                   
         self.N = torch.distributions.Normal(0, 1)
         # Get sampling working on GPU

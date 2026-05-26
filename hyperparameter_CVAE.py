@@ -54,7 +54,7 @@ def HP_congif(params, obs_ref, lead_months, y_start, y_end, NPSProj = False):
         print(' Warning!!! If you used Standardizer as a preprocessing step make sure to pass "VAE = True" as an argument to the initializer!!!')
         #####################################################################################################
 
-        ds_in = xr.open_dataset('/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/NASA/Bias_Adjusted/global_mean_bias_adjusted_1983-2020.nc')['SICN']
+        ds_in = xr.open_dataset('/space/hall7/sitestore/eccc/crd/cccma/users/rpg002/output/SI/Full/results/NASA/Bias_Adjusted/global_mean_bias_adjusted_1983-2020.nc')['SICN']
         if params['ensemble_list'] is not None:
             raise RuntimeError('With version 3 you are reading the bias adjusted ensemble mean as input. Set ensemble_list to None to proceed.')
 
@@ -866,7 +866,7 @@ if __name__ == "__main__":
 
     params = {
         "model": cVAE,
-        "path_to_deterministic" : None, #'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/NASA/UNet2/run_set_3_convnext/N5_M12_F12_v1.1_1x1_North_lr0.001_batch100_e50_LNone_bilinear_low_ress_loss16', 
+        "path_to_deterministic" : None, #'/space/hall7/sitestore/eccc/crd/cccma/users/rpg002/output/SI/Full/results/NASA/UNet2/run_set_3_convnext/N5_M12_F12_v1.1_1x1_North_lr0.001_batch100_e50_LNone_bilinear_low_ress_loss16', 
         "freeze_deterministic" : True,
         "learned_decoder_variance" : False, 
         "time_features": ['month_sin','month_cos', 'imonth_sin', 'imonth_cos', 'land_mask'],
@@ -927,7 +927,7 @@ if __name__ == "__main__":
     hyperparameterspace = config_grid(config_dict).full_grid()
 
     ##################################################################  Adjust the path if necessary #############3##############################################
-    out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_1_convnext/Model_tunning/'
+    out_dir_x  = f'/space/hall7/sitestore/eccc/crd/cccma/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_1_convnext/Model_tunning/'
     if params['hybrid_weight'] is not None:
         model_type = 'CGNhybrid'
     else:

@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 from torch.optim import lr_scheduler
 from torch.distributions.multivariate_normal import MultivariateNormal
 from losses import WeightedMSEKLD, WeightedMSE, BCElossKLD
-from preprocessing import align_data_and_targets, create_mask, pole_centric, reverse_pole_centric, segment, reverse_segment, pad_xarray, smoother
+from preprocessing import align_data_and_targets, create_mask, pole_centric, reverse_pole_centric, segment, reverse_segment, pad_xarray, smoother, load_model_data
 from preprocessing import AnomaliesScaler_v1_seasonal, AnomaliesScaler_v2_seasonal, Standardizer, Normalizer, PreprocessingPipeline, calculate_climatology, bias_adj, zeros_mask_gen
 from torch_datasets import XArrayDataset
 import torch.nn as nn
@@ -29,7 +29,15 @@ data_dir_forecast = LOC_FORECASTS_SI
 
 
 def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, model_dir,  test_years, NPSProj  = False,  model_year = None, ensemble_list = None, ensemble_mode = 'Mean', btstrp_it = 200, save=True):
-    if '-DecoderSamplerV17' in model_dir:
+    if 'DetRess' in model_dir:
+        from models.cvae_0911_DetRes import cVAE 
+    elif '-DecoderSamplerV31' in model_dir:
+        from models.cvae_1031 import cVAE  
+    elif '-DecoderSamplerV01' in model_dir:
+        from models.cvae_1001 import cVAE  
+    elif '-DecoderSamplerV11' in model_dir:
+        from models.cvae_0911 import cVAE  
+    elif '-DecoderSamplerV17' in model_dir:
         from models.cvae_0717 import cVAE  
     elif '-DecoderSamplerV07' in model_dir:
         from models.cvae_0707 import cVAE
@@ -37,10 +45,8 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
         from models.cvae_0417 import cVAE
     elif 'run_set_1_0127' in model_dir:
         from models.cvae_0127 import cVAE
-    # elif 'run_set_1' in model_dir:
-    #     from models.cvae_0717 import cVAE
     else:
-        from models.cvae_0717 import cVAE
+        from models.cvae_1001 import cVAE
 
     if 'Linear' in model_dir:
             params['VAE_MLP_encoder'] = True
@@ -51,11 +57,21 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
     else:
         model_year_ = model_year
 
-    
+    if 'btstrp' in model_dir:
+        params['target_ensemble_bootstrap'] = True
+    else:
+        params['target_ensemble_bootstrap'] = False
+
+    if 'clamped' in model_dir:
+        params['clamped'] = True
+    else:
+        params['clamped'] = False
+
     try:
         scale_factor_channels = params['scale_factor_channels']
     except:
         scale_factor_channels = None
+    
 
     params["obs_clim"] = False
     params['forecast_range_months'] = eval(model_dir.split('_F')[1].split('_')[0])
@@ -63,6 +79,10 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
         lead_time = eval(model_dir.split('_LT')[1].split('_')[0])
     else:
         lead_time = None
+    if '-OutConv2x2' in model_dir:
+        params['Final_kernel_2'] = True
+    else:
+        params['Final_kernel_2'] = False
     if 'combined' in model_dir:
         params['combined_prediction'] = True
     else:
@@ -73,7 +93,7 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
 
         params['forecast_preprocessing_steps'] = [
             ('anomalies', AnomaliesScaler_v1_seasonal())]
-        params['observations_preprocessing_steps'] = []
+        params['observations_preprocessing_steps'] = [('anomalies', AnomaliesScaler_v2_seasonal(VAE = True))]
         
     else:
         params['forecast_preprocessing_steps'] = []
@@ -105,6 +125,8 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
     else:
         params['output_sampling'] = None
 
+    if 'noise_injection_level' not in params['learn_decoder_sampler'].keys():
+            params['learn_decoder_sampler']['noise_injection_level'] = 'medium' 
     ############################################## load data ##################################
     ensemble_list = params['ensemble_list']
     time_features = params["time_features"]
@@ -129,38 +151,49 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
 
     print("Load forecasts")
     if params['version'] == 3:
-        ds_in = xr.open_dataset('/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/NASA/Bias_Adjusted/bias_adjusted_North_1983-2020_1x1.nc')['SICN']
+        ds_in = xr.open_dataset('/space/hall7/sitestore/eccc/crd/cccma/users/rpg002/output/SI/Full/results/NASA/Bias_Adjusted/bias_adjusted_North_1983-2020_1x1.nc')['SICN']
         #####################################################################################################
         ### if you used Standardizer make sure to pass VAE = True as an argument to the initializer below ###
         if params['version'] == 3:
             print(' Warning!!! If you used Standardizer as a preprocessing step make sure to pass "VAE = True" as an argument to the initializer!!!')
         #####################################################################################################
     else:
-        if ensemble_list is not None: ## PG: calculate the mean if ensemble mean is none
-            ds_in = fct.sel(ensembles = ensemble_list)['SICN']
-                
-        else:    ## Load specified members
-            ds_in = fct['SICN']
 
+        ds_in = fct
         if params['ensemble_mode'] == 'Mean': ##
-            ds_in = ds_in.mean('ensembles').load() ##
+            if 'ensemble_error' in params['time_features']:
+                ds_in_std = load_model_data(LOC_FORECASTS_SI, obs_ref, crs, ensemble_list, ensemble_mode = 'std')
+
         else:
-            ds_in = ds_in.load().transpose('time','lead_time','ensembles',...)
+            ds_in = ds_in.transpose('time','lead_time','ensembles',...)
             print('Warning: ensemble_mode is None. Predicting for large ensemble ...')
         
     ###### handle nan and inf over land ############
     if not NPSProj:
         ds_in = ds_in.where(ds_in<1000,np.nan) ### land is masked in model data with a large number
+        if 'ensemble_error' in params['time_features']:
+            ds_in_std = ds_in_std.where(ds_in_std<1000,np.nan)
     else:
-        mask_projection = (xr.open_dataset(data_dir_obs)['mask'].rename({'x':'lon','y':'lat'}))[...,:,64:-64]
-        observation = (observation.rename({'x':'lon','y':'lat'}))[...,:,64:-64]
-        ds_in = (ds_in.rename({'x':'lon','y':'lat'}))[...,:,64:-64]
+        # mask_projection = (xr.open_dataset(data_dir_obs)['mask'].rename({'x':'lon','y':'lat'}))[...,:,64:-64]
+        observation = (observation.rename({'x':'lon','y':'lat'}))
+        ds_in = (ds_in.rename({'x':'lon','y':'lat'}))
+        if 'ensemble_error' in params['time_features']:
+            ds_in_std = (ds_in_std.rename({'x':'lon','y':'lat'}))
+        if obs_ref == 'NASA':
+            observation = observation[...,:,64:-64]
+            ds_in = ds_in[...,:,64:-64]
+            if 'ensemble_error' in params['time_features']:
+               ds_in_std = ds_in_std[...,:,64:-64] 
+
+
     land_mask = observation.mean('time').where(np.isnan(observation.mean('time')),1).fillna(0)
     model_mask = ds_in.mean('time')[0].where(np.isnan(ds_in.mean('time')[0]),1).fillna(0).drop('lead_time')
     observation = observation.clip(0,1)
     ds_in = ds_in.clip(0,1)
     observation = observation.fillna(0)
     ds_in = ds_in.fillna(0)
+    if 'ensemble_error' in params['time_features']:
+        ds_in_std = ds_in_std.fillna(0)
     ############################################
     obs_in = observation.expand_dims('channels', axis=1)
 
@@ -168,18 +201,31 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
         ds_in = ds_in.expand_dims('channels', axis=3)
     else:
         ds_in = ds_in.expand_dims('channels', axis=2) 
+        if 'ensemble_error' in params['time_features']:
+            ds_in_std = ds_in_std.expand_dims('channels', axis=2)
+            ds_in = xr.concat([ds_in, ds_in_std], dim = 'channels')
+
+    ds_raw, obs_raw = align_data_and_targets(ds_in, obs_in, lead_months, target_ensemble_bootstrap = params['target_ensemble_bootstrap'])  
 
     min_year = np.min(test_years)*100
     max_year = (np.min(test_years) + 1 )*100 if len(test_years) <2 else (np.max(test_years) + 1)*100
-    ds_in_ = ds_in.where((ds_in.time >= min_year)&(ds_in.time <= max_year) , drop = True).isel(lead_time = np.arange(0,lead_months ))
-    obs_in_ = obs_in.where((obs_in.time >= min_year), drop = True)
-    
-    ds_raw, obs_raw = align_data_and_targets(ds_in.where(ds_in.time <= (model_year_)*100, drop = True), obs_in, lead_months)  # extract valid lead times and usable years ## used to be np.min(test_years)
-    ds_raw_, obs_raw_ = align_data_and_targets(ds_in_, obs_in_, lead_months)  # extract valid lead times and usable years ## used to be np.min(test_years)
-    if ds_raw_.time.max() < ds_in_.time.max():
-        print(f'test_years truncated at {ds_raw_.time.max().values} due to unavailability of corresponding observation beyond that.')
+    ds_raw_ = ds_raw.where((ds_raw.time >= min_year)&(ds_raw.time <= max_year) , drop = True).isel(lead_time = np.arange(0,lead_months ))
+    obs_raw_ = obs_raw.where((obs_raw.time >= min_year)&(ds_raw.time <= max_year) , drop = True).isel(lead_time = np.arange(0,lead_months ))
 
-    del ds_in, obs_in, obs_in_, ds_in_
+    ds_raw = ds_raw.where(ds_raw.time <= (model_year_)*100, drop = True)
+    obs_raw = obs_raw.where(ds_raw.time <= (model_year_)*100, drop = True)
+    # min_year = np.min(test_years)*100
+    # max_year = (np.min(test_years) + 1 )*100 if len(test_years) <2 else (np.max(test_years) + 1)*100
+    # ds_in_ = ds_in.where((ds_in.time >= min_year)&(ds_in.time <= max_year) , drop = True).isel(lead_time = np.arange(0,lead_months ))
+    # obs_in_ = obs_in.where((obs_in.time >= min_year), drop = True)
+    
+    # ds_raw, obs_raw = align_data_and_targets(ds_in.where(ds_in.time <= (model_year_)*100, drop = True), obs_in, lead_months)  # extract valid lead times and usable years ## used to be np.min(test_years)
+    # ds_raw_, obs_raw_ = align_data_and_targets(ds_in_, obs_in_, lead_months)  # extract valid lead times and usable years ## used to be np.min(test_years)
+    # if ds_raw_.time.max() < ds_in_.time.max():
+    #     print(f'test_years truncated at {ds_raw_.time.max().values} due to unavailability of corresponding observation beyond that.')
+
+    # del ds_in, obs_in, obs_in_, ds_in_
+    del ds_in, obs_in
     gc.collect()
 
     if not ds_raw.time.equals(obs_raw.time): 
@@ -319,8 +365,6 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
     ds = ds_pipeline.transform(ds_raw_ensemble_mean)
 
     obs_pipeline = PreprocessingPipeline(observations_preprocessing_steps).fit(obs_baseline, mask=preprocessing_mask_obs)
-    # if 'standardize' in ds_pipeline.steps:
-    #     obs_pipeline.add_fitted_preprocessor(ds_pipeline.get_preprocessors('standardize'), 'standardize')
     obs = obs_pipeline.transform(obs_raw.isel(channels = slice(0,1)))
 
     if params['combined_prediction']:
@@ -328,7 +372,7 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
 
     del ds_baseline, obs_baseline, preprocessing_mask_obs, preprocessing_mask_fct
     gc.collect()
-    if params['version']  in [3,1.1]:
+    if params['version']  in [3,2, 1.1]:
         sigmoid_activation = False
     else:
         sigmoid_activation = True
@@ -366,6 +410,8 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
             add_feature_dim = len(time_features)
     if 'land_mask' in time_features:
         add_feature_dim -= 1
+    if 'ensemble_error' in time_features:
+        add_feature_dim -= 1
 
     ########################################### load the model ######################################
     try:
@@ -380,7 +426,7 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
     if params['learn_decoder_residual']:
             from models.cvae_0226 import cVAE_res
             CVAE = cVAE(VAE_latent_size = params['VAE_latent_size'], n_channels_x= n_channels_x+ add_feature_dim , sigmoid = sigmoid_activation, NPS_proj = NPSProj, device=device, combined_prediction = params['combined_prediction'], VAE_MLP_encoder = params['VAE_MLP_encoder'],
-                        scale_factor_channels = params['scale_factor_channels'], skip_VAE_added_dim = params['skip_VAE_added_dim'], learn_decoder_variance = learn_decoder_variance)
+                         scale_factor_channels = params['scale_factor_channels'], skip_VAE_added_dim = params['skip_VAE_added_dim'], learn_decoder_variance = learn_decoder_variance)
             try:
                 CVAE.load_state_dict(torch.load(glob.glob(params['path_to_saved_CVAE']+ f'/*-{model_year_}*.pth')[0], map_location=torch.device('cpu'))) 
             except:
@@ -405,6 +451,10 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
                 LocallyConnected_saved = params_saved['LocallyConnected']
             except:
                 LocallyConnected_saved = False
+            try:
+                Final_kernel_2_saved = params_saved['Final_kernel_2']
+            except:
+                Final_kernel_2_saved = False  
             assert NPSProj_saved == NPSProj, 'The saved deterministic model cannot have a trained for a different projection than your cVAE!'
             version_saved = eval(params['path_to_deterministic'].split('/')[-1].split('_')[3][1:]) if 'VAL' not in params['path_to_deterministic'] else eval(params['path_to_deterministic'].split('/')[-1].split('_')[4][1:])
             if params['version'] == 'IceExtent':
@@ -415,7 +465,6 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
             assert params['time_features'] == params_saved['time_features'], 'The saved deterministic model must have the same input as your cVAE for the model data and added features!'
             assert params_saved['combined_prediction'] == params['combined_prediction'], 'The saved deterministic model must have the same output type as your cVAE'
             assert LocallyConnected == LocallyConnected_saved, 'The saved deterministic model must have the same output layer as your cVAE'
-
             from models.unetconvnext import UNet2,UNet2_NPS
             model = eval(params_saved['model'])
             unet = model(n_channels_x= n_channels_x+ add_feature_dim , bilinear = params_saved['bilinear'], sigmoid = sigmoid_activation, skip_conv = params_saved['skip_conv'], combined_prediction = params_saved['combined_prediction'], LocallyConnected = LocallyConnected_saved)
@@ -428,9 +477,15 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
    
         else:
             unet = None
+        
+        if 'DetRess' in model_dir:
+            net = cVAE(VAE_latent_size = params['VAE_latent_size'], n_channels_x= n_channels_x+ add_feature_dim , sigmoid = sigmoid_activation, NPS_proj = NPSProj, VAE_MLP_encoder = params['VAE_MLP_encoder'],
+                            scale_factor_channels = params['scale_factor_channels'], skip_VAE_added_dim = params['skip_VAE_added_dim'], saved_deterministic_model = unet,  clamped = params['clamped'],
+                              learn_decoder_variance = params['learn_decoder_variance']['status'], noise_injection_std = params['learn_decoder_sampler']['noise_std'], noise_injection_level = params['learn_decoder_sampler']['noise_injection_level'], LocallyConnected= LocallyConnected, device=device)   #temporarily not input to check whether sending the net to device does automatically take care of this
 
-        net = cVAE(VAE_latent_size = params['VAE_latent_size'], n_channels_x= n_channels_x+ add_feature_dim , sigmoid = sigmoid_activation, NPS_proj = NPSProj, device=device, combined_prediction = params['combined_prediction'],scale_factor_channels = scale_factor_channels,
-                    VAE_MLP_encoder = params['VAE_MLP_encoder'], skip_VAE_added_dim = params['skip_VAE_added_dim'], saved_deterministic_model = unet, learn_decoder_variance = learn_decoder_variance, noise_injection_std = params['learn_decoder_sampler']['noise_std'], LocallyConnected=LocallyConnected )
+        else:
+            net = cVAE(VAE_latent_size = params['VAE_latent_size'], n_channels_x= n_channels_x+ add_feature_dim , sigmoid = sigmoid_activation, NPS_proj = NPSProj, device=device, combined_prediction = params['combined_prediction'],scale_factor_channels = scale_factor_channels,
+                    clamped = params['clamped'], VAE_MLP_encoder = params['VAE_MLP_encoder'], skip_VAE_added_dim = params['skip_VAE_added_dim'], saved_deterministic_model = unet, learn_decoder_variance = learn_decoder_variance, noise_injection_std = params['learn_decoder_sampler']['noise_std'], noise_injection_level = params['learn_decoder_sampler']['noise_injection_level'], LocallyConnected=LocallyConnected )
 
 
     print('Loading model ....')
@@ -592,19 +647,22 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
             obs_mask = obs_mask.expand_as(test_obs[0])
 
             if params['learn_decoder_sampler']['status']:
-                _, deterministic_output, _, _, cond_mu, cond_log_var = net(test_obs, obs_mask, test_raw, model_mask_, sample_size = 1, inject_noise = True )
+                _, deterministic_output, mu, log_var, cond_mu, cond_log_var = net(test_obs, obs_mask, test_raw, model_mask_, sample_size = 1, inject_noise = True )
             elif any([learn_decoder_variance, params['learn_decoder_residual']]):
-                _, _, deterministic_output, _, _, cond_mu, cond_log_var = net(test_obs, obs_mask, test_raw, model_mask_, sample_size = 1 )
+                _, _, deterministic_output, mu, log_var, cond_mu, cond_log_var = net(test_obs, obs_mask, test_raw, model_mask_, sample_size = 1 )
             else:
-                _,deterministic_output, _, _, cond_mu, cond_log_var = net(test_obs, obs_mask, test_raw, model_mask_, sample_size = 1 )
+                _,deterministic_output, mu, log_var, cond_mu, cond_log_var = net(test_obs, obs_mask, test_raw, model_mask_, sample_size = 1 )
 
-            if not params['save_deterministic'] :
-                del deterministic_output
-
-            basic_unet = net.unet(test_raw, model_mask_) if not net.loaded_unet else net.unet(test_raw, model_mask_[0,...])
-            cond_var = torch.exp(cond_log_var) + 1e-4
-            cond_std = torch.sqrt(cond_var)
-            z =  Normal(cond_mu, cond_std * n_stds).rsample(sample_shape=(params['BVAE'],)).squeeze().to(device)
+            # if not params['save_deterministic'] :
+            #     del deterministic_output
+            if 'DetRess' not in model_dir:
+                basic_unet = net.unet(test_raw, model_mask_) if not net.loaded_unet else net.unet(test_raw, model_mask_[0,...])
+            if all([cond_log_var is not None, cond_mu is not None]):
+                cond_var = torch.exp(cond_log_var) + 1e-4
+                cond_std = torch.sqrt(cond_var)
+                z =  Normal(cond_mu, cond_std * n_stds).rsample(sample_shape=(params['BVAE'],)).squeeze().to(device)  ### should squeeze be there? REMOVED
+            else:
+                z = Normal(torch.zeros_like(mu), torch.ones_like(log_var) * n_stds).rsample(sample_shape=(params['BVAE'],)).squeeze().to(device)  ### should squeeze be there? REMOVED
             if lead_time is None:
                 z = torch.flatten(z, start_dim = 0, end_dim = 1)
             if params['learn_decoder_sampler']['status']:
@@ -612,11 +670,21 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
             else:
                 out = net.generation(z)
             del z
-            out = torch.unflatten(out, dim = 0, sizes = (params['BVAE'],cond_var.shape[0]))
-            out = out + basic_unet.squeeze() 
-            out = torch.flatten(out, start_dim = 0, end_dim = 1)     
-            generated_output = net.last_conv(out)
-            output_logvar = net.last_conv_var(out) if learn_decoder_variance else None
+
+            if 'DetRess' in model_dir:
+                generated_output = torch.unflatten(net.last_conv(out), dim = 0, sizes = (params['BVAE'],log_var.shape[0]))
+                generated_output = generated_output + deterministic_output 
+                generated_output = torch.flatten(generated_output, start_dim = 0, end_dim = 1)  
+
+            else:
+                out = torch.unflatten(out, dim = 0, sizes = (params['BVAE'],log_var.shape[0]))
+                out = out + basic_unet.squeeze() 
+                out = torch.flatten(out, start_dim = 0, end_dim = 1)     
+                generated_output = net.last_conv(out)
+                output_logvar = net.last_conv_var(out) if learn_decoder_variance else None
+
+            if params['clamped']:
+                generated_output = torch.clamp(generated_output, 0, 1)
 
             if params['learn_decoder_residual']:
 
@@ -656,10 +724,14 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
                 epsilon = torch.zeros(generated_output.shape).to(device)
 
             
-            generated_output = torch.unflatten(generated_output + epsilon, dim = 0, sizes = (params['BVAE'],cond_var.shape[0]))
+            generated_output = torch.unflatten(generated_output + epsilon, dim = 0, sizes = (params['BVAE'],log_var.shape[0]))
             test_results[:,time_id * len(lead_times) : (time_id+1) * len(lead_times),] = generated_output.squeeze(-3).to(torch.device('cpu')).numpy()
             if params['save_deterministic'] :
+                if params['combined_prediction']:
+                    (deterministic_output, deterministic_output_extent) = deterministic_output
                 test_results_deterministic[time_id * len(lead_times) : (time_id+1) * len(lead_times),] = deterministic_output.to(torch.device('cpu')).numpy()
+            else:
+                del deterministic_output
                
             if params['combined_prediction']:
                     generated_output_extent = net.last_conv2(out)
@@ -668,7 +740,7 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
                     except:
                         pass
                     (test_obs, test_obs_extent) = (test_obs[:,0].unsqueeze(1), test_obs[:,1].unsqueeze(1))
-                    generated_output_extent = torch.unflatten(generated_output_extent, dim = 0, sizes = (params['BVAE'],cond_var.shape[0]))
+                    generated_output_extent = torch.unflatten(generated_output_extent, dim = 0, sizes = (params['BVAE'],log_var.shape[0]))
                     test_results_extent[:,time_id * len(lead_times) : (time_id+1) * len(lead_times),] = generated_output_extent.squeeze().to(torch.device('cpu')).numpy()
                     if params['save_deterministic'] :
                         test_results_deterministic_extent[time_id * len(lead_times) : (time_id+1) * len(lead_times),] = deterministic_output_extent.squeeze().to(torch.device('cpu')).numpy()
@@ -784,12 +856,12 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
 
 
     if np.min(test_years) != np.max(test_years):
-        result.to_netcdf(path=Path(model_dir, f'saved_model_nn_adjusted_ENS_{np.min(test_years)}-{np.max(test_years)}_nstds{n_stds}_output_sampling_{params["output_sampling"]}.nc', mode='w'))
+        result.to_netcdf(path=Path(model_dir, f'saved_model_nn_adjusted_ENS_{np.min(test_years)}-{np.max(test_years)}_nstds{n_stds}_output_sampling_{params["output_sampling"]}_N{params["BVAE"]}.nc', mode='w'))
         if params['save_deterministic'] :
             result_deterministic.to_netcdf(path=Path(model_dir, f'saved_model_nn_adjusted_deterministic_{np.min(test_years)}-{np.max(test_years)}.nc', mode='w'))
 
     else:
-        result.to_netcdf(path=Path(model_dir, f'saved_model_nn_adjusted_ENS_{np.min(test_years)}_nstds{n_stds}_output_sampling_{params["output_sampling"]}.nc', mode='w'))
+        result.to_netcdf(path=Path(model_dir, f'saved_model_nn_adjusted_ENS_{np.min(test_years)}_nstds{n_stds}_output_sampling_{params["output_sampling"]}_N{params["BVAE"]}.nc', mode='w'))
         if params['save_deterministic'] :
             result_deterministic.to_netcdf(path=Path(model_dir, f'saved_model_nn_adjusted_deterministic_{np.min(test_years)}.nc', mode='w'))
 
@@ -855,8 +927,8 @@ if __name__ == "__main__":
 
     ############################################## Set_up ############################################
 
-    out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/NASA/cVAE/run_set_2_convnext'
-    out_dir    = f'{out_dir_x}/N2_M12_VAL3_F12_v1.1_*_B0.1_CscaleNone_CVAE_50_LS1000_Linear_1x1_lr_scheduler_North_lr0.0001_batch100x1_e50_equalweights' 
+    out_dir_x  = f'/space/hall7/sitestore/eccc/crd/cccma/users/rpg002/output/SI/Full/results/NOAA/cVAE/run_set_final_convnext_interp'
+    out_dir    = f'{out_dir_x}/N2_M12_VAL3_F12_v1.1_*_Banealing_CscaleNone_CVAE-DecoderSamplerV31-10-full_50_LS1000_Linear_NPSproj_cosine_lr_scheduler_North_lr1e-05_batch2x2_e50_equalweights_multi_ress_loss2_pretrainedUNETnotforzen' 
 
 
     params = extract_params(out_dir)
@@ -874,9 +946,9 @@ if __name__ == "__main__":
 
     lead_months = 12
     bootstrap = False
-    test_years = np.arange(2017,2021)
-    n_stds = 1.2
-    params['BVAE'] = 100
+    test_years = np.arange(2019,2024)
+    n_stds = 1
+    params['BVAE'] = 200
     params['save_deterministic'] = False
     params['output_sampling'] = None  # None, Gaussian_noise,  conditional_normal_based_train_sampling, conditional_multinormal_based_train_sampling
 
@@ -891,16 +963,19 @@ if __name__ == "__main__":
 
 
     if obs_ref == 'NASA':
-        data_dir_obs = glob.glob(LOC_OBSERVATIONS_SI+ f'/NASA*{crs}*.nc')[0] 
+        data_dir_obs = glob.glob(LOC_OBSERVATIONS_SI+ f'/NASA/*{crs}*.nc')[0] 
+    elif obs_ref == 'NOAA':
+        assert crs == 'NPS'
+        data_dir_obs = glob.glob(LOC_OBSERVATIONS_SI+ f'/NOAA/*{crs}*.nc')[0] 
     else:
         data_dir_obs = glob.glob(LOC_OBSERVATIONS_SI+ '/uws*.nc')[0]
+
+
     
     observation = xr.open_dataset(data_dir_obs)['SICN']
-    ls = [xr.open_dataset(glob.glob(LOC_FORECASTS_SI + f'/*_initial_month_{intial_month}_*{crs}*.nc')[0]) for intial_month in range(1,13) ]
-    fct = xr.concat(ls, dim = 'time').sortby('time')
-
-    del ls
-    gc.collect()
+    fct = load_model_data(LOC_FORECASTS_SI, obs_ref = obs_ref, crs = crs, ensemble_list = params['ensemble_list'], ensemble_mode = params['ensemble_mode'], var = 'SICN')
+    # ls = [xr.open_dataset(glob.glob(LOC_FORECASTS_SI + f'/{obs_ref}/*_initial_month_{intial_month}_{obs_ref}*{crs}*.nc')[0]) for intial_month in range(1,13) ]
+    # fct = xr.concat(ls, dim = 'time').sortby('time')
     ##################################################################################################
     # for i in range(1,13):
     # out_dir    = f'{out_dir_x}/N4_M12_F12_v1_Banealing_batch10_e50_cVAE_50-1_LS50_NPSproj_North_lr0.001_batch10_e50_LNone'  

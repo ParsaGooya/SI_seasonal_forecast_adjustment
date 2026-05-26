@@ -85,7 +85,7 @@ class WeightedMSELowRess:
         self.max_threshold = max_threshold
         self.loss_area = loss_area
         self.device = device
-        assert np.mod(kernel,2) == 0, 'choose even kernel size'
+        # assert np.mod(kernel,2) == 0, 'choose even kernel size'
         self.kernel = kernel
 
         if self.loss_area is not None:
@@ -101,13 +101,15 @@ class WeightedMSELowRess:
             if weights_mask is not None:
                 weights_mask = torch.from_numpy(weights_mask).to(device)
                 krn = torch.ones(1, 1, self.kernel, self.kernel).to(weights_mask)
-                weights_mask = F.conv2d(weights_mask.unsqueeze(0).unsqueeze(0), krn, bias=None, stride=self.kernel//2 )[0,0]
+                # weights_mask = F.conv2d(weights_mask.unsqueeze(0).unsqueeze(0), krn, bias=None, stride=self.kernel//2 )[0,0] ## changed V31
+                weights_mask = F.conv2d(weights_mask.unsqueeze(0).unsqueeze(0), krn, bias=None, stride=1 )[0,0] ## changed V31
                 weights_mask = torch.clamp(weights_mask, 0, 1)
                 del krn
 
             self.weights = torch.from_numpy(weights).to(device) 
         
-        self.weights = F.avg_pool2d(self.weights.unsqueeze(0).unsqueeze(0), kernel_size=self.kernel, stride=self.kernel//2)[0,0]
+        # self.weights = F.avg_pool2d(self.weights.unsqueeze(0).unsqueeze(0), kernel_size=self.kernel, stride=self.kernel//2)[0,0]  ## changed V31
+        self.weights = F.avg_pool2d(self.weights.unsqueeze(0).unsqueeze(0), kernel_size=self.kernel, stride=1)[0,0]  ## changed V31
         if weights_mask is not None:
             self.weights = self.weights* weights_mask
 
@@ -134,12 +136,14 @@ class WeightedMSELowRess:
             y = target
 
         if mask is not None:
-            weight= self.weights * F.avg_pool2d(mask, kernel_size=4, stride=2)
+            weight= self.weights * F.avg_pool2d(mask, kernel_size=self.kernel, stride=1)
         else:
             weight= self.weights
 
-        y_lowress =  F.avg_pool2d(torch.flatten(y, start_dim = 0, end_dim = 1), kernel_size=self.kernel, stride=self.kernel//2)
-        y_hat_lowress =  F.avg_pool2d(torch.flatten(y_hat, start_dim = 0, end_dim = 1), kernel_size=self.kernel, stride=self.kernel//2)
+        # y_lowress =  F.avg_pool2d(torch.flatten(y, start_dim = 0, end_dim = 1), kernel_size=self.kernel, stride=self.kernel//2)  ## changed V31
+        # y_hat_lowress =  F.avg_pool2d(torch.flatten(y_hat, start_dim = 0, end_dim = 1), kernel_size=self.kernel, stride=self.kernel//2)  ## changed V31
+        y_lowress =  F.avg_pool2d(torch.flatten(y, start_dim = 0, end_dim = 1), kernel_size=self.kernel, stride=1)  ## changed V31
+        y_hat_lowress =  F.avg_pool2d(torch.flatten(y_hat, start_dim = 0, end_dim = 1), kernel_size=self.kernel, stride=1)  ## changed V31
 
         m = torch.ones_like(y_lowress)
         m[(y_lowress < self.min_threshold) & (y_hat_lowress >= 0)] *= self.hyperparam
@@ -206,7 +210,69 @@ class WeightedCRPS:
         return loss
 ##adapted from https://github.com/climagination/ClimatExML/blob/stochastic/ClimatExML/losses.py - https://docs.pyro.ai/en/stable/_modules/pyro/ops/stats.html#crps_empirical
     
+class WeightedCRPSLowRess:
 
+    def __init__(self, weights, device, weights_mask = None,  reduction='mean' , loss_area = None, kernel = 4):
+        self.reduction = reduction
+        self.device = device
+        # assert np.mod(kernel,2) == 0, 'choose even kernel size'
+        self.kernel = kernel
+
+        if weights_mask is not None:
+            weights_mask = torch.from_numpy(weights_mask).to(device)
+            krn = torch.ones(1, 1, self.kernel, self.kernel).to(weights_mask)
+            # weights_mask = F.conv2d(weights_mask.unsqueeze(0).unsqueeze(0), krn, bias=None, stride=self.kernel//2 )[0,0] ## changed V31
+            weights_mask = F.conv2d(weights_mask.unsqueeze(0).unsqueeze(0), krn, bias=None, stride=1 )[0,0] ## changed V31
+            weights_mask = torch.clamp(weights_mask, 0, 1)
+            del krn
+        self.weights = torch.from_numpy(weights).to(device)
+        # self.weights = F.avg_pool2d(self.weights.unsqueeze(0).unsqueeze(0), kernel_size=self.kernel, stride=self.kernel//2)[0,0] ## changed V31
+        self.weights = F.avg_pool2d(self.weights.unsqueeze(0).unsqueeze(0), kernel_size=self.kernel, stride=1)[0,0] ## changed V31
+        if weights_mask is not None:
+            self.weights = self.weights * weights_mask
+
+    def __call__(self, truth, pred ,data_logvar = None,  mask = None, print_loss = False):
+
+        assert data_logvar == None
+
+        if mask is not None:
+            weight = self.weights * mask
+        else:
+            weight = self.weights
+    
+        # truth_lowress =  F.avg_pool2d(torch.flatten(truth, start_dim = 0, end_dim = 1), kernel_size=self.kernel, stride=self.kernel//2) ## changed V31
+        # pred_lowress =  F.avg_pool2d(torch.flatten(pred, start_dim = 1, end_dim = 2), kernel_size=self.kernel, stride=self.kernel//2) ## changed V31
+        truth_lowress =  F.avg_pool2d(torch.flatten(truth, start_dim = 0, end_dim = 1), kernel_size=self.kernel, stride=1) ## changed V31
+        pred_lowress =  F.avg_pool2d(torch.flatten(pred, start_dim = 1, end_dim = 2), kernel_size=self.kernel, stride=1) ## changed V31
+
+        if pred_lowress.shape[1:] != (1,) * (pred_lowress.dim() - truth.dim() - 1) + truth_lowress.shape:
+            raise ValueError(
+                "Expected pred to have one extra sample dim on left. "
+                "Actual shapes: {} versus {}".format(pred_lowress.shape, truth_lowress.shape)
+            )
+        opts = dict(device=pred_lowress.device, dtype=pred_lowress.dtype)
+        num_samples = pred_lowress.size(0)
+        if num_samples == 1:
+            return (pred_lowress[0] - truth_lowress).abs()
+
+        pred_lowress = pred_lowress.sort(dim=0).values
+        diff = pred_lowress[1:] - pred_lowress[:-1]
+        weight_crps = torch.arange(1, num_samples, **opts) * torch.arange(
+            num_samples - 1, 0, -1, **opts
+        )
+        weight_crps = weight_crps.reshape(weight_crps.shape + (1,) * (diff.dim() - 1))
+        loss = (pred_lowress - truth_lowress).abs().mean(0) - (diff * weight_crps).sum(0) / num_samples**2
+
+        if self.reduction == 'mean':
+            loss = (loss * weight).sum() / (torch.ones_like(loss) * weight).sum()
+        elif self.reduction == 'sum':
+            loss = torch.sum(loss * weight, dim = (-1,-2)).mean()
+
+        if print_loss:
+            print(f'CRPS : {loss}')
+
+        return loss
+##adapted from https://github.com/climagination/ClimatExML/blob/stochastic/ClimatExML/losses.py - https://docs.pyro.ai/en/stable/_modules/pyro/ops/stats.html#crps_empirical
 
 class Weightedloglikelihood:
 
@@ -282,7 +348,7 @@ class WeightedloglikelihoodLowRess:
         self.reduction = reduction
         self.loss_area = loss_area
         self.device = device
-        assert np.mod(kernel,2) == 0, 'choose even kernel size'
+        # assert np.mod(kernel,2) == 0, 'choose even kernel size'
         self.kernel = kernel
 
         if self.loss_area is not None:
@@ -298,13 +364,15 @@ class WeightedloglikelihoodLowRess:
             if weights_mask is not None:
                 weights_mask = torch.from_numpy(weights_mask).to(device)
                 krn = torch.ones(1, 1, self.kernel, self.kernel).to(weights_mask)
-                weights_mask = F.conv2d(weights_mask.unsqueeze(0).unsqueeze(0), krn, bias=None, stride=self.kernel//2 )[0,0]
+                # weights_mask = F.conv2d(weights_mask.unsqueeze(0).unsqueeze(0), krn, bias=None, stride=self.kernel//2 )[0,0]  ## changed V31
+                weights_mask = F.conv2d(weights_mask.unsqueeze(0).unsqueeze(0), krn, bias=None, stride=1 )[0,0]  ## changed V31
                 weights_mask = torch.clamp(weights_mask, 0, 1)
                 del krn
 
             self.weights = torch.from_numpy(weights).to(device) 
         
-        self.weights = F.avg_pool2d(self.weights.unsqueeze(0).unsqueeze(0), kernel_size=self.kernel, stride=self.kernel//2)[0,0]
+        # self.weights = F.avg_pool2d(self.weights.unsqueeze(0).unsqueeze(0), kernel_size=self.kernel, stride=self.kernel//2)[0,0]  ## changed V31
+        self.weights = F.avg_pool2d(self.weights.unsqueeze(0).unsqueeze(0), kernel_size=self.kernel, stride=1)[0,0]  ## changed V31
         if weights_mask is not None:
             self.weights = self.weights* weights_mask
 
@@ -329,13 +397,16 @@ class WeightedloglikelihoodLowRess:
             y = target
 
         if mask is not None:
-            weight= self.weights * F.avg_pool2d(mask, kernel_size=4, stride=2)
+            weight= self.weights * F.avg_pool2d(mask, kernel_size=self.kernel, stride=1)## changed V31
         else:
             weight= self.weights
 
-        y_lowress =  F.avg_pool2d(torch.flatten(y, start_dim = 0, end_dim = 1), kernel_size=self.kernel, stride=self.kernel//2)
-        y_hat_lowress =  F.avg_pool2d(torch.flatten(y_hat, start_dim = 0, end_dim = 1), kernel_size=self.kernel, stride=self.kernel//2)
-        data_var_lowress = F.avg_pool2d(torch.flatten((torch.exp(data_logvar) + 1e-4 ), start_dim = 0, end_dim = 1), kernel_size=self.kernel, stride=self.kernel//2)
+        # y_lowress =  F.avg_pool2d(torch.flatten(y, start_dim = 0, end_dim = 1), kernel_size=self.kernel, stride=self.kernel//2)  ## changed V31
+        # y_hat_lowress =  F.avg_pool2d(torch.flatten(y_hat, start_dim = 0, end_dim = 1), kernel_size=self.kernel, stride=self.kernel//2)  ## changed V31
+        # data_var_lowress = F.avg_pool2d(torch.flatten((torch.exp(data_logvar) + 1e-4 ), start_dim = 0, end_dim = 1), kernel_size=self.kernel, stride=self.kernel//2)  ## changed V31
+        y_lowress =  F.avg_pool2d(torch.flatten(y, start_dim = 0, end_dim = 1), kernel_size=self.kernel, stride=1)  ## changed V31
+        y_hat_lowress =  F.avg_pool2d(torch.flatten(y_hat, start_dim = 0, end_dim = 1), kernel_size=self.kernel, stride=1)  ## changed V31
+        data_var_lowress = F.avg_pool2d(torch.flatten((torch.exp(data_logvar) + 1e-4 ), start_dim = 0, end_dim = 1), kernel_size=self.kernel, stride=1)  ## changed V31
 
         loss = (0.5 * (y_hat_lowress - y_lowress)**2 / data_var_lowress ) + 0.5 * torch.log(data_var_lowress) + 0.5 * np.log(2 * np.pi)
 
@@ -374,6 +445,8 @@ class VAEloss:  ## PG: penalizing negative anomalies
         if multi_ress_loss_kernel_size is not None:
             if learn_decoder_variance:
                 self.mse_lr = WeightedloglikelihoodLowRess(weights=weights, device=device, weights_mask = weights_mask,reduction=reduction, loss_area=loss_area, kernel = multi_ress_loss_kernel_size)
+            elif decoder_inject_noise:
+                self.mse_lr = WeightedCRPSLowRess(weights=weights, device=device, weights_mask = weights_mask, reduction=reduction, loss_area=loss_area, kernel = multi_ress_loss_kernel_size)
             else:
                 self.mse_lr = WeightedMSELowRess(weights=weights, device=device, weights_mask = weights_mask, hyperparam=hyperparam, reduction=reduction, loss_area=loss_area, kernel = multi_ress_loss_kernel_size)
 
@@ -429,12 +502,16 @@ class VAEloss:  ## PG: penalizing negative anomalies
             return loss
         
 class VAElossLowRess:  ## PG: penalizing negative anomalies
-    def __init__(self, weights, device, weights_mask = None, hyperparam=1.0, min_threshold=0, max_threshold=0, reduction='mean', loss_area=None, exclude_zeros=True, min_val=0, max_val=None, kernel = 4, learn_decoder_variance = False):
+    def __init__(self, weights, device, weights_mask = None, hyperparam=1.0, min_threshold=0, max_threshold=0, reduction='mean', loss_area=None, exclude_zeros=True, min_val=0, max_val=None, kernel = 4, learn_decoder_variance = False, decoder_inject_noise = False):
         self.reduction = reduction
         self.device = device
         self.learn_decoder_variance = learn_decoder_variance
+        self.decoder_inject_noise = decoder_inject_noise
+        
         if learn_decoder_variance:
             self.mse = WeightedloglikelihoodLowRess(weights=weights, device=device, weights_mask = weights_mask, reduction=reduction, loss_area=loss_area, kernel = kernel)
+        elif decoder_inject_noise:
+            self.mse = WeightedCRPSLowRess(weights=weights, device=device, weights_mask = weights_mask, reduction=reduction, loss_area=loss_area, kernel = kernel)       
         else:
             self.mse = WeightedMSELowRess(weights=weights, device=device, weights_mask = weights_mask, hyperparam=hyperparam, reduction=reduction, loss_area=loss_area, kernel = kernel)
 
@@ -446,6 +523,8 @@ class VAElossLowRess:  ## PG: penalizing negative anomalies
         if print_loss:
             if self.learn_decoder_variance:
                 print(f'LLH : {loss}')
+            elif self.decoder_inject_noise:
+                print(f'CRPS : {loss}')
             else:
                 print(f'MSE : {loss}')
 

@@ -52,7 +52,7 @@
 
 #         params['forecast_preprocessing_steps'] = []
 #         params['observations_preprocessing_steps'] = []
-#         ds_in = xr.open_dataset('/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/NASA/Bias_Adjusted/global_mean_bias_adjusted_1983-2020.nc')['SICN']
+#         ds_in = xr.open_dataset('/space/hall7/sitestore/eccc/crd/cccma/users/rpg002/output/SI/Full/results/NASA/Bias_Adjusted/global_mean_bias_adjusted_1983-2020.nc')['SICN']
 
 #     else:
 #         if params['ensemble_list'] is not None: ## PG: calculate the mean if ensemble mean is none
@@ -597,7 +597,7 @@
 
 #     ##################################################################  Adjust the path if necessary #############3##############################################
 
-#     out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_1/Model_tunning/arch{params["arch"]}/batch_reg_tunning_adj_lr_{params["subset_dimensions"]}_v{params["version"]}_2'
+#     out_dir_x  = f'/space/hall7/sitestore/eccc/crd/cccma/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_1/Model_tunning/arch{params["arch"]}/batch_reg_tunning_adj_lr_{params["subset_dimensions"]}_v{params["version"]}_2'
 
 #     if params['lr_scheduler']:
 #         out_dir_x = out_dir_x + '_lr_scheduler'

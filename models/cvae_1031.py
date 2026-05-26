@@ -3,26 +3,31 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.modules.utils import _pair
 from models.partialconv2d import PartialConv2d
-
+from timm.models.layers import trunc_normal_, DropPath
 class cVAE(nn.Module):
 	
-    def __init__( self, VAE_latent_size, n_channels_x=1 ,  sigmoid = True, NPS_proj = False,scale_factor_channels = None, combined_prediction = False, VAE_MLP_encoder = False,
-                 skip_VAE_added_dim = False, saved_deterministic_model = None, freeze_deterministic = True, learn_decoder_variance = False, noise_injection_std = None, device = torch.device('cpu') ): # temporarily not input to check whether sending the net to device does automatically take care of this
+    def __init__( self, VAE_latent_size, n_channels_x=1 ,  sigmoid = True, NPS_proj = False,scale_factor_channels = None, combined_prediction = False, VAE_MLP_encoder = False, LocallyConnected = False, Final_kernel_2 = False,  clamped  =False,
+                 skip_VAE_added_dim = False, saved_deterministic_model = None, freeze_deterministic = True, learn_decoder_variance = False, noise_injection_std = None, noise_injection_level = 'medium', device = torch.device('cpu') ): # temporarily not input to check whether sending the net to device does automatically take care of this
         super().__init__()
         self.combined_prediction = combined_prediction
         self.VAE_MLP_encoder = VAE_MLP_encoder
         self.n_channels_x = n_channels_x
         self.loaded_unet = True if saved_deterministic_model is not None else False
+        self.freeze_deterministic = freeze_deterministic
         self.learn_decoder_variance = learn_decoder_variance
         self.noise_injection_std = noise_injection_std
+        self.noise_injection_level = noise_injection_level
         self.device = device
+        self.clamped = clamped
+
+        assert noise_injection_level.lower() in ['full', 'medium', 'low']
 
         if self.combined_prediction:
              num_obs_channels = 2
         else:
              num_obs_channels = 1
 
-
+        
         if not NPS_proj:
             if saved_deterministic_model is None:
                 self.unet = prediction(n_channels_x, sigmoid, scale_factor_channels = scale_factor_channels )
@@ -34,7 +39,7 @@ class cVAE(nn.Module):
 
             self.recognition = prior_recognition(n_channels_x + num_obs_channels, sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder, scale_factor_channels = scale_factor_channels)
             self.prior = prior_recognition(n_channels_x + num_obs_channels, sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder, scale_factor_channels = scale_factor_channels)
-            self.generation = generation(sigmoid = sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder, scale_factor_channels = scale_factor_channels, skip_VAE_added_dim = skip_VAE_added_dim, noise_injection_std = noise_injection_std, device=device)
+            self.generation = generation(sigmoid = sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder, scale_factor_channels = scale_factor_channels, skip_VAE_added_dim = skip_VAE_added_dim, noise_injection_std = noise_injection_std,noise_injection_level = noise_injection_level, device=device)
         else:
             if saved_deterministic_model is None:
                 self.unet = prediction_NPS(n_channels_x, sigmoid, scale_factor_channels = scale_factor_channels)
@@ -46,7 +51,7 @@ class cVAE(nn.Module):
 
             self.recognition = prior_recognition_NPS(n_channels_x + num_obs_channels, sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder, scale_factor_channels = scale_factor_channels)
             self.prior = prior_recognition_NPS(n_channels_x + num_obs_channels, sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder, scale_factor_channels = scale_factor_channels)
-            self.generation = generation_NPS(sigmoid = sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder, scale_factor_channels = scale_factor_channels, skip_VAE_added_dim = skip_VAE_added_dim, noise_injection_std = noise_injection_std, device = device)	
+            self.generation = generation_NPS(sigmoid = sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder, scale_factor_channels = scale_factor_channels, skip_VAE_added_dim = skip_VAE_added_dim, noise_injection_std = noise_injection_std,noise_injection_level = noise_injection_level, device = device)	
 		
         if saved_deterministic_model is not None:
             self.last_conv = saved_deterministic_model.last_conv
@@ -65,14 +70,14 @@ class cVAE(nn.Module):
                         for param in self.last_conv_var.parameters():
                             param.requires_grad = False    
                 except:
-                    self.last_conv_var = OutConv(16 , 1, sigmoid = False, NPS_proj = True)
+                    self.last_conv_var = OutConv(16 , 1, sigmoid = False, NPS_proj = NPS_proj, LocallyConnected = LocallyConnected, Final_kernel_2 = Final_kernel_2)
                     print('Saved model does not have decoder variance learned')                 
-        else:		
-            self.last_conv = OutConv(16  , 1, sigmoid = sigmoid, NPS_proj= NPS_proj)
+        else:
+            self.last_conv = OutConv(16  , 1, sigmoid = sigmoid, NPS_proj= NPS_proj, LocallyConnected = LocallyConnected, Final_kernel_2 = Final_kernel_2)
             if combined_prediction:
-                self.last_conv2 = OutConv(16 , 1, sigmoid = True, NPS_proj = True)
+                self.last_conv2 = OutConv(16 , 1, sigmoid = True, NPS_proj = NPS_proj, LocallyConnected = LocallyConnected, Final_kernel_2 = Final_kernel_2)
             if learn_decoder_variance:
-                 self.last_conv_var = OutConv(16 , 1, sigmoid = False, NPS_proj = True)
+                 self.last_conv_var = OutConv(16 , 1, sigmoid = False, NPS_proj = NPS_proj, LocallyConnected = LocallyConnected, Final_kernel_2 = Final_kernel_2)
                   
         self.N = torch.distributions.Normal(0, 1)
         # Get sampling working on GPU
@@ -87,13 +92,18 @@ class cVAE(nn.Module):
     #         if self.noise_injection_std is not None:
     #             self.generation.to_device(device)
             
-    def forward(self, obs, obs_mask, model, model_mask, sample_size = 1, seed = None, nstd = 1, inject_noise = False,  mode = 'CVAE'):
+    def forward(self, obs, obs_mask, model, model_mask, sample_size = 1, seed = None, nstd = 1, inject_noise = False,  mode = 'train'):
             
         basic_unet = self.unet(model, model_mask) if not self.loaded_unet else self.unet(model, model_mask[0,...])
-        deterministic_output = self.last_conv(basic_unet)
-        if self.loaded_unet:
-            with torch.no_grad(): 
-                deterministic_output = deterministic_output.clip(0,1) ### PG V0717
+        
+        if all([self.loaded_unet, self.freeze_deterministic]):
+                with torch.no_grad(): 
+                    deterministic_output = self.last_conv(basic_unet)
+                    deterministic_output =  torch.clamp(deterministic_output, 0, 1)
+        else:
+            deterministic_output = self.last_conv(basic_unet)
+            if self.clamped:
+                deterministic_output = torch.clamp(deterministic_output, 0, 1)
 
         if self.combined_prediction:
             with torch.no_grad(): 
@@ -110,7 +120,7 @@ class cVAE(nn.Module):
         if self.combined_prediction:
             deterministic_output = (deterministic_output[...,0,:,:], deterministic_output[...,1,:,:])
 
-        if mode == 'CVAE':
+        if mode == 'train':
             z = self.sample( mu, log_var, 1, seed, nstd = nstd)
         elif mode == 'GCGN':
             z = self.sample( cond_mu, cond_log_var, 1, seed, nstd = nstd)
@@ -132,6 +142,8 @@ class cVAE(nn.Module):
 
         generated_output = self.last_conv(out)
         generated_output = torch.unflatten(generated_output, dim = 0 , sizes = out_shape[0:2])
+        if self.clamped:
+            generated_output = torch.clamp(generated_output, 0, 1)
 
         if self.learn_decoder_variance:
             output_log_variance = self.last_conv_var(out)
@@ -170,16 +182,199 @@ class cVAE(nn.Module):
     
 
 
+class VAE(nn.Module):
+	
+    def __init__( self, VAE_latent_size, n_channels_x=1 ,  sigmoid = True, NPS_proj = False,scale_factor_channels = None, combined_prediction = False, VAE_MLP_encoder = False, LocallyConnected = False, Final_kernel_2 = False, clamped  =False,
+                 skip_VAE_added_dim = False, saved_deterministic_model = None, freeze_deterministic = True, learn_decoder_variance = False, noise_injection_std = None, noise_injection_level = 'medium', device = torch.device('cpu') ): # temporarily not input to check whether sending the net to device does automatically take care of this
+        super().__init__()
+        self.combined_prediction = combined_prediction
+        self.VAE_MLP_encoder = VAE_MLP_encoder
+        self.n_channels_x = n_channels_x
+        self.loaded_unet = True if saved_deterministic_model is not None else False
+        self.freeze_deterministic = freeze_deterministic
+        self.learn_decoder_variance = learn_decoder_variance
+        self.noise_injection_std = noise_injection_std
+        self.noise_injection_level = noise_injection_level
+        self.device = device
+        self.clamped = clamped
+        assert noise_injection_level.lower() in ['full', 'medium', 'low']
+
+        if self.combined_prediction:
+             num_obs_channels = 2
+        else:
+             num_obs_channels = 1
+
+
+        if not NPS_proj:
+            if saved_deterministic_model is None:
+                self.unet = prediction(n_channels_x, sigmoid, scale_factor_channels = scale_factor_channels )
+            else:
+                self.unet = Trimed_unet(saved_deterministic_model)
+                if freeze_deterministic:
+                    for param in self.unet.parameters():
+                        param.requires_grad = False
+
+            self.recognition = prior_recognition(n_channels_x + num_obs_channels, sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder, scale_factor_channels = scale_factor_channels)
+            self.generation = generation(sigmoid = sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder, scale_factor_channels = scale_factor_channels, skip_VAE_added_dim = skip_VAE_added_dim, noise_injection_std = noise_injection_std,noise_injection_level = noise_injection_level, device=device)
+        else:
+            if saved_deterministic_model is None:
+                self.unet = prediction_NPS(n_channels_x, sigmoid, scale_factor_channels = scale_factor_channels)
+            else:
+                self.unet = Trimed_unet_NPS(saved_deterministic_model)
+                if freeze_deterministic:
+                    for param in self.unet.parameters():
+                        param.requires_grad = False
+
+            self.recognition = prior_recognition_NPS(n_channels_x + num_obs_channels, sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder, scale_factor_channels = scale_factor_channels)
+            self.generation = generation_NPS(sigmoid = sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder, scale_factor_channels = scale_factor_channels, skip_VAE_added_dim = skip_VAE_added_dim, noise_injection_std = noise_injection_std,noise_injection_level = noise_injection_level, device = device)	
+		
+        if saved_deterministic_model is not None:
+            self.last_conv = saved_deterministic_model.last_conv
+            if freeze_deterministic:
+                for param in self.last_conv.parameters():
+                        param.requires_grad = False
+            if combined_prediction:
+                self.last_conv2 = saved_deterministic_model.last_conv2
+                if freeze_deterministic:
+                    for param in self.last_conv2.parameters():
+                        param.requires_grad = False
+            if learn_decoder_variance:
+                try:
+                    self.last_conv_var = saved_deterministic_model.last_conv_var
+                    if freeze_deterministic:
+                        for param in self.last_conv_var.parameters():
+                            param.requires_grad = False    
+                except:
+                    self.last_conv_var = OutConv(16 , 1, sigmoid = False, NPS_proj = NPS_proj, LocallyConnected = LocallyConnected, Final_kernel_2 = Final_kernel_2)
+                    print('Saved model does not have decoder variance learned')                 
+        else:
+            self.last_conv = OutConv(16  , 1, sigmoid = sigmoid, NPS_proj= NPS_proj, LocallyConnected = LocallyConnected, Final_kernel_2 = Final_kernel_2)
+            if combined_prediction:
+                self.last_conv2 = OutConv(16 , 1, sigmoid = True, NPS_proj = NPS_proj, LocallyConnected = LocallyConnected, Final_kernel_2 = Final_kernel_2)
+            if learn_decoder_variance:
+                 self.last_conv_var = OutConv(16 , 1, sigmoid = False, NPS_proj = NPS_proj, LocallyConnected = LocallyConnected, Final_kernel_2 = Final_kernel_2)
+                  
+        self.N = torch.distributions.Normal(0, 1)
+        # Get sampling working on GPU
+        self.N.loc = self.N.loc.to(device)
+        self.N.scale = self.N.scale.to(device)
+
+
+    # def to_device(self, device):
+    #         self.device = device
+    #         self.N.loc = self.N.loc.cuda()
+    #         self.N.scale = self.N.scale.cuda() 
+    #         if self.noise_injection_std is not None:
+    #             self.generation.to_device(device)
+            
+    def forward(self, obs, obs_mask, model, model_mask, sample_size = 1, seed = None, nstd = 1, inject_noise = False,  mode = 'train'):
+            
+        basic_unet = self.unet(model, model_mask) if not self.loaded_unet else self.unet(model, model_mask[0,...])
+        
+        if all([self.loaded_unet, self.freeze_deterministic]):
+                with torch.no_grad(): 
+                    deterministic_output = self.last_conv(basic_unet)
+                    deterministic_output = torch.clamp(deterministic_output, 0, 1)
+        else:
+            deterministic_output = self.last_conv(basic_unet)
+            if self.clamped:
+                deterministic_output = torch.clamp(deterministic_output, 0, 1)
+        
+        if self.combined_prediction:
+            with torch.no_grad(): 
+                    deterministic_output_extent = self.last_conv2(basic_unet)
+                    deterministic_output_extent = (deterministic_output_extent >= 0.5).float() ### PG V0717
+            deterministic_output = torch.cat([deterministic_output, deterministic_output_extent], dim = -3) 
+
+        mask_recognition = torch.cat([obs_mask, model_mask], dim = 0)
+        mu, log_var = self.recognition(obs, cond = model, mask = mask_recognition)
+        
+
+        if self.combined_prediction:
+            deterministic_output = (deterministic_output[...,0,:,:], deterministic_output[...,1,:,:])
+
+        if mode == 'train':
+            z = self.sample( mu, log_var, 1, seed, nstd = nstd)
+        elif mode == 'GCGN':
+            if nstd != 1:
+                N = torch.distributions.Normal(0, nstd)
+                N.loc = N.loc.to(self.device)
+                N.scale = N.scale.to(self.device)
+                z =  N.sample((1,*mu.shape))
+            else:
+                z =  self.N.sample((1,*mu.shape))
+    
+        if inject_noise:
+            z = z.expand(sample_size, *z.shape[1:])
+
+        out_shape = z.shape
+        z = torch.flatten(z, start_dim = 0, end_dim = 1)
+
+        out = self.generation(z, inject_noise = inject_noise)
+        del z
+
+        out =  torch.unflatten(out, dim = 0 , sizes = out_shape[0:2])  
+        out = out + basic_unet.unsqueeze(0).expand_as(out)
+        del basic_unet
+        out = torch.flatten(out, start_dim = 0, end_dim = 1)
+
+
+        generated_output = self.last_conv(out)
+        generated_output = torch.unflatten(generated_output, dim = 0 , sizes = out_shape[0:2])
+        if self.clamped:
+            generated_output = torch.clamp(generated_output, 0, 1)
+
+        if self.learn_decoder_variance:
+            output_log_variance = self.last_conv_var(out)
+            output_log_variance = torch.unflatten(output_log_variance, dim = 0 , sizes = out_shape[0:2])
+
+        if self.combined_prediction:
+            generated_output_extent = self.last_conv2(out)
+            generated_output_extent = torch.unflatten(generated_output_extent, dim = 0 , sizes = out_shape[0:2])
+            generated_output = (generated_output, generated_output_extent)
+        
+        cond_mu = cond_log_var = None
+
+        del out
+        if self.learn_decoder_variance:
+            return generated_output, output_log_variance, deterministic_output, mu, log_var , cond_mu, cond_log_var
+        else:
+            return generated_output, deterministic_output, mu, log_var , cond_mu, cond_log_var
+
+    def sample( self, mu, log_var, sample_size = 1, seed = None, nstd = 1):
+        if seed is not None:
+            current_rng_state = torch.random.get_rng_state()
+            torch.manual_seed(seed)
+        var = torch.exp(log_var) + 1e-4
+
+        if nstd !=1:
+            N = torch.distributions.Normal(0, nstd)
+        # Get sampling working on GPU
+            N.loc = N.loc.to(self.device)
+            N.scale = N.scale.to(self.device)
+            out = mu + torch.sqrt(var)*N.sample((sample_size,*mu.shape))
+        else:
+            out = mu + torch.sqrt(var)*self.N.sample((sample_size,*mu.shape))
+        
+        if seed is not None:
+            torch.random.set_rng_state(current_rng_state)
+        
+        return out
+    
+
 
 class generation(nn.Module):
 		
-    def __init__( self, VAE_latent_size,  sigmoid = True, VAE_MLP_encoder = False, scale_factor_channels = 4, skip_VAE_added_dim = False , noise_injection_std = None, device = torch.device('cpu') ):
+    def __init__( self, VAE_latent_size,  sigmoid = True, VAE_MLP_encoder = False, scale_factor_channels = 4, skip_VAE_added_dim = False , noise_injection_std = None, noise_injection_level = 'medium', device = torch.device('cpu') ):
         
         super().__init__()
         self.VAE_MLP_encoder = VAE_MLP_encoder
         self.added_dim  = 0
+        self.added_dim_skip_conv = 0
         self.decoder_noise_injection = False
         self.skip_VAE_added_dim = skip_VAE_added_dim
+        self.noise_injection_level = noise_injection_level
+        self.convnext_noise_injection = False
 
         if VAE_MLP_encoder:
             self.combine = nn.Linear(VAE_latent_size, 256 * 6*11)
@@ -192,9 +387,15 @@ class generation(nn.Module):
             self.N = torch.distributions.Normal(0, noise_injection_std)
             self.N.loc = self.N.loc.to(device)
             self.N.scale = self.N.scale.to(device)
-            self.added_dim  += 1
+            if skip_VAE_added_dim:
+                self.added_dim_skip_conv += 1
+            if self.noise_injection_level.lower() in ['full']:
+                self.convnext_noise_injection = True
+
         else:
+            self.decoder_noise_injection = False
             self.N = None
+
         if skip_VAE_added_dim :
             self.skip1 = nn.Linear(VAE_latent_size, 1 * 12*22)
             self.skip2 = nn.Linear(VAE_latent_size, 1 *25*45)
@@ -202,16 +403,29 @@ class generation(nn.Module):
             self.skip4 = nn.Linear(VAE_latent_size, 1 *100 * 180)
 
             self.added_dim  += 1
+            self.added_dim_skip_conv += 1
         
-        if self.added_dim > 0:
-            self.skip4conv =  SingleConvNext(16 + self.added_dim, 16,  multi_channel=False, return_mask=False) 
+        if self.added_dim_skip_conv > 0:
+            if self.convnext_noise_injection :
+                self.skip4conv =  SingleConvNext(16 + self.added_dim_skip_conv, 16,  multi_channel=False, return_mask=False, noise_dist = self.N) 
+            else:
+                self.skip4conv =  SingleConvNext(16 + self.added_dim_skip_conv, 16,  multi_channel=False, return_mask=False, noise_dist = None) 
 
 
-        self.up1 = Up(256 , 128, scale_factor_channels = scale_factor_channels, noise_dist = self.N)
-        self.up2 = Up(128 + self.added_dim , 64, scale_factor_channels = scale_factor_channels, noise_dist = self.N)
-        self.up3 = Up(64 + self.added_dim , 32, scale_factor_channels = scale_factor_channels, noise_dist = self.N)
-        self.up4 = Up(32 + self.added_dim , 16, scale_factor_channels = scale_factor_channels, noise_dist = self.N)
-    
+
+        if self.noise_injection_level.lower() in ['full', 'medium']:
+             noise_dist = self.N
+        else:
+             noise_dist = None
+        self.up1 = Up(256 , 128, scale_factor_channels = scale_factor_channels, noise_dist = noise_dist, convnext_noise_injection = self.convnext_noise_injection)
+        self.up2 = Up(128 + self.added_dim , 64, scale_factor_channels = scale_factor_channels, noise_dist = noise_dist, convnext_noise_injection = self.convnext_noise_injection)
+        self.up3 = Up(64 + self.added_dim , 32, scale_factor_channels = scale_factor_channels, noise_dist = noise_dist, convnext_noise_injection = self.convnext_noise_injection)
+        if self.decoder_noise_injection:
+            # self.up3 = Up(64 + self.added_dim , 32, scale_factor_channels = scale_factor_channels, noise_dist = self.N, convnext_noise_injection = self.convnext_noise_injection)
+            self.up4 = Up(32 + self.added_dim , 16, scale_factor_channels = scale_factor_channels, noise_dist = self.N, convnext_noise_injection = self.convnext_noise_injection, pad_sphere = True)
+        else:
+            # self.up3 = Up(64 + self.added_dim , 32, scale_factor_channels = scale_factor_channels, noise_dist = None)
+            self.up4 = Up(32 + self.added_dim , 16, scale_factor_channels = scale_factor_channels, noise_dist = None, pad_sphere = True)
 
     def forward(self, z, inject_noise = False):
         # Upsampling
@@ -220,34 +434,32 @@ class generation(nn.Module):
             x = torch.unflatten(x, dim = 1, sizes = (256,6,11))
 
         x = self.up1(x)  # (batch, 128, 12, 22)
+
         if self.skip_VAE_added_dim:
             z_ = self.skip1(z)
             z_ = torch.unflatten(z_, dim = 1, sizes = (1,12,22))
             x = torch.cat([x,z_], dim = 1)
-        if all([inject_noise, self.decoder_noise_injection]):
-            N = self.N.sample((x.shape[0],1,12,22 ))
-            x = torch.cat([x,N], dim = 1)
+        # if all([inject_noise, self.decoder_noise_injection, self.noise_injection_level.lower() in ['full']]):
+        #     N = self.N.sample((x.shape[0],1,12,22 ))
+        #     x = torch.cat([x,N], dim = 1)
 
         x = self.up2(x, pad = (0,1,0,1))  # (batch, 64, 25, 45)
+
         if self.skip_VAE_added_dim:
             z_ = self.skip2(z)
             z_ = torch.unflatten(z_, dim = 1, sizes = (1,25,45))
             x = torch.cat([x,z_], dim = 1)
-        if all([inject_noise, self.decoder_noise_injection]):
-            N = self.N.sample((x.shape[0],1,25,45))
-            x = torch.cat([x,N], dim = 1)
 
         x = self.up3(x)  # (batch, 32, 50, 90)
+
         if self.skip_VAE_added_dim:
             z_ = self.skip3(z)
             z_ = torch.unflatten(z_, dim = 1, sizes = (1,50,90))
             x = torch.cat([x,z_], dim = 1)
-        if all([inject_noise, self.decoder_noise_injection]):
-            N = self.N.sample((x.shape[0],1,50,90 ))
-            x = torch.cat([x,N], dim = 1)
                         
         x = self.up4(x)  # (batch, 16, 100, 180)      
-        if self.added_dim >0:
+
+        if self.added_dim_skip_conv > 0:
             if self.skip_VAE_added_dim:
                 z_ = self.skip4(z)
                 z_ = torch.unflatten(z_, dim = 1, sizes = (1,100,180))
@@ -261,13 +473,16 @@ class generation(nn.Module):
 	
 class generation_NPS(nn.Module):
 		
-    def __init__( self, VAE_latent_size,   sigmoid = True, VAE_MLP_encoder = False , scale_factor_channels = 4 , skip_VAE_added_dim = False, noise_injection_std = None, device = torch.device('cpu')  ):
+    def __init__( self, VAE_latent_size,   sigmoid = True, VAE_MLP_encoder = False , scale_factor_channels = 4 , skip_VAE_added_dim = False, noise_injection_std = None, noise_injection_level = 'medium', device = torch.device('cpu')  ):
 
         super().__init__()
         self.VAE_MLP_encoder = VAE_MLP_encoder
         self.added_dim = 0
+        self.added_dim_skip_conv = 0
         self.decoder_noise_injection = False
         self.skip_VAE_added_dim = skip_VAE_added_dim
+        self.noise_injection_level = noise_injection_level
+        self.convnext_noise_injection = False
 
         if VAE_MLP_encoder:
             # self.combine = nn.Linear(VAE_latent_size, 512 * 13*9)  ### deeper model
@@ -279,11 +494,17 @@ class generation_NPS(nn.Module):
 
         if noise_injection_std is not None:
             self.decoder_noise_injection = True
+            
             self.N = torch.distributions.Normal(0, noise_injection_std)
             self.N.loc = self.N.loc.to(device)
             self.N.scale = self.N.scale.to(device)
-            self.added_dim  += 1
+            if skip_VAE_added_dim:
+                self.added_dim_skip_conv  += 1
+            if self.noise_injection_level.lower() == 'full':
+                self.convnext_noise_injection = True
+
         else:
+            self.decoder_noise_injection = False
             self.N = None
 
         if skip_VAE_added_dim :
@@ -294,16 +515,31 @@ class generation_NPS(nn.Module):
             self.skip5 = nn.Linear(VAE_latent_size, 1 *432 * 304)
 
             self.added_dim  += 1
+            self.added_dim_skip_conv += 1
         
-        if self.added_dim > 0:
-            self.skip5conv =   SingleConvNext(16 + self.added_dim, 16,  multi_channel=False, return_mask=False) 
+        if self.added_dim_skip_conv > 0:
+            if  self.convnext_noise_injection :
+                self.skip5conv =   SingleConvNext(16 + self.added_dim_skip_conv, 16,  multi_channel=False, return_mask=False, noise_dist = self.N) 
+            else:
+                self.skip5conv =   SingleConvNext(16 + self.added_dim_skip_conv, 16,  multi_channel=False, return_mask=False, noise_dist = None) 
 
-                            
+
+        if self.noise_injection_level.lower() in ['full', 'medium']:
+             noise_dist = self.N
+        else:
+             noise_dist = None       
+                                 
         # self.up1 = Up(512, 256, scale_factor_channels = scale_factor_channels, noise_dist = self.N) ### deeper model
-        self.up2 = Up(256 , 128, scale_factor_channels = scale_factor_channels, noise_dist = self.N)
-        self.up3 = Up(128+ self.added_dim , 64, scale_factor_channels = scale_factor_channels, noise_dist = self.N)
-        self.up4 = Up(64+ self.added_dim , 32, scale_factor_channels = scale_factor_channels, noise_dist = self.N)
-        self.up5 = Up(32+ self.added_dim , 16, scale_factor_channels = scale_factor_channels, noise_dist = self.N)
+        self.up2 = Up(256 , 128, scale_factor_channels = scale_factor_channels, noise_dist = noise_dist, convnext_noise_injection = self.convnext_noise_injection)
+        self.up3 = Up(128+ self.added_dim , 64, scale_factor_channels = scale_factor_channels, noise_dist = noise_dist, convnext_noise_injection = self.convnext_noise_injection)
+        self.up4 = Up(64+ self.added_dim , 32, scale_factor_channels = scale_factor_channels, noise_dist = noise_dist, convnext_noise_injection = self.convnext_noise_injection)
+
+        if self.decoder_noise_injection:
+            # self.up4 = Up(64+ self.added_dim , 32, scale_factor_channels = scale_factor_channels, noise_dist = self.N, convnext_noise_injection = self.convnext_noise_injection)
+            self.up5 = Up(32+ self.added_dim , 16, scale_factor_channels = scale_factor_channels, noise_dist = self.N, convnext_noise_injection = self.convnext_noise_injection)
+        else:
+            # self.up4 = Up(64+ self.added_dim , 32, scale_factor_channels = scale_factor_channels, noise_dist = None)
+            self.up5 = Up(32+ self.added_dim , 16, scale_factor_channels = scale_factor_channels, noise_dist = None)
 
     def forward(self, z, inject_noise = False):
         x = self.combine(z)
@@ -322,34 +558,32 @@ class generation_NPS(nn.Module):
         #     x = torch.cat([x,N], dim = 1)
         #######################################################
         x = self.up2(x)  # (batch, 128, 54, 38)
+
         if self.skip_VAE_added_dim:
             z_ = self.skip2(z)
             z_ = torch.unflatten(z_, dim = 1, sizes = (1,54,38))
             x = torch.cat([x,z_], dim = 1)
-        if all([inject_noise, self.decoder_noise_injection]):
-            N = self.N.sample((x.shape[0],1,54,38 ))
-            x = torch.cat([x,N], dim = 1)
+        # if all([inject_noise, self.decoder_noise_injection, self.noise_injection_level.lower() in ['full']]):
+        #     N = self.N.sample((x.shape[0],1,54,38 ))
+        #     x = torch.cat([x,N], dim = 1)
 
         x = self.up3(x)  # (batch, 64, 108, 76)
+
         if self.skip_VAE_added_dim:
             z_ = self.skip3(z)
             z_ = torch.unflatten(z_, dim = 1, sizes = (1,108,76))
             x = torch.cat([x,z_], dim = 1)
-        if all([inject_noise, self.decoder_noise_injection]):
-            N = self.N.sample((x.shape[0],1,108,76 ))
-            x = torch.cat([x,N], dim = 1)
 
         x = self.up4(x)  # (batch, 32, 216, 152)
+
         if self.skip_VAE_added_dim:
             z_ = self.skip4(z)
             z_ = torch.unflatten(z_, dim = 1, sizes = (1,216,152))
             x = torch.cat([x,z_], dim = 1)
-        if all([inject_noise, self.decoder_noise_injection]):
-            N = self.N.sample((x.shape[0],1,216,152 ))
-            x = torch.cat([x,N], dim = 1)
 
         x = self.up5(x)  # (batch, 16, 432, 304) 
-        if self.added_dim >0:    
+
+        if self.added_dim_skip_conv > 0: 
             if self.skip_VAE_added_dim:
                 z_ = self.skip5(z)
                 z_ = torch.unflatten(z_, dim = 1, sizes = (1,432,304))
@@ -360,7 +594,6 @@ class generation_NPS(nn.Module):
             x = self.skip5conv(x)
 
         return x
-	
 
 class prior_recognition(nn.Module):
  
@@ -495,7 +728,7 @@ class prediction(nn.Module):
         self.up1 = Up(256, 128, scale_factor_channels = scale_factor_channels)
         self.up2 = Up(128, 64, scale_factor_channels = scale_factor_channels)
         self.up3 = Up(64, 32, scale_factor_channels = scale_factor_channels)
-        self.up4 = Up(32, 16, scale_factor_channels = scale_factor_channels)
+        self.up4 = Up(32, 16, scale_factor_channels = scale_factor_channels, pad_sphere = True)
 
         if self.output_layer:
             self.last_conv = OutConv(16  , 1, sigmoid = sigmoid, NPS_proj= False)
@@ -547,7 +780,7 @@ class prediction_NPS(nn.Module):
         self.d1 = Down(16, 32, scale_factor_channels = scale_factor_channels)
         self.d2 = Down(32, 64, scale_factor_channels = scale_factor_channels)
         self.d3 = Down(64, 128, scale_factor_channels = scale_factor_channels)
-        self.d4 = Down(128, 256, scale_factor_channels = scale_factor_channels) 
+        self.d4 = Down(128, 256, scale_factor_channels = scale_factor_channels)
         # self.d5 = Down(256, 512, scale_factor_channels = scale_factor_channels) ### deeper model
         if scale_factor_channels is None:
              mid_channels = None
@@ -604,7 +837,7 @@ class prediction_NPS(nn.Module):
 
 class DoubleConvNext(nn.Module):
     r"""Adopted from from https://github.com/m2lines/Samudra/blob/main/samudra/model.py"""
-    def __init__(self, in_channels, out_channels, mid_channels=None, multi_channel=False, return_mask=False, VAE_latent_size = None, VAE_MLP_input_dim = None, noise_dist =  None  ):
+    def __init__(self, in_channels, out_channels, mid_channels=None, multi_channel=False, return_mask=False, VAE_latent_size = None, VAE_MLP_input_dim = None, noise_dist =  None, pad_sphere = False  ):
         super().__init__()
         self.VAE_latent_size = VAE_latent_size
         if self.VAE_latent_size is not None:
@@ -616,24 +849,31 @@ class DoubleConvNext(nn.Module):
         self.multi_channel = multi_channel
         self.VAE_MLP_input_dim = VAE_MLP_input_dim
         self.noise_dist = noise_dist
+        self.pad_sphere = pad_sphere
+
         if self.noise_dist is not None:
             added_dim = 1
         else:
             added_dim = 0
+
+        if pad_sphere:
+            padding= [1,0]
+        else:
+            padding = 1
 
         if all([in_channels == out_channels, self.noise_dist is None]):
             self.skip_module = lambda x: x  # Identity-function required in forward pass
             self.lambda_skip = True
         else:
             self.lambda_skip = False
-            self.skip_module = PartialConv2d(in_channels=in_channels + added_dim,out_channels=out_channels,kernel_size=1,bias = False, multi_channel=multi_channel, return_mask=False)
+            self.skip_module = PartialConv2d(in_channels=in_channels ,out_channels=out_channels,kernel_size=1,bias = False, multi_channel=multi_channel, return_mask=False)
                 
-        self.conv1 = PartialConv2d(in_channels+added_dim, mid_channels, kernel_size=3, padding= 1, multi_channel=multi_channel, return_mask=True)
+        self.conv1 = PartialConv2d(in_channels+added_dim, mid_channels, kernel_size=3, padding= padding, multi_channel=multi_channel, return_mask=True)
         # self.bn1 = nn.BatchNorm2d(mid_channels)
         self.bn1 = LayerNorm(mid_channels, data_format='channels_first' )
         self.act1 = nn.GELU()
         
-        self.conv2 = PartialConv2d(mid_channels+added_dim, mid_channels, kernel_size=3, padding= 1, multi_channel=multi_channel, return_mask=True)
+        self.conv2 = PartialConv2d(mid_channels+added_dim, mid_channels, kernel_size=3, padding= padding, multi_channel=multi_channel, return_mask=True)
         # self.bn2 = nn.BatchNorm2d(mid_channels)
         self.bn2 = LayerNorm(mid_channels, data_format='channels_first' )
         self.act2 = nn.GELU()
@@ -644,7 +884,7 @@ class DoubleConvNext(nn.Module):
         if VAE_latent_size is not None:
             # self.bn_vae = nn.BatchNorm2d(out_channels)
             self.bn_vae = LayerNorm(out_channels, data_format='channels_first' )
-            self.acr_vae = nn.ReLU(inplace = True)
+            # self.acr_vae = nn.ReLU(inplace = True)  ######### removed 0717 #########
 
             if VAE_MLP_input_dim is not None:
                 self.mu = nn.Linear(VAE_MLP_input_dim, VAE_latent_size, bias=False ) 
@@ -654,16 +894,25 @@ class DoubleConvNext(nn.Module):
                 self.log_var = nn.Conv2d(out_channels, VAE_latent_size, kernel_size=1, bias=False) 
 
     def forward(self, x, mask = None):
+            if self.multi_channel:
+                assert mask is not None
+
+            # if not self.lambda_skip:
+            #     if self.noise_dist is not None:
+            #         N = self.noise_dist.sample((x.shape[0],1,x.shape[-2],x.shape[-1] ))
+            #         x = torch.cat([x,N], dim = 1)
+            #     skip = self.skip_module(x, mask)
+
+            # else:
+            skip = self.skip_module(x)     
             if self.noise_dist is not None:
                 N = self.noise_dist.sample((x.shape[0],1,x.shape[-2],x.shape[-1] ))
                 x = torch.cat([x,N], dim = 1)
 
-            if self.multi_channel:
-                assert mask is not None
-            if  self.lambda_skip:
-                skip = self.skip_module(x)     
-            else:
-                skip = self.skip_module(x, mask)
+            if self.pad_sphere:
+                x = pad_ice(x, [0,1])
+                if mask is not None:
+                    mask = pad_ice(mask, [0,1]) 
             x, mask = self.conv1(x, mask)
             x = self.bn1(x)
             x = self.act1(x)
@@ -673,6 +922,10 @@ class DoubleConvNext(nn.Module):
             if self.noise_dist is not None:
                 N = self.noise_dist.sample((x.shape[0],1,x.shape[-2],x.shape[-1] ))
                 x = torch.cat([x,N], dim = 1)
+            if self.pad_sphere:
+                x = pad_ice(x, [0,1])
+                if mask is not None:
+                    mask = pad_ice(mask, [0,1]) 
             x, mask = self.conv2(x, mask)
             x = self.bn2(x)
             x = self.act2(x)
@@ -686,7 +939,7 @@ class DoubleConvNext(nn.Module):
 
             if self.VAE_latent_size:
                 x = self.bn_vae(x)  ## turn on if layernorm is used not batchnorm
-                x = self.acr_vae(x)
+                # x = self.acr_vae(x)   ######### removed 0717 #########
                 if self.VAE_MLP_input_dim is not None:
                     x = torch.flatten(x, start_dim = 1)
                 mu = self.mu(x)
@@ -702,25 +955,32 @@ class DoubleConvNext(nn.Module):
 
 class SingleConvNext(nn.Module):
     r"""Adopted from from https://github.com/m2lines/Samudra/blob/main/samudra/model.py"""
-    def __init__(self, in_channels, out_channels,  multi_channel=False, return_mask=False, noise_dist =  None ):
+    def __init__(self, in_channels, out_channels,  multi_channel=False, return_mask=False, noise_dist =  None , pad_sphere = False):
         super().__init__()
 
         self.return_mask = return_mask
         self.multi_channel = multi_channel
         self.noise_dist = noise_dist
+        self.pad_sphere = pad_sphere
+
         if self.noise_dist is not None:
             added_dim = 1
         else:
             added_dim = 0
                 # 1x1 conv to increase/decrease channel depth if necessary
-        if in_channels == out_channels:
+        if all([in_channels == out_channels, self.noise_dist is None]):
             self.skip_module = lambda x: x  # Identity-function required in forward pass
             self.lambda_skip = True
         else:
             self.lambda_skip = False
-            self.skip_module = PartialConv2d(in_channels=in_channels+added_dim,out_channels=out_channels,kernel_size=1,bias = False, multi_channel=multi_channel, return_mask=False)
+            self.skip_module = PartialConv2d(in_channels=in_channels,out_channels=out_channels,kernel_size=1,bias = False, multi_channel=multi_channel, return_mask=False)
+
+        if pad_sphere:
+            padding= [1,0]
+        else:
+            padding = 1
                 
-        self.conv1 = PartialConv2d(in_channels+added_dim, in_channels, kernel_size=3, padding= 1, multi_channel=multi_channel, return_mask=True)
+        self.conv1 = PartialConv2d(in_channels+added_dim, in_channels, kernel_size=3, padding= padding, multi_channel=multi_channel, return_mask=True)
         self.bn1 = LayerNorm(in_channels, data_format='channels_first' )
         self.act1 = nn.GELU()
         
@@ -728,16 +988,25 @@ class SingleConvNext(nn.Module):
 
 
     def forward(self, x, mask = None):
-            if self.noise_dist is not None:
-                N = self.noise_dist.sample((x.shape[0],1,x.shape[-2],x.shape[-1] ))
-                x = torch.cat([x,N], dim = 1)
 
             if self.multi_channel:
                 assert mask is not None
-            if  self.lambda_skip:
-                skip = self.skip_module(x)     
-            else:
-                skip = self.skip_module(x, mask)
+
+            # if not self.lambda_skip:
+            #     if self.noise_dist is not None:
+            #         N = self.noise_dist.sample((x.shape[0],1,x.shape[-2],x.shape[-1] ))
+            #         x = torch.cat([x,N], dim = 1)
+            #     skip = self.skip_module(x, mask)
+
+            # else:
+            skip = self.skip_module(x)     
+            if self.noise_dist is not None:
+                N = self.noise_dist.sample((x.shape[0],1,x.shape[-2],x.shape[-1] ))
+                x = torch.cat([x,N], dim = 1)
+            if self.pad_sphere:
+                x = pad_ice(x, [0,1])
+                if mask is not None:
+                    mask = pad_ice(mask, [0,1])                 
             x, mask = self.conv1(x, mask)
             x = self.bn1(x)
             x = self.act1(x)
@@ -756,6 +1025,28 @@ class SingleConvNext(nn.Module):
             else:
                 return x
 
+
+
+# class Down(nn.Module):
+#         """Downscaling with double conv then maxpool"""
+
+#         def __init__(self, in_channels, out_channels, pooling_padding = 0,scale_factor_channels = 4):
+#                 super().__init__()
+                
+#                 if scale_factor_channels is None:
+#                      mid_channels = None
+#                 else:
+#                      mid_channels = scale_factor_channels * in_channels
+
+#                 self.doubleconv = DoubleConvNext(in_channels, in_channels,mid_channels= mid_channels, multi_channel=True, return_mask=True)	
+#                 self.norm = LayerNorm(in_channels, eps=1e-6, data_format="channels_first")   ######## Changed 0717 ######
+#                 self.pool = PartialConv2d(in_channels, out_channels, kernel_size=2, stride = 2, padding=pooling_padding,  multi_channel=True, return_mask=True)
+
+#         def forward(self, x, mask):
+#                 x, mask = self.doubleconv(x, mask)
+#                 x = self.norm(x)   ######## Changed 0717 ######
+#                 x, mask = self.pool(x, mask)
+#                 return x, mask
 
 class Down(nn.Module):
         """Downscaling with double conv then maxpool"""
@@ -776,22 +1067,67 @@ class Down(nn.Module):
                 return x1, mask1
 
 
+# class Up(nn.Module):
+#     """Upscaling then double conv"""
+#     def __init__(self, in_channels, out_channels, up_kernel = 3, scale_factor_channels = 4, noise_dist = None):
+#             super().__init__()
+#             if scale_factor_channels is None:
+#                 mid_channels = None
+#             else:
+#                 mid_channels = scale_factor_channels * out_channels
+
+#             self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+#             self.conv_mid = PartialConv2d(in_channels, out_channels, kernel_size=3, padding=  1)
+#             self.conv = DoubleConvNext(out_channels, out_channels, mid_channels= mid_channels, multi_channel=False, return_mask=False, noise_dist = noise_dist)
+    
+#     def forward(self, x, pad = None):# input is CHW
+#         x = self.up(x)   
+#         x = self.conv_mid(x)
+#         if pad is not None:
+#             x = F.pad(x, pad)
+#         x = self.conv(x)
+#         return x
+
 class Up(nn.Module):
     """Upscaling then double conv"""
-    def __init__(self, in_channels, out_channels, up_kernel = 3, scale_factor_channels = 4, noise_dist = None):
+    def __init__(self, in_channels, out_channels, up_kernel = 3, scale_factor_channels = 4, noise_dist = None, convnext_noise_injection = False, pad_sphere = False):
             super().__init__()
             if scale_factor_channels is None:
                 mid_channels = None
             else:
                 mid_channels = scale_factor_channels * in_channels
 
+            self.noise_dist = noise_dist
+            self.convnext_noise_injection = convnext_noise_injection
+            self.pad_sphere = pad_sphere
+            
+            if all([noise_dist is not None]):
+                self.mid_conv_added_dim = 1
+            else:
+                self.mid_conv_added_dim = 0
+
+            if self.pad_sphere:
+                padding= [1,0]
+            else:
+                padding = 1
 
             self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-            self.conv_mid = PartialConv2d(in_channels, in_channels, kernel_size=3, padding=  1)
-            self.conv = DoubleConvNext(in_channels, out_channels, mid_channels= mid_channels, multi_channel=False, return_mask=False, noise_dist = noise_dist)
+            self.conv_mid = PartialConv2d(in_channels + self.mid_conv_added_dim , in_channels, kernel_size=3, padding=  padding)
+
+            if self.convnext_noise_injection:
+                self.conv = DoubleConvNext(in_channels, out_channels, mid_channels= mid_channels, multi_channel=False, return_mask=False, noise_dist = noise_dist, pad_sphere = pad_sphere)
+            else:
+                self.conv = DoubleConvNext(in_channels, out_channels, mid_channels= mid_channels, multi_channel=False, return_mask=False, noise_dist = None, pad_sphere = pad_sphere)
     
     def forward(self, x, pad = None):# input is CHW
         x = self.up(x)   
+
+        if all([self.noise_dist is not None, self.mid_conv_added_dim>0]) :
+                N = self.noise_dist.sample((x.shape[0],1,x.shape[-2],x.shape[-1] ))
+                x = torch.cat([x,N], dim = 1)
+        if self.pad_sphere:
+            x = pad_ice(x, [0,1])
+        
         x = self.conv_mid(x)
         if pad is not None:
             x = F.pad(x, pad)
@@ -805,67 +1141,132 @@ class InitialConv(nn.Module):
             self.firstconv = PartialConv2d(in_channels, out_channels ,kernel_size=3, padding= [1,0], multi_channel=True, return_mask=True)
             # self.BN = nn.BatchNorm2d(out_channels)
             self.BN = LayerNorm(out_channels, data_format='channels_first' ) 
-            self.activation = nn.ReLU(inplace=True)
+            # self.activation = nn.ReLU(inplace=True)  ######### removed 0717 #########
     def forward(self, x, mask):
             x1 = pad_ice(x, [0,1])
             mask1 = pad_ice(mask, [0,1])
             x1, mask1 = self.firstconv(x1, mask1)
             x1 = self.BN(x1)
-            x1 = self.activation(x1)
+            # x1 = self.activation(x1)  ######### removed 0717 #########
             return x1, mask1
+    
 
+
+    
 class OutConv(nn.Module):
-    def __init__(self, in_channels, out_channels, sigmoid = True, NPS_proj = False):
+    def __init__(self, in_channels, out_channels, sigmoid = True, NPS_proj = False, LocallyConnected = False, Final_kernel_2 = False):
             super().__init__()
             self.NPS_proj = NPS_proj
+            if Final_kernel_2:
+                self.spherical_padding = True if not NPS_proj else False
+                kernel_size = 2
+            else:
+                self.spherical_padding = False
+                kernel_size = 1
+
             if NPS_proj:
-                padding = 1
+                output_size = (432, 304)
+            else:				
+                output_size = (100,180)
+                        
+            if self.spherical_padding:
+                self.padding = [0,0,0,1]
             else:
-                padding= [1,0]
-            # self.conv1 = PartialConv2d(in_channels, in_channels, kernel_size=3, padding= padding)
+                self.padding = [0,1,0,1] if kernel_size == 2 else 0
+
+            if LocallyConnected:
+                conv = 	LocallyConnected2d(in_channels, out_channels,output_size = output_size, padding = 0, kernel_size=kernel_size)
+            else:
+                conv = nn.Conv2d(in_channels, out_channels, padding = 0, kernel_size=kernel_size)
+
             if sigmoid:
-                self.conv2 = nn.Sequential(
-                            # nn.BatchNorm2d(in_channels),
-                            LayerNorm(in_channels, data_format='channels_first' ),
-                            nn.ReLU(inplace=True),
-                            nn.Conv2d(in_channels, out_channels, kernel_size=1), nn.Sigmoid())
-                    
+                self.conv2 = nn.Sequential(   
+                            LayerNorm(in_channels, eps=1e-6, data_format='channels_first'),
+                            nn.ReLU(inplace=True),  
+                            conv,
+                            nn.Sigmoid())
+                
             else:
-                self.conv2 = nn.Sequential(
-                            # nn.BatchNorm2d(in_channels),
-                            LayerNorm(in_channels, data_format='channels_first' ),
-                            nn.ReLU(inplace=True),
-                            nn.Conv2d(in_channels, out_channels, kernel_size=1))
-        
+                self.conv2 = nn.Sequential(   
+                            LayerNorm(in_channels, eps=1e-6, data_format='channels_first'),   
+                            nn.ReLU(inplace=True), 
+                            conv)
+                
+            self.conv2.apply(weights_init)
+
     def forward(self, x):
-            # if not self.NPS_proj:
-            # 	x = pad_ice(x, [0,1])
-            # x1 = self.conv1(x)
-            return self.conv2(x)
+        if self.padding != 0:
+            x = F.pad(x, self.padding) #####################################333
+        if self.spherical_padding:
+            east_pad = torch.flip(x[...,-1:], dims = [-2])
+            x = torch.cat([x, torch.flip(east_pad,dims = [-1])], dim = -1 )
+        return self.conv2(x)   
+          
+# class OutConv(nn.Module):
+# 		def __init__(self, in_channels, out_channels, sigmoid = True, NPS_proj = False, LocallyConnected = False):
+# 				super().__init__()
+# 				self.NPS_proj = NPS_proj
+# 				if NPS_proj:
+# 					padding = 1
+# 					output_size = (432, 304)
+# 				else:
+# 					padding= [1,0]
+# 					output_size = (100,180)
+
+# 				if LocallyConnected:
+# 					conv = 	LocallyConnected2d(in_channels, out_channels,output_size = output_size, kernel_size=1)
+# 				else:
+# 					conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+
+# 				if sigmoid:
+# 					self.conv = nn.Sequential(   
+# 								LayerNorm(in_channels, eps=1e-6, data_format='channels_first'),
+# 								nn.ReLU(inplace=True),  
+# 								conv,
+# 								nn.Sigmoid())
+					
+# 				else:
+# 					self.conv = nn.Sequential(   
+# 								LayerNorm(in_channels, eps=1e-6, data_format='channels_first'),   
+# 								nn.ReLU(inplace=True), 
+# 								conv)
+					
+# 				self.conv.apply(weights_init)
+
+# 		def forward(self, x):
+
+# 				return self.conv(x)   
 
 
 class OutConv_logvar(nn.Module):
-    def __init__(self, in_channels, out_channels, sigmoid = True, NPS_proj = False):
+    def __init__(self, in_channels, out_channels, sigmoid = True, NPS_proj = False, LocallyConnected = False):
             super().__init__()
             self.NPS_proj = NPS_proj
             if NPS_proj:
                 padding = 1
+                output_size = (432, 304)
             else:
                 padding= [1,0]
-            # self.conv1 = PartialConv2d(in_channels, in_channels, kernel_size=3, padding= padding)
+                output_size = (100,180)
+
+            if LocallyConnected:
+                conv = 	LocallyConnected2d(in_channels, out_channels,output_size = output_size, kernel_size=3, padding = 1)
+            else:
+                conv = PartialConv2d(in_channels, out_channels, kernel_size=3, padding= 1)
+                         
             if sigmoid:
                 self.conv2 = nn.Sequential(
-                            # nn.BatchNorm2d(in_channels),
+
                             LayerNorm(in_channels, data_format='channels_first' ),
                             nn.ReLU(inplace=True),
-                            PartialConv2d(in_channels, out_channels, kernel_size=3, padding= 1), nn.Sigmoid())
+                            conv, nn.Sigmoid())
                     
             else:
                 self.conv2 = nn.Sequential(
-                            # nn.BatchNorm2d(in_channels),
+
                             LayerNorm(in_channels, data_format='channels_first' ),
                             nn.ReLU(inplace=True),
-                            PartialConv2d(in_channels, out_channels, kernel_size=3, padding= 1))
+                            conv)
         
     def forward(self, x):
             # if not self.NPS_proj:
@@ -1283,3 +1684,37 @@ class prediction_NPS_small(nn.Module):
         
         return x
     
+
+class LocallyConnected2d(nn.Module):
+    def __init__(self, in_channels, out_channels, output_size, kernel_size, stride = 1, bias=False):
+        super(LocallyConnected2d, self).__init__()
+        output_size = _pair(output_size)
+        self.weight = nn.Parameter(
+            torch.randn(1, out_channels, in_channels, output_size[0], output_size[1], kernel_size**2)
+        )
+        if bias:
+            self.bias = nn.Parameter(
+                torch.randn(1, out_channels, output_size[0], output_size[1])
+            )
+        else:
+            self.register_parameter('bias', None)
+        self.kernel_size = _pair(kernel_size)
+        self.stride = _pair(stride)
+
+    def forward(self, x):
+        _, c, h, w = x.size()
+        kh, kw = self.kernel_size
+        dh, dw = self.stride
+        x = x.unfold(2, kh, dh).unfold(3, kw, dw)
+        x = x.contiguous().view(*x.size()[:-2], -1)
+        # Sum in in_channel and kernel_size dims
+        out = (x.unsqueeze(1) * self.weight).sum([2, -1])
+        if self.bias is not None:
+            out += self.bias
+        return out
+    
+def weights_init(m):
+	if isinstance(m, nn.Conv2d):
+		trunc_normal_(m.weight, std=.02)
+		if m.bias is not None:
+			nn.init.constant_(m.bias, 0)

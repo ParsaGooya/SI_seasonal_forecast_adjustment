@@ -55,6 +55,9 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
 
     if obs_ref == 'NASA':
         data_dir_obs = glob.glob(LOC_OBSERVATIONS_SI+ f'/NASA*{crs}*.nc')[0] 
+    elif obs_ref == 'NOAA':
+        assert crs == 'NPS'
+        data_dir_obs = glob.glob(LOC_OBSERVATIONS_SI+ f'/NOAA*{crs}*.nc')[0] 
     else:
         data_dir_obs = glob.glob(LOC_OBSERVATIONS_SI+ '/uws*.nc')[0]
 
@@ -105,7 +108,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
 
         params['forecast_preprocessing_steps'] = []
         params['observations_preprocessing_steps'] = []
-        ds_in = xr.open_dataset('/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/NASA/Bias_Adjusted/bias_adjusted_North_1983-2020.nc')['SICN']
+        ds_in = xr.open_dataset('/space/hall7/sitestore/eccc/crd/cccma/users/rpg002/output/SI/Full/results/NASA/Bias_Adjusted/bias_adjusted_North_1983-2020.nc')['SICN']
         if ensemble_list is not None:
             raise RuntimeError('With version 2 you are reading the bias adjusted ensemble mean as input. Set ensemble_list to None to proceed.')
 
@@ -113,7 +116,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
 
         if ensemble_list is not None: ## PG: calculate the mean if ensemble mean is none
             print("Load forecasts")
-            ls = [xr.open_dataset(glob.glob(LOC_FORECASTS_SI + f'/*_initial_month_{intial_month}_*{crs}*.nc')[0])['SICN'] for intial_month in range(1,13) ]
+            ls = [xr.open_dataset(glob.glob(LOC_FORECASTS_SI + f'/*_initial_month_{intial_month}_{obs_ref}*{crs}*.nc')[0])['SICN'] for intial_month in range(1,13) ]
             ds_in = xr.concat(ls, dim = 'time').sortby('time').sel(ensembles = ensemble_list)
             if ensemble_mode == 'Mean': 
                 ds_in = ds_in.mean('ensembles') 
@@ -123,7 +126,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
 
         else:    ## Load specified members
             print("Load forecasts") 
-            ls = [xr.open_dataset(glob.glob(LOC_FORECASTS_SI + f'/*_initial_month_{intial_month}_*{crs}*.nc')[0])['SICN'] for intial_month in range(1,13) ]
+            ls = [xr.open_dataset(glob.glob(LOC_FORECASTS_SI + f'/*_initial_month_{intial_month}_{obs_ref}*{crs}*.nc')[0])['SICN'] for intial_month in range(1,13) ]
             ds_in = xr.concat(ls, dim = 'time').mean('ensembles').sortby('time')
    
     ###### handle nan and inf over land ############
@@ -131,9 +134,12 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
     if not NPSProj:
         ds_in = ds_in.where(ds_in<1000,np.nan)
     else:
-        mask_projection = (xr.open_dataset(data_dir_obs)['mask'].rename({'x':'lon','y':'lat'}))
+        # mask_projection = (xr.open_dataset(data_dir_obs)['mask'].rename({'x':'lon','y':'lat'}))
         obs_in = (obs_in.rename({'x':'lon','y':'lat'}))
         ds_in = (ds_in.rename({'x':'lon','y':'lat'}))
+        if obs_ref == 'NASA':
+            obs_in = obs_in[...,:,64:-64]
+            ds_in = ds_in[...,:,64:-64]
 
 
     land_mask = obs_in.mean('time').where(np.isnan(obs_in.mean('time')),1).fillna(0)
@@ -802,7 +808,7 @@ if __name__ == "__main__":
     NPSProj = False
 
     
-    out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_8'
+    out_dir_x  = f'/space/hall7/sitestore/eccc/crd/cccma/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_8'
     if lead_time is None:
         out_dir    = f'{out_dir_x}/N{n_years}_M{lead_months}_F{params["forecast_range_months"]}_v{params["version"]}'
     else:
@@ -859,7 +865,7 @@ if __name__ == "__main__":
         print('Training done.')
     except Exception as e:
         import shutil
-        shutil.rmtree(out_dir)
+        shutil.move(out_dir, out_dir_x + '/failed_cases')
         print("Terminated due to the follwoing error:\n", e)
         raise  # 
 

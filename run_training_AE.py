@@ -77,7 +77,7 @@
 
 #         params['forecast_preprocessing_steps'] = []
 #         params['observations_preprocessing_steps'] = []
-#         ds_in = xr.open_dataset('/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/NASA/Bias_Adjusted/global_mean_bias_adjusted_1983-2020.nc')['SICN']
+#         ds_in = xr.open_dataset('/space/hall7/sitestore/eccc/crd/cccma/users/rpg002/output/SI/Full/results/NASA/Bias_Adjusted/global_mean_bias_adjusted_1983-2020.nc')['SICN']
 #         if ensemble_list is not None:
 #             raise RuntimeError('With version 2 you are reading the bias adjusted ensemble mean as input. Set ensemble_list to None to proceed.')
 
@@ -531,7 +531,7 @@
 #     obs_ref = 'NASA'
 
     
-#     out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_1'
+#     out_dir_x  = f'/space/hall7/sitestore/eccc/crd/cccma/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_1'
 #     if params['lr_scheduler']:
 #         params['start_factor'] = 1.0
 #         params['end_factor'] = 0.5

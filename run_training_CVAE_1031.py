@@ -9,14 +9,16 @@ from pathlib import Path
 from torch.distributions import Normal
 import torch
 from torch.utils.data import DataLoader
-from torch.optim import lr_scheduler
-from models.cvae_0707 import cVAE
-from losses import WeightedMSE, BCElossKLD #, WeightedMSEKLD, WeightedMSELowRessKLD
+from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
+from models.cvae_1031 import cVAE, VAE
+from losses_new import WeightedMSE, BCElossKLD #, WeightedMSEKLD, WeightedMSELowRessKLD
 from losses_new import VAElossLowRess, VAEloss
 from preprocessing import align_data_and_targets, create_mask, pole_centric, reverse_pole_centric, segment, reverse_segment, pad_xarray, smoother, load_model_data
 from preprocessing import AnomaliesScaler_v1_seasonal, AnomaliesScaler_v2_seasonal, Standardizer, Normalizer, PreprocessingPipeline, calculate_climatology, bias_adj, zeros_mask_gen
 from torch_datasets import XArrayDataset
 import torch.nn as nn
+from torch.cuda.amp import GradScaler, autocast
+
 # from subregions import subregions
 from data_locations import LOC_FORECASTS_SI, LOC_OBSERVATIONS_SI
 import glob
@@ -28,13 +30,16 @@ data_dir_forecast = LOC_FORECASTS_SI
 
 
 
-def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False,test_years = None,  n_runs=1, results_dir=None, numpy_seed=None, torch_seed=None, save = False):
+def run_training(params, n_years, n_validation_years = 0, lead_months = 12, lead_time = None, NPSProj = False,test_years = None,  n_runs=1, results_dir=None, numpy_seed=None, torch_seed=None, save = False):
 
     if lead_time is not None:
         assert lead_time <=lead_months, f"{lead_time} can not be greater than {lead_months}"
 
     if not params['masked_weights']:
         assert 'land_mask' in params['time_features']
+
+    if 'ensemble_error' in params['time_features']:
+        assert params['ensemble_mode'] == 'Mean'
     
     if NPSProj:
         crs = 'NPS'  
@@ -45,7 +50,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
         data_dir_obs = glob.glob(LOC_OBSERVATIONS_SI+ f'/NASA/*{crs}*.nc')[0] 
     elif obs_ref == 'NOAA':
         assert crs == 'NPS'
-        data_dir_obs = glob.glob(LOC_OBSERVATIONS_SI+ f'/NOAA/*{crs}**interp*.nc')[0] 
+        data_dir_obs = glob.glob(LOC_OBSERVATIONS_SI+ f'/NOAA/*{crs}*interp*.nc')[0] 
     else:
         data_dir_obs = glob.glob(LOC_OBSERVATIONS_SI+ '/uws*.nc')[0]
 
@@ -56,19 +61,18 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
 
         params['forecast_preprocessing_steps'] = [
             ('anomalies', AnomaliesScaler_v1_seasonal())]
-        params['observations_preprocessing_steps'] = []
+        params['observations_preprocessing_steps'] = [ ('anomalies', AnomaliesScaler_v2_seasonal(VAE = True))]
         
     else:
         params['forecast_preprocessing_steps'] = []
         params['observations_preprocessing_steps'] = []
     #####################################################################################################
     ### if you used Standardizer make sure to pass VAE = True as an argument to the initializer below ###
-    if params['version'] == 3:
-        print(' Warning!!! If you used Standardizer as a preprocessing step make sure to pass "VAE = True" as an argument to the initializer!!!')
+    if params['version'] == 2:
+        print(' Warning!!! If you used AnomaliesScaler_v*_seasonal or Standardizer as a observation preprocessing step make sure to pass "VAE = True" as an argument to the initializer!!!')
     #####################################################################################################
 
     if params['version'] == 'IceExtent':
-        params['reg_scale'] = None
         params['combined_prediction'] = False
         assert params['learn_decoder_variance']['status'] is False, 'Ice extent version decoder output is itself a probability distribution'
         assert params['learn_decoder_sampler']['status'] is False, 'Ice extent version decoder output is itself a probability distribution'
@@ -82,18 +86,16 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
 
     if params['learn_decoder_sampler']['status']:
         assert params['combined_prediction'] is False, 'CRPS does not work on combined output'
-        assert params['multi_ress_loss_kernel_size'] is None, 'CRPS works on grid scale'
-        assert params['low_ress_loss_kernel_size'] is None, 'CRPS works on grid scale'
     else:
         params['learn_decoder_sampler']['noise_std'] = None
         
         
     if params['lr_scheduler']:
-        start_factor = params['start_factor']
-        end_factor = params['end_factor']
-        total_iters = params['total_iters']
+        max_learning_rate = params['lr']
+        min_lr = params['min_lr']
+        num_warmup_epchs = params['num_warmup_epchs']
     else:
-        start_factor = end_factor = total_iters = None
+        min_lr = num_warmup_epchs = max_learning_rate = None
     
     if params['multi_ress_loss_kernel_size'] is not None:
         params['active_grid'] = False
@@ -111,7 +113,6 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
     ensemble_list = params['ensemble_list']
     ###### PG: Add ensemble features to training features
     ensemble_mode = params['ensemble_mode'] ##
-    ensemble_features = params['ensemble_features']
 
     if params['version'] == 3:
 
@@ -135,13 +136,21 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
      ### land is masked in model data with a large number
     if not NPSProj:
         ds_in = ds_in.where(ds_in<1000,np.nan)
+        if 'ensemble_error' in params['time_features']:
+            ds_in_std = ds_in_std.where(ds_in_std<1000,np.nan)
     else:
         # mask_projection = (xr.open_dataset(data_dir_obs)['mask'].rename({'x':'lon','y':'lat'}))[...,:,64:-64]
         obs_in = (obs_in.rename({'x':'lon','y':'lat'}))
         ds_in = (ds_in.rename({'x':'lon','y':'lat'}))
+        if 'ensemble_error' in params['time_features']:
+            ds_in_std = (ds_in_std.rename({'x':'lon','y':'lat'}))
         if obs_ref == 'NASA':
             obs_in = obs_in[...,:,64:-64]
             ds_in = ds_in[...,:,64:-64]
+            if 'ensemble_error' in params['time_features']:
+               ds_in_std = ds_in_std[...,:,64:-64] 
+        # else:
+        #     ds_in = ds_in.interp(lon = obs_in.lon, lat = obs_in.lat)
 
 
     land_mask = obs_in.mean('time').where(np.isnan(obs_in.mean('time')),1).fillna(0)
@@ -150,6 +159,8 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
     ds_in = ds_in.clip(0,1)
     obs_in = obs_in.fillna(0)
     ds_in = ds_in.fillna(0)
+    if 'ensemble_error' in params['time_features']:
+        ds_in_std = ds_in_std.fillna(0)
     ############################################
     
     obs_in = obs_in.expand_dims('channels', axis=1)
@@ -158,8 +169,11 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
         ds_in = ds_in.expand_dims('channels', axis=3)
     else:
         ds_in = ds_in.expand_dims('channels', axis=2) 
+        if 'ensemble_error' in params['time_features']:
+            ds_in_std = ds_in_std.expand_dims('channels', axis=2)
+            ds_in = xr.concat([ds_in, ds_in_std], dim = 'channels')
 
-    ds_raw, obs_raw = align_data_and_targets(ds_in, obs_in, lead_months)  # extract valid lead times and usable years
+    ds_raw, obs_raw = align_data_and_targets(ds_in, obs_in, lead_months, target_ensemble_bootstrap = params['target_ensemble_bootstrap'])  # extract valid lead times and usable years
     del ds_in, obs_in
     gc.collect()
 
@@ -198,7 +212,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
             test_years = test_years[:-1]
 
     if any([params['active_grid'],'active_mask' in params["time_features"], 'full_ice_mask' in params["time_features"]]):
-        zeros_mask_full = xr.concat([zeros_mask_gen(obs_raw.isel(lead_time = 0).drop('lead_time').where(obs_raw.time<test_year*100, drop = True ), 3) for test_year in test_years], dim = 'test_year').assign_coords(test_year = test_years)           
+        zeros_mask_full = xr.concat([zeros_mask_gen(obs_raw.isel(lead_time = 0).drop('lead_time').where(obs_raw.time<(test_year - n_validation_years) *100, drop = True ), 3) for test_year in test_years], dim = 'test_year').assign_coords(test_year = test_years)           
         
         for item in ['active_mask', 'full_ice_mask']:
             zeros_mask_full = zeros_mask_full.drop(item) if item not in params["time_features"] else zeros_mask_full
@@ -207,20 +221,18 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
         zeros_mask_full = zeros_mask_full.expand_dims('channels', axis=-3)
         if 'ensembles' in ds_raw.dims:
              zeros_mask_full = zeros_mask_full.expand_dims('ensembles', axis=2)
-   
-    reg_scale = params["reg_scale"]
+
     model = params["model"]
     time_features = params["time_features"]
     epochs = params["epochs"]
     batch_size = params["batch_size"]
-    decoder_kernel_size = params["decoder_kernel_size"]
+    grad_accumulation_steps = params['grad_accumulation_steps']
     optimizer = params["optimizer"]
     lr = params["lr"]
     l2_reg = params["L2_reg"]
     forecast_preprocessing_steps = params["forecast_preprocessing_steps"]
     observations_preprocessing_steps = params["observations_preprocessing_steps"]
-    loss_region = params["loss_region"]
-    
+    LocallyConnected = params['LocallyConnected']
     obs_clim = params["obs_clim"]
     active_grid = params['active_grid']
     multi_ress_loss_kernel_size = params['multi_ress_loss_kernel_size']
@@ -282,25 +294,23 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
             f"path_to_deterministic\t{params['path_to_deterministic']}\n" +
             f"learn_decoder_variance\t{params['learn_decoder_variance']}\n" +
             f"learn_decoder_sampler\t{params['learn_decoder_sampler']}\n" +
-            f"reg_scale\t{reg_scale}\n" +  ## PG: The scale to be passed to Signloss regularization
             f"loss_function\t{params['loss_function']}\n" + 
             f"time_features\t{time_features}\n" +
             f"obs_clim\t{obs_clim}\n" +
             f"ensemble_list\t{ensemble_list}\n" + ## PG: Ensemble list
             f"ensemble_mode\t{ensemble_mode}\n" + ## PG: Ensemble list
-            f"ensemble_features\t{ensemble_features}\n" + ## PG: Ensemble features
             f"epochs\t{epochs}\n" +
-            f"batch_size\t{batch_size}\n" +
+            f"batch_size\t{batch_size}\n" +   
+            f"grad_accumulation_steps\t{grad_accumulation_steps}\n" + 
             f"optimizer\t{optimizer.__name__}\n" +
             f"lr\t{params['lr']}\n" +
-            f"lr_scheduler\t{params['lr_scheduler']}: {start_factor} --> {end_factor} in {total_iters} epochs\n" + 
-            f"decoder_kernel_size\t{decoder_kernel_size}\n" +
+            f"lr_scheduler\t{params['lr_scheduler']}: {max_learning_rate} --> {min_lr} cosine annealing with {num_warmup_epchs} warm up epochs\n" + 
             f"forecast_preprocessing_steps\t{[s[0] if forecast_preprocessing_steps is not None else None for s in forecast_preprocessing_steps]}\n" +
             f"observations_preprocessing_steps\t{[s[0] if observations_preprocessing_steps is not None else None for s in observations_preprocessing_steps]}\n" +
-            f"loss_region\t{loss_region}\n" +
             f"active_grid\t{active_grid}\n" + 
             f"multi_ress_loss_kernel_size\t{multi_ress_loss_kernel_size}\n" +
             f"low_ress_loss_kernel_size\t{low_ress_loss_kernel_size}\n" +
+            f"LocallyConnected\t{LocallyConnected}\n" +
             f"equal_weights\t{params['equal_weights']}\n" + 
             f"subset_dimensions\t{subset_dimensions}\n" + 
             f"L2_reg\t{l2_reg}\n" + 
@@ -309,7 +319,8 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
             f"scale_factor_channels\t{params['scale_factor_channels']}\n"  + 
             f"VAE_MLP_encoder\t{params['VAE_MLP_encoder']}\n"  + 
             f"skip_VAE_added_dim\t{params['skip_VAE_added_dim']}\n" +
-            f"hybrid_weight\t{params['hybrid_weight']}\n"
+            f"hybrid_weight\t{params['hybrid_weight']}\n" + 
+            f"beta\t{params['beta']}\n"
         )
     del ds_raw
     gc.collect()
@@ -337,7 +348,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                     zeros_mask = None
                 
 
-                train_years = ds_raw_ensemble_mean.time[ds_raw_ensemble_mean.time < test_year * 100 + month].to_numpy()
+                train_years = ds_raw_ensemble_mean.time[ds_raw_ensemble_mean.time < (test_year - n_validation_years) * 100 + month].to_numpy()
                 n_train = len(train_years)
                 train_mask = create_mask(ds_raw_ensemble_mean[:n_train,...]) if lead_time is None else create_mask(full_shape[:n_train,...])[:, lead_time - 1][..., None] ############
 
@@ -373,25 +384,26 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                 del ds_baseline, obs_baseline, preprocessing_mask_obs, preprocessing_mask_fct
                 gc.collect()
 
-                if params['version']  in [3, 1.1]:
+                if params['version']  in [2,3, 1.1]:
                     sigmoid_activation = False
                 else:
                     sigmoid_activation = True
 
-                y0 = np.floor(ds[:n_train].time[0].values/100 )
-                yr, mn = np.divmod(int(ds[:n_train+params['forecast_range_months']].time[-1].values - y0*100),100)
-                month_min_max = [y0, yr * 12 + mn]
 
                 if 'land_mask' in time_features:
                     ds = xr.concat([ds, land_mask.expand_dims('channels', axis = 0)], dim = 'channels')
                 
-                # TRAIN MODEL
+                ############################################# Prepare data ###########################################
 
                 ds_train = ds[:n_train,...]
                 obs_train = obs[:n_train,...]
+
+                ds_validation = ds[n_train:n_train + n_validation_years*12,...]
+                obs_validation = obs[n_train:n_train + n_validation_years*12,...]     
+
                 if test_year*100 + month <= ds_raw_ensemble_mean.time[-1]:
-                        ds_test = ds[n_train:n_train + params['forecast_range_months'],...]
-                        obs_test = obs[n_train:n_train + params['forecast_range_months'],...]
+                        ds_test = ds[n_train  + n_validation_years*12 :n_train + n_validation_years*12 + params['forecast_range_months'],...]
+                        obs_test = obs[n_train  + n_validation_years*12 :n_train + n_validation_years*12 + params['forecast_range_months'],...]
 
                 if params['masked_weights']:
                     weights_mask = land_mask.copy()
@@ -399,10 +411,10 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                     weights_mask = weights_mask.where(weights_mask == 0 ,1).values
                 else:
                     weights_mask = None
+
                 if NPSProj:
                     weights = (np.ones_like(ds_train.lon) * (np.ones_like(ds_train.lat.to_numpy()))[..., None])  # Moved this up
                     weights = xr.DataArray(weights, dims = ds_train.dims[-2:], name = 'weights').assign_coords({'lat': ds_train.lat, 'lon' : ds_train.lon})
-                    
                     # weights = weights * land_mask_smooth   if params['masked_weights'] else weights
                     weights_ = weights * land_mask
                 else:
@@ -412,15 +424,6 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                     weights_ = weights * land_mask
                     if params['equal_weights']:
                         weights = xr.ones_like(weights)
-                    # if any(['land_mask' not in time_features, model not in [cVAE]]):
-                    # weights = weights * land_mask_smooth   if params['masked_weights'] else weights
-                
-                if loss_region is not None:
-                    loss_region_indices, loss_area = get_coordinate_indices(ds_raw_ensemble_mean, loss_region, flat = False)  ### the function has to be editted for flat opeion!!!!! 
-                
-                else:
-                    loss_region_indices = None
-
 
                 del ds, obs
                 gc.collect()
@@ -429,21 +432,34 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                 weights = weights.values
                 weights_ = weights_.values
 
+
+                if lead_time is not None:
+                    mask =  create_mask(full_shape)[:n_train]  #create_mask(ds)[:n_train]
+                    val_mask = create_mask(full_shape[n_train:n_train + n_validation_years *12] )[:, lead_time - 1][..., None] ####create_mask(ds_raw_ensemble_mean)[n_train:n_train + num_val_years*12] 
+                else:
+                    val_mask = create_mask(ds_validation)
+                    mask = train_mask
+
+                train_set = XArrayDataset(ds_train, obs_train, mask=mask, zeros_mask = zeros_mask, in_memory=True, lead_time=lead_time, time_features=time_features, aligned = True,  model = 'UNet2') 
+                dataloader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
+                
+                validation_set = XArrayDataset(ds_validation, obs_validation, mask=val_mask, zeros_mask = zeros_mask, lead_time=lead_time, time_features=time_features, in_memory=True, aligned = True,  model = 'UNet2') 
+                dataloader_val = DataLoader(validation_set, batch_size=batch_size, shuffle=False)                   
+                
+                ############################################## Prepare model #######################################
                 if time_features is None:
-                    if ensemble_features: ## PG: We can choose to add an ensemble feature.
-                        add_feature_dim = 1
-                    else:
                         add_feature_dim = 0
                 else:
-                    if ensemble_features:
-                        add_feature_dim = len(time_features) + 1
-                    else:
                         add_feature_dim = len(time_features)
                 if 'land_mask' in time_features:
                     add_feature_dim -= 1
-
+                if 'ensemble_error' in time_features:
+                    add_feature_dim -= 1
 
                 n_channels_x = len(ds_train.channels)
+
+                model_mask_ = torch.from_numpy(model_mask.to_numpy()).unsqueeze(0).expand(n_channels_x + add_feature_dim,*model_mask.shape)
+                obs_mask = torch.from_numpy(land_mask.to_numpy()).unsqueeze(0)
                 
                 if params['path_to_deterministic'] is not None:
                     from preprocessing import extract_params
@@ -452,75 +468,74 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                     NPSProj_saved = False if '1x1' in params['path_to_deterministic'] else True          
                     params_saved['combined_prediction'] = True if 'combined' in params['path_to_deterministic'] else False
                     lead_time_saved = eval(params['path_to_deterministic'].split('_LT')[1].split('_')[0]) if 'LT' in params['path_to_deterministic'] else None
+                    n_val_year_saved = int(params['path_to_deterministic'].split('_VAL')[1][:1]) if '_VAL' in params['path_to_deterministic'] else 0
+                    try:
+                        LocallyConnected_saved = params_saved['LocallyConnected']
+                    except:
+                        LocallyConnected_saved = False
                     if test_year*100 + month <= ds_raw_ensemble_mean.time[-1]:
-                        saved_model_year_dir = f'/*-{test_year * 100 + month -1}*.pth'
+                        saved_model_year_dir = f'*-{(test_year - n_val_year_saved) * 100 + month -1}*.pth'
                     else:
-                        saved_model_year_dir = f'/*final*.pth'
+                        saved_model_year_dir = f'*final*.pth'
+
                     assert NPSProj_saved == NPSProj, 'The saved deterministic model cannot have a trained for a different projection than your cVAE!'
+                    version_saved = eval(params['path_to_deterministic'].split('/')[-1].split('_')[3][1:]) if 'VAL' not in params['path_to_deterministic'] else eval(params['path_to_deterministic'].split('/')[-1].split('_')[4][1:])
                     if params['version'] == 'IceExtent':
-                        assert eval(params['path_to_deterministic'].split('/')[-1].split('_')[3][1:]) in  ['IceExtent', 1]
+                        assert version_saved in  ['IceExtent', 1]
                     else:
-                        assert eval(params['path_to_deterministic'].split('/')[-1].split('_')[3][1:]) == params['version'], 'The saved deterministic model cannot have a different version than your cVAE!'
+                        assert version_saved == params['version'], 'The saved deterministic model cannot have a different version than your cVAE!'
                     assert lead_time_saved == lead_time, 'The saved deterministic model cannot have a trained for a different lead_time than your cVAE!'
                     assert params['time_features'] == params_saved['time_features'], 'The saved deterministic model must have the same input as your cVAE for the model data and added features!'
                     assert params_saved['combined_prediction'] == params['combined_prediction'], 'The saved deterministic model must have the same output type as your cVAE'
- 
+                    assert LocallyConnected == LocallyConnected_saved, 'The saved deterministic model must have the same output layer as your cVAE'
                     from models.unetconvnext import UNet2,UNet2_NPS
                     model = eval(params_saved['model'])
-                    unet = model(n_channels_x= n_channels_x+ add_feature_dim , bilinear = params_saved['bilinear'], sigmoid = sigmoid_activation, skip_conv = params_saved['skip_conv'], combined_prediction = params_saved['combined_prediction'])
+                    unet = model(n_channels_x= n_channels_x+ add_feature_dim , bilinear = params_saved['bilinear'], sigmoid = sigmoid_activation, skip_conv = params_saved['skip_conv'], combined_prediction = params_saved['combined_prediction'], LocallyConnected = LocallyConnected_saved)
+                    saved_model_dir = glob.glob(params['path_to_deterministic']+ '/Checkpoints/' +saved_model_year_dir)
+                    
+                    saved_model_dir.sort()
                     try:
-                        unet.load_state_dict(torch.load(glob.glob(params['path_to_deterministic']+ saved_model_year_dir)[0], map_location=torch.device('cpu'))) 
+                        unet.load_state_dict(torch.load(saved_model_dir[0], map_location=torch.device('cpu')))
                     except:
-                        try:
-                            unet.load_state_dict(torch.load(glob.glob(params['path_to_deterministic']+ '/Checkpoints/' +saved_model_year_dir)[0], map_location=torch.device('cpu')))
-                        except:
-                            print(f'No saved deterministic model found for test year {test_year}')
-                            break
-                    # unet.to(device) temporarily not input to check whether sending the net to device does automatically take care of this
+                        print(f'No saved deterministic model found for test year {test_year}')
+                        break
                 else:
                     unet = None
+                                           
+                model = params['model']
+                net = model(VAE_latent_size = params['VAE_latent_size'], n_channels_x= n_channels_x+ add_feature_dim , sigmoid = sigmoid_activation, NPS_proj = NPSProj, combined_prediction = params['combined_prediction'], VAE_MLP_encoder = params['VAE_MLP_encoder'],
+                            scale_factor_channels = params['scale_factor_channels'], skip_VAE_added_dim = params['skip_VAE_added_dim'], saved_deterministic_model = unet, freeze_deterministic = params['freeze_deterministic'], clamped = params['clamped'],
+                              learn_decoder_variance = params['learn_decoder_variance']['status'], noise_injection_std = params['learn_decoder_sampler']['noise_std'], noise_injection_level =  params['learn_decoder_sampler']['noise_injection_level'], LocallyConnected= LocallyConnected, device=device)   #temporarily not input to check whether sending the net to device does automatically take care of this
 
-
-                if lead_time is not None:
-                    mask =  create_mask(full_shape)[:n_train]  #create_mask(ds)[:n_train]
-                else:
-                    mask = train_mask
-
-                train_set = XArrayDataset(ds_train, obs_train, mask=mask, zeros_mask = zeros_mask, in_memory=False, lead_time=lead_time, time_features=time_features,ensemble_features =ensemble_features, aligned = True, month_min_max = month_min_max, model = 'UNet2') 
-                dataloader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
-                model_mask_ = torch.from_numpy(model_mask.to_numpy()).unsqueeze(0).expand(n_channels_x + add_feature_dim,*model_mask.shape)
-                obs_mask = torch.from_numpy(land_mask.to_numpy()).unsqueeze(0)
-                
-                net = cVAE(VAE_latent_size = params['VAE_latent_size'], n_channels_x= n_channels_x+ add_feature_dim , sigmoid = sigmoid_activation, NPS_proj = NPSProj, combined_prediction = params['combined_prediction'], VAE_MLP_encoder = params['VAE_MLP_encoder'],
-                            scale_factor_channels = params['scale_factor_channels'], skip_VAE_added_dim = params['skip_VAE_added_dim'], saved_deterministic_model = unet, freeze_deterministic = params['freeze_deterministic'],
-                              learn_decoder_variance = params['learn_decoder_variance']['status'], noise_injection_std = params['learn_decoder_sampler']['noise_std'], device=device)   #temporarily not input to check whether sending the net to device does automatically take care of this
-
-                if params['saved_checkpoint_dir'] is not None:
-                    if params['saved_checkpoint_dir'] == 'same':
+                if params['saved_checkpoint_dir'] != 'None':
+                    if params['saved_checkpoint_dir'].lower() == 'same':
                         saved_checkpoint_dir = results_dir
-                    if test_year*100 + month <= ds_raw_ensemble_mean.time[-1]:
-                        nameSave = f"MODEL_V{params['version']}_198101-{test_year * 100 + month -1}*"
+                    else:
+                        saved_checkpoint_dir = params['saved_checkpoint_dir'] 
+
+                    if test_year*100  + month <= ds_raw_ensemble_mean.time[-1]:
+                        nameSave = f"MODEL_V{params['version']}_198101-{(test_year - n_validation_years) * 100 + month -1}*"
                     else:
                         if lead_time is not None:
-                                nameSave = f"MODEL_final_V{params['version']}_198101-{int(ds_raw_ensemble_mean.time[-lead_time])}*"
+                                nameSave = f"MODEL_final_V{params['version']}_198101-{int(ds_raw_ensemble_mean.time[-lead_time]) - n_validation_years*100}*"
                         else:
-                                nameSave = f"MODEL_final_V{params['version']}_198101-{int(ds_raw_ensemble_mean.time[-1])}*"
-                    if len(glob.glob(saved_checkpoint_dir + '/' + nameSave)) > 0 :
-                        checkpoint_model_dir = glob.glob(saved_checkpoint_dir+ '/' + nameSave)[0]
-                    else:
-                        try:
-                            checkpoint_model_dir = glob.glob(saved_checkpoint_dir + '/Checkpoints/' + nameSave )[0]
-                        except:
-                            raise RuntimeError("No checkpoints found !")
-                        
-                    checkpoint_restart_epoch = int(checkpoint_model_dir.split('_epoch_')[1].split('.pth')[0])
-                    print(f'Restart training from epoch {checkpoint_restart_epoch} ...\n')
-                    with open(Path(results_dir, "training_parameters.txt"), 'a') as f:
-                        f.write(f"Restarted training from epoch {checkpoint_restart_epoch} ... \n")
-                        if params['saved_checkpoint_dir'] != 'same':
-                            f.write(f"contintuing {params['saved_checkpoint_dir']} \n")
+                                nameSave = f"MODEL_final_V{params['version']}_198101-{int(ds_raw_ensemble_mean.time[-1])- n_validation_years*100}*"
 
-                    net.load_state_dict(torch.load(checkpoint_model_dir, map_location=torch.device('cpu')))
+                    try:
+                        checkpoint_model_dir = glob.glob(saved_checkpoint_dir + '/Checkpoints/' + nameSave )[0]
+                        checkpoint_restart_epoch = int(checkpoint_model_dir.split('_epoch_')[1].split('.pth')[0])
+                        print(f'\nTest year {test_year} restart training from epoch {checkpoint_restart_epoch} ...\n')
+                        with open(Path(results_dir, "training_parameters.txt"), 'a') as f:
+                            f.write(f"\nTest year {test_year} restarted training from epoch {checkpoint_restart_epoch} ... \n")
+                            if params['saved_checkpoint_dir'].lower() != 'same':
+                                f.write(f"\nTest year {test_year} contintuing {params['saved_checkpoint_dir']} \n")
+
+                        net.load_state_dict(torch.load(checkpoint_model_dir, map_location=torch.device('cpu')))
+                    except:
+                        print("No checkpoints found !")
+                        break
+                        
+
                 else:
                     checkpoint_restart_epoch = 0
 
@@ -552,7 +567,6 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                         lr = params['lr']
                         multi_ress_loss_kernel_size = params['multi_ress_loss_kernel_size']
                         low_ress_loss_kernel_size = params['low_ress_loss_kernel_size']
-                        beta_ = params['beta']
 
                     elif training == 'training_decoder_variance':
                         print('Optimizing decoder variance ...')
@@ -575,60 +589,67 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                         multi_ress_loss_kernel_size = None
                         low_ress_loss_kernel_size = None
                         lr = 0.0001 
-                        beta_ = params['beta']
+
                         if params['learn_decoder_variance']['epochs'] is not None:
                             epochs = params['learn_decoder_variance']['epochs']  
                                                                
                         
                     optimizer = torch.optim.Adam(net.parameters(), lr=lr, weight_decay = l2_reg)
                     if params['lr_scheduler']:
-                        scheduler = lr_scheduler.LinearLR(optimizer, start_factor=params['start_factor'], end_factor=params['end_factor'], total_iters=params['total_iters'])
-                        # scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=params['total_iters'], eta_min=params['end_factor'])
-                    ## PG: XArrayDataset now needs to know if we are adding ensemble features. The outputs are datasets that are maps or flattened in space depending on the model.
-
+                        if num_warmup_epchs > 0:
+                            # scheduler = get_cosine_schedule_with_warmup(optimizer, len(dataloader) * num_warmup_epchs, len(dataloader) * params['epochs'],  min_lr)
+                            warmup_scheduler = LinearLR(optimizer, start_factor=0.0001, end_factor=1.0, total_iters=len(dataloader) * num_warmup_epchs)
+                            cosine_scheduler = CosineAnnealingLR(optimizer, T_max=len(dataloader) * (params['epochs']  - num_warmup_epchs), eta_min=min_lr)
+                            scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler],milestones=[len(dataloader) * num_warmup_epchs])
+                        else:   
+                            scheduler = CosineAnnealingLR(optimizer, T_max=len(dataloader) * params['epochs'], eta_min=min_lr)     
+                               
                     
-                    # if reg_scale is None: ## PG: if no penalizing for negative anomalies
+
                     if params['version'] == 'IceExtent':
                         criterion = BCElossKLD(device=device,  reduction=params['loss_reduction'])
 
                     else:
                         if params['low_ress_loss_kernel_size'] is None:  
-                            # criterion = WeightedMSEKLD(weights=weights, device=device, weights_mask = weights_mask, hyperparam=1, reduction=params['loss_reduction'], loss_area=loss_region_indices, scale=reg_scale, multi_ress_loss_kernel_size = multi_ress_loss_kernel_size)
-                            criterion = VAEloss(weights=weights, device=device, weights_mask = weights_mask,  reduction=params['loss_reduction'], loss_area=loss_region_indices, scale=reg_scale, 
+                            # criterion = WeightedMSEKLD(weights=weights, device=device, weights_mask = weights_mask, hyperparam=1, reduction=params['loss_reduction'], multi_ress_loss_kernel_size = multi_ress_loss_kernel_size)
+                            criterion = VAEloss(weights=weights, device=device, weights_mask = weights_mask,  reduction=params['loss_reduction'], 
                                                 multi_ress_loss_kernel_size = multi_ress_loss_kernel_size, learn_decoder_variance = learn_decoder_variance_training_step, decoder_inject_noise = decoder_inject_noise)
                     
                         else:
-                            # criterion = WeightedMSELowRessKLD(weights=weights, device=device, weights_mask = weights_mask, hyperparam=1, reduction=params['loss_reduction'], loss_area=loss_region_indices, scale=reg_scale, kernel = params['low_ress_loss_kernel_size'])
-                            criterion = VAElossLowRess(weights=weights, device=device, weights_mask = weights_mask, reduction=params['loss_reduction'], loss_area=loss_region_indices, scale=reg_scale,
+                            # criterion = WeightedMSELowRessKLD(weights=weights, device=device, weights_mask = weights_mask, hyperparam=1, reduction=params['loss_reduction'],kernel = params['low_ress_loss_kernel_size'])
+                            criterion = VAElossLowRess(weights=weights, device=device, weights_mask = weights_mask, reduction=params['loss_reduction'], 
                                                         kernel = low_ress_loss_kernel_size, learn_decoder_variance = learn_decoder_variance_training_step, decoder_inject_noise = decoder_inject_noise)
                     
-                    
+                    # scaler = GradScaler()
+                #################################################### Train/Eval Loop #############################################
                     if params['combined_prediction']:
                         criterion_extent = nn.BCELoss()
 
                     epoch_loss = []
                     epoch_MSE = []
                     epoch_KLD = []
-                    net.train()
+
+                    epoch_loss_validation = []
+                    epoch_loss_validation_GCN = []
+                    epoch_MSE_validation = []
+                    epoch_KLD_validation = []
+
+                    
                     num_batches = len(dataloader)
+                    num_batches_val = len(dataloader_val)
                     step = 0
 
                     for epoch in tqdm.tqdm(range(epochs)):
+                        ################################# Train ###############################
+                        net.train()
                         batch_loss = 0
                         batch_loss_MSE = 0
                         batch_loss_KLD = 0
+                        optimizer.zero_grad()
+
                         for batch, (x, y) in enumerate(dataloader):
 
-                            if type(beta_) == dict:
-                                if epoch + 1< beta_['start_epoch']:
-                                    beta = beta_['start']
-                                else:
-                                    range_epochs = (beta_['end_epoch'] - beta_['start_epoch'] + 1)*num_batches
-                                    step_beta = np.clip((step - (beta_['start_epoch'] - 1)* num_batches) /(range_epochs),a_min = 0, a_max = None)
-                                    beta = beta_['start'] + (beta_['end'] - beta_['start']) * min(step_beta, 1)
-
-                            else:
-                                beta = beta_
+                            beta = beta_finder(step, num_batches, params['beta'] )
                             step = step +1
 
                             if (type(x) == list) or (type(x) == tuple):
@@ -644,9 +665,9 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                                 y = y.to(device)
                                 m  = None
 
-                            optimizer.zero_grad()
+                            # optimizer.zero_grad() ### before adding grad accumulation
                             obs_mask = obs_mask.to(y).expand_as(y[0])
-
+                            
                             if params['learn_decoder_variance']['status']:
                                 generated_output, output_logvar, _, mu, log_var , cond_mu, cond_log_var = net(y, obs_mask, x, model_mask_, sample_size = params['learn_decoder_sampler']["decoder_sample_size"], inject_noise = decoder_inject_noise )
                             else:
@@ -666,6 +687,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                                 y_ = y.unsqueeze(0).expand_as(generated_output)
                             else:
                                 y_ = y
+
                             
                             loss, MSE, KLD = criterion(y_, generated_output, output_logvar ,mu, log_var, cond_mu = cond_mu, cond_log_var = cond_log_var ,beta = beta, mask = m, return_ind_loss=True , print_loss = True)
                             
@@ -689,7 +711,6 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                                     loss_extent_GCGN = criterion_extent(generated_output_GCGN_extent, y_extent.unsqueeze(0).expand_as(generated_output_extent))
                                     loss_extent = loss_extent * params['hybrid_weight'] + ( 1- params['hybrid_weight']) * loss_extent_GCGN
                                     del generated_output_GCGN_extent, y_extent
-                                    torch.cuda.empty_cache() 
                             
 
                                 loss_GCGN = criterion(y_, generated_output_GCGN,output_logvar_GCGN , mask = m , return_ind_loss=False , print_loss = False)
@@ -697,46 +718,222 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                                 loss = loss * params['hybrid_weight'] + ( 1- params['hybrid_weight']) * loss_GCGN
                                 del generated_output_GCGN
                                 if learn_decoder_variance_training_step:
-                                    output_logvar_GCGN
+                                    del output_logvar_GCGN
                                 torch.cuda.empty_cache() 
 
                             if params['combined_prediction']:
                                 loss = loss + loss_extent
-
+    
                             batch_loss += loss.item()
                             batch_loss_MSE += MSE.item()
                             batch_loss_KLD += KLD.item()
+
+                            loss = loss / grad_accumulation_steps
                             loss.backward()
+
+                            if (batch + 1) % grad_accumulation_steps == 0:
+                                optimizer.step()
+                                if params['lr_scheduler']:
+                                    scheduler.step()
+                                optimizer.zero_grad()
+
+                        if (batch + 1) % grad_accumulation_steps != 0:
                             optimizer.step()
+                            if params['lr_scheduler']:
+                                scheduler.step()
+                            optimizer.zero_grad()
+
                         epoch_loss.append(batch_loss / num_batches)
                         epoch_MSE.append(batch_loss_MSE / num_batches)
                         epoch_KLD.append(batch_loss_KLD / num_batches)
 
-                        if params['lr_scheduler']:
-                            scheduler.step()
 
+                        del x, y , y_, m, mu, log_var , cond_mu, cond_log_var, loss, MSE, KLD 
+                        gc.collect()
+                        torch.cuda.empty_cache() 
+                        ################################# Validation ###############################
+                        net.eval()
+                        batch_loss_validation = 0
+                        batch_loss_validation_GCN = 0
+                        batch_loss_MSE_validation = 0
+                        batch_loss_KLD_validation = 0
+                        for batch, (x, y) in enumerate(dataloader_val):
+                            with torch.no_grad():   
+                                if (type(x) == list) or (type(x) == tuple):
+                                    x = (x[0].to(device), x[1].to(device))    
+                                else:
+                                    x = x.to(device)                                
+                                
+                                if (type(y) == list) or (type(y) == tuple):
+                                    y, m = (y[0].to(device), y[1].to(device))
+                                else:
+                                    y = y.to(device)
+                                    m  = None
+
+                                if params['learn_decoder_variance']['status']:
+                                    generated_output, output_logvar, _, mu, log_var , cond_mu, cond_log_var = net(y, obs_mask, x, model_mask_, sample_size = params['learn_decoder_sampler']["decoder_sample_size"], inject_noise = decoder_inject_noise )
+                                else:
+                                    generated_output, _, mu, log_var , cond_mu, cond_log_var = net(y, obs_mask, x, model_mask_, sample_size = params['learn_decoder_sampler']["decoder_sample_size"], inject_noise = decoder_inject_noise )
+                                    output_logvar = None
+                                
+                                if not learn_decoder_variance_training_step:
+                                    output_logvar = None
+
+
+                                if params['combined_prediction']:
+                                    (y, y_extent) = (y[:,0].unsqueeze(1), y[:,1].unsqueeze(1))
+                                    (generated_output, generated_output_extent) = generated_output
+                                    loss_extent = criterion_extent(generated_output_extent, y_extent.unsqueeze(0).expand_as(generated_output_extent))
+                                    del generated_output_extent
+                                
+                                if not decoder_inject_noise:
+                                    y_ = y.unsqueeze(0).expand_as(generated_output)
+                                else:
+                                    y_ = y
+                                
+                                loss, MSE, KLD = criterion(y_, generated_output, output_logvar ,mu, log_var, cond_mu = cond_mu, cond_log_var = cond_log_var ,beta = beta, mask = m, return_ind_loss=True , print_loss = False)
+
+                                
+                                del generated_output
+                                if learn_decoder_variance_training_step:
+                                    del output_logvar
+                                torch.cuda.empty_cache() 
+
+                                
+                                if params['learn_decoder_variance']['status']:
+                                    generated_output_GCGN, output_logvar_GCGN, _, _, _ , _, _ = net(y, obs_mask, x, model_mask_, sample_size = params['learn_decoder_sampler']["decoder_sample_size"], mode = 'GCGN', inject_noise = decoder_inject_noise )   
+                                else:
+                                    generated_output_GCGN, _, _, _ , _, _ = net(y, obs_mask, x, model_mask_, sample_size = params['learn_decoder_sampler']["decoder_sample_size"], mode = 'GCGN', inject_noise = decoder_inject_noise )  
+                                    output_logvar_GCGN = None
+
+                                if not learn_decoder_variance_training_step:
+                                    output_logvar_GCGN = None
+
+                                if params['combined_prediction']:
+                                    (generated_output_GCGN, generated_output_GCGN_extent) = generated_output_GCGN
+                                    loss_extent_GCGN = criterion_extent(generated_output_GCGN_extent, y_extent.unsqueeze(0).expand_as(generated_output_extent))
+                                    loss_extent = loss_extent * params['hybrid_weight'] + ( 1- params['hybrid_weight']) * loss_extent_GCGN
+                                    del generated_output_GCGN_extent, y_extent
+                                    torch.cuda.empty_cache() 
+                                
+
+                                loss_GCGN = criterion(y_, generated_output_GCGN,output_logvar_GCGN , mask = m , return_ind_loss=False , print_loss = False)
+                                if params['hybrid_weight'] is not None:
+                                    loss = loss * params['hybrid_weight'] + ( 1- params['hybrid_weight']) * loss_GCGN
+                                del generated_output_GCGN
+                                if learn_decoder_variance_training_step:
+                                    del output_logvar_GCGN
+                                torch.cuda.empty_cache() 
+
+                                if params['combined_prediction']:
+                                    loss = loss + loss_extent
+
+                                batch_loss_validation += loss.item()
+                                batch_loss_validation_GCN += loss_GCGN.item()
+                                batch_loss_MSE_validation += MSE.item()
+                                batch_loss_KLD_validation += KLD.item()
+
+                        epoch_loss_validation.append(batch_loss_validation / num_batches_val)
+                        epoch_loss_validation_GCN.append(batch_loss_validation_GCN / num_batches_val)
+                        epoch_MSE_validation.append(batch_loss_MSE_validation / num_batches_val)
+                        epoch_KLD_validation.append(batch_loss_KLD_validation / num_batches_val)
+
+                        if epoch == 0:
+                            best_valScore = epoch_MSE_validation[-1]
+                            best_valScore_GCN = epoch_loss_validation_GCN[-1]
+                            earlystopping_counter = 0
+                            if params['saved_checkpoint_dir'] != 'None':
+                                    if test_year*100 + month <= ds_raw_ensemble_mean.time[-1]:
+                                        nameSave = f"MODEL_V{params['version']}_198101-{(test_year - n_validation_years) * 100 + month -1}"
+                                    else:
+                                        if lead_time is not None:
+                                                nameSave = f"MODEL_final_V{params['version']}_198101-{int(ds_raw_ensemble_mean.time[-lead_time]) - n_validation_years * 100}"
+                                        else:
+                                                nameSave = f"MODEL_final_V{params['version']}_198101-{int(ds_raw_ensemble_mean.time[-1]) - n_validation_years * 100 }"   
+                                                
+                                    torch.save( net.state_dict(), results_dir + '/Checkpoints/' + nameSave + f"_epoch_{epoch + 1 + checkpoint_restart_epoch}.pth")
+
+                        del x, y, y_ , m, mu, log_var , cond_mu, cond_log_var, loss, MSE, KLD 
+                        gc.collect()
+                        torch.cuda.empty_cache() 
+                        ################################# Save Checkpoints ###############################
                         if np.mod(epoch + 1 + checkpoint_restart_epoch , 10) == 0:
 
+                                fig, ax = plt.subplots(1,1, figsize=(8,5))
+                                if params['version'] == 'IceExtent':
+                                    label = 'BCE' 
+                                elif learn_decoder_variance_training_step: 
+                                    label = 'LLH'
+                                elif decoder_inject_noise:
+                                    label = 'CRPS'
+                                else:
+                                    label = 'MSE' 
+                                ax.plot(np.arange(1,len(epoch_loss)+1), epoch_loss, color = 'r', label = 'Epoch loss total')
+                                ax.plot(np.arange(1,len(epoch_loss)+1), epoch_MSE, color = 'b', label = f'Epoch {label} only')
+                                ax.plot(np.arange(1,len(epoch_loss)+1), epoch_KLD, color = 'g', label = 'Epoch KLD')
+
+                                ax.plot(np.arange(1,len(epoch_loss)+1), epoch_loss_validation, color = 'r', linestyle = 'dashed', label = 'Val loss total')
+                                ax.plot(np.arange(1,len(epoch_loss)+1), epoch_loss_validation_GCN, color = 'k', linestyle = 'dashed', label = 'Val loss GCN')
+                                ax.plot(np.arange(1,len(epoch_loss)+1), epoch_MSE_validation, color = 'b', linestyle = 'dashed', label = f'Val {label} only')
+                                ax.plot(np.arange(1,len(epoch_loss)+1), epoch_KLD_validation, color = 'g', linestyle = 'dashed', label = 'Val KLD')
+
+                                ax.set_title(f'Train/Val Loss ') ###
+                                ax.legend()
+                                ax.set_xlabel('Epoch')
+                                ax.set_ylabel('Loss')
+                                plt.show()
+                                try:
+                                    os.remove(glob.glob(results_dir+f'/Figures/train_val_loss_198101-{(test_year - n_validation_years )* 100 + month -1}_{training}_epoch_{checkpoint_restart_epoch}_*.png')[0])
+                                except:
+                                    pass
+                                plt.savefig(results_dir+f'/Figures/train_val_loss_198101-{(test_year - n_validation_years )* 100 + month -1}_{training}_epoch_{checkpoint_restart_epoch}_{len(epoch_loss) + checkpoint_restart_epoch}.png')
+                                plt.close()
+
+                                
+                        ################################# Early Stopping ###############################
+                        if epoch > 0:
+                            if epoch_MSE_validation[-1] < best_valScore - ( 0.02 * best_valScore):  # if new score not 5% better than best val score
+                                best_valScore = epoch_MSE_validation[-1]
+                                best_valScore_GCN = epoch_loss_validation_GCN[-1]
+                                earlystopping_counter = 0
                                 if test_year*100 + month <= ds_raw_ensemble_mean.time[-1]:
-                                    nameSave = f"MODEL_V{params['version']}_198101-{test_year * 100 + month -1}"
+                                    nameSave = f"MODEL_V{params['version']}_198101-{(test_year - n_validation_years) * 100 + month -1}"
                                 else:
                                     if lead_time is not None:
-                                            nameSave = f"MODEL_final_V{params['version']}_198101-{int(ds_raw_ensemble_mean.time[-lead_time])}"
+                                            nameSave = f"MODEL_final_V{params['version']}_198101-{int(ds_raw_ensemble_mean.time[-lead_time]) - n_validation_years * 100}"
                                     else:
-                                            nameSave = f"MODEL_final_V{params['version']}_198101-{int(ds_raw_ensemble_mean.time[-1])}"
+                                            nameSave = f"MODEL_final_V{params['version']}_198101-{int(ds_raw_ensemble_mean.time[-1] - n_validation_years * 100 )}"
                                             
                                 saved_model = glob.glob(results_dir + '/Checkpoints/' + nameSave + "*.pth")
                                 if len(saved_model) > 0:
                                     for link in saved_model:
                                         os.remove(link)
                                 torch.save( net.state_dict(), results_dir + '/Checkpoints/' + nameSave + f"_epoch_{epoch + 1 + checkpoint_restart_epoch}.pth")
+                                Early_stop = False
+                            else:
+                                if params['earlystoppingbuffer'] is not None:
+                                    earlystopping_counter += 1
+                                    if params['version'] == 'IceExtent':
+                                        loss_function = 'BCE' 
+                                    elif learn_decoder_variance_training_step: 
+                                        loss_function = 'LLH'
+                                    elif decoder_inject_noise:
+                                        loss_function = 'CRPS'
+                                    else:
+                                        loss_function = 'MSE' 
+                    
+                                    if (earlystopping_counter >= params['earlystoppingbuffer']) and (epoch >= 15 ):  # want to train for at least 20 epochs
+                                        print(
+                                            f"Stopping early --> epoch val {loss_function} score {epoch_MSE_validation[-1]} has not decreased over {params['earlystoppingbuffer']} epochs compared to best {best_valScore} ")
+                                        with open(Path(results_dir, "training_parameters.txt"), 'a') as f:
+                                            f.write(f"\n Test year {test_year}, stopping early at {epoch + 1 + checkpoint_restart_epoch} --> epoch val {loss_function} score {epoch_MSE_validation[-1]} has not decreased over {params['earlystoppingbuffer']} epochs compared to best {best_valScore}\n")
+                                        Early_stop = True
+                                        break
 
-
-
-                    del x, y , m, mu, log_var , cond_mu, cond_log_var, optimizer 
-
+                    del optimizer
                     gc.collect()
                     torch.cuda.empty_cache() 
+                    ################################# Plot ###############################
                     fig, ax = plt.subplots(1,1, figsize=(8,5))
                     if params['version'] == 'IceExtent':
                         label = 'BCE' 
@@ -746,48 +943,54 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                         label = 'CRPS'
                     else:
                          label = 'MSE' 
-                    ax.plot(np.arange(1,epochs+1), epoch_loss, label = 'Epoch loss total')
-                    ax.plot(np.arange(1,epochs+1), epoch_MSE, linestyle = 'dashed', label = f'Epoch {label} only')
-                    ax.plot(np.arange(1,epochs+1), epoch_KLD, linestyle = 'dotted', label = 'Epoch KLD')
+                    if params['combined_prediction']:
+                        label = label + ' + BCE' 
+                    ax.plot(np.arange(1,len(epoch_loss)+1), epoch_loss, color = 'r', label = 'Epoch loss total')
+                    ax.plot(np.arange(1,len(epoch_loss)+1), epoch_MSE, color = 'b', label = f'Epoch {label} only')
+                    ax.plot(np.arange(1,len(epoch_loss)+1), epoch_KLD, color = 'g', label = 'Epoch KLD')
 
-                    ax.set_title(f'Train Loss ') ###
+                    ax.plot(np.arange(1,len(epoch_loss)+1), epoch_loss_validation, color = 'r', linestyle = 'dashed', label = 'Val loss total')
+                    ax.plot(np.arange(1,len(epoch_loss)+1), epoch_loss_validation_GCN, color = 'k', linestyle = 'dashed', label = 'Val loss GCN')
+                    ax.plot(np.arange(1,len(epoch_loss)+1), epoch_MSE_validation, color = 'b', linestyle = 'dashed', label = f'Val {label} only')
+                    ax.plot(np.arange(1,len(epoch_loss)+1), epoch_KLD_validation, color = 'g', linestyle = 'dashed', label = 'Val KLD')
+
+                    ax.set_title(f'Train/Val Loss - best val loss : {best_valScore} - GCN loss : {best_valScore_GCN}') ###
                     ax.legend()
                     ax.set_xlabel('Epoch')
                     ax.set_ylabel('Loss')
                     plt.show()
-                    plt.savefig(results_dir+f'/Figures/train_loss_198101-{test_year * 100 + month -1}_{training}_epoch_{epochs + checkpoint_restart_epoch}.png')
+                    try:
+                        os.remove(glob.glob(results_dir+f'/Figures/train_val_loss_198101-{(test_year - n_validation_years )* 100 + month -1}_{training}_epoch_{checkpoint_restart_epoch}_*.png')[0])
+                    except:
+                        pass
+                    plt.savefig(results_dir+f'/Figures/train_val_loss_198101-{(test_year - n_validation_years )* 100 + month -1}_{training}_epoch_{checkpoint_restart_epoch}_{len(epoch_loss) + checkpoint_restart_epoch}.png')
                     plt.close()
 
-                del train_set, dataloader, ds_train, obs_train
-
-                # EVALUATE MODEL
+                del train_set, dataloader, ds_train, obs_train,
+                del validation_set, dataloader_val, ds_validation, obs_validation
+                gc.collect()
+                torch.cuda.empty_cache() 
+              
+                # Test years
                 ##################################################################################################################################
+                              
                 if test_year*100 + month <= ds_raw_ensemble_mean.time[-1]:
                     
-                    
-                    if save:
-                        nameSave = f"MODEL_V{params['version']}_198101-{test_year * 100 + month -1}_epoch_{epochs + checkpoint_restart_epoch}.pth"    
-                        torch.save( net.state_dict(),results_dir + '/' + nameSave)
-                        try:
-                            nameSave = f"MODEL_V{params['version']}_198101-{test_year * 100 + month -1}*.pth"
-                            ls_checkpoints = glob.glob(results_dir + '/Checkpoints/' + nameSave)
-                            for link in ls_checkpoints:
-                                os.remove(link)
-                        except:
-                            pass
-                    
+                    if Early_stop:
+                        net.load_state_dict(torch.load(glob.glob(results_dir + '/Checkpoints/' + f"MODEL_V{params['version']}_198101-{(test_year - n_validation_years) * 100 + month -1}*.pth")[0], map_location=torch.device('cpu')))
+                        print('Loading the best checkpoint model ...')
+                        net.to(device)
 
                     test_years_list = np.arange(1, ds_test.shape[0] + 1)
                     test_lead_time_list = np.arange(1, ds_test.shape[1] + 1)
 
         
                     ## PG: Extract the number of years as well 
-                    test_set = XArrayDataset(ds_test, obs_test, lead_time=lead_time,mask = None,zeros_mask = zeros_mask, time_features=time_features,ensemble_features =ensemble_features,  in_memory=False, aligned = True, month_min_max = month_min_max, model = 'UNet2')
+                    test_set = XArrayDataset(ds_test, obs_test, lead_time=lead_time,mask = None,zeros_mask = zeros_mask, time_features=time_features,  in_memory=False, aligned = True,  model = 'UNet2')
                     if params['version'] == 'IceExtent':   
                         criterion_test = nn.BCELoss( reduction='mean')
                     else:
-                        
-                        criterion_test =  WeightedMSE(weights=weights_, device=device, hyperparam=1, reduction='mean', loss_area=loss_region_indices)
+                        criterion_test =  WeightedMSE(weights=weights_, device=device, hyperparam=1, reduction='mean')
 
 
                     test_loss = np.zeros(shape=(test_set.target.shape[0]))
@@ -826,18 +1029,23 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                                 m = None
                             del x, target
                             if params['learn_decoder_variance']['status']:
-                                _, _, deterministic_output, _, _, cond_mu, cond_log_var = net(test_obs, obs_mask, test_raw, model_mask_, sample_size = 1, inject_noise = decoder_inject_noise )
+                                _, _, deterministic_output, mu, log_var, cond_mu, cond_log_var = net(test_obs, obs_mask, test_raw, model_mask_, sample_size = 1, inject_noise = decoder_inject_noise )
                             else:
-                                _, deterministic_output, _, _, cond_mu, cond_log_var = net(test_obs, obs_mask, test_raw, model_mask_, sample_size = 1, inject_noise = decoder_inject_noise )
+                                _, deterministic_output, mu, log_var, cond_mu, cond_log_var = net(test_obs, obs_mask, test_raw, model_mask_, sample_size = 1, inject_noise = decoder_inject_noise )
 
                             basic_unet = net.unet(test_raw, model_mask_) if not net.loaded_unet else net.unet(test_raw, model_mask_[0,...])
-                            cond_var = torch.exp(cond_log_var) + 1e-4
-                            cond_std = torch.sqrt(cond_var)
-
-                            z =  Normal(cond_mu, cond_std).rsample(sample_shape=(params['BVAE'],)).squeeze().to(device)
-                            # z = torch.unflatten(z , dim = -1, sizes = cond_std.shape[-3:])
+                            if all([cond_mu is not None, cond_log_var is not None]):
+                                cond_var = torch.exp(cond_log_var) + 1e-4
+                                cond_std = torch.sqrt(cond_var)
+                                z =  Normal(cond_mu, cond_std).rsample(sample_shape=(params['BVAE'],)).squeeze().to(device)    ### should squeeze be there?
+                                # z = torch.unflatten(z , dim = -1, sizes = cond_std.shape[-3:])
+                            else:
+                                z =  Normal(torch.zeros_like(mu), torch.ones_like(log_var)).rsample(sample_shape=(params['BVAE'],)).squeeze().to(device)    ### should squeeze be there?
+                            
                             out = net.generation(z, inject_noise = params['learn_decoder_sampler']['status']) + basic_unet.squeeze() 
                             generated_output = net.last_conv(out)
+                            if params['clamped']:
+                                generated_output = torch.clamp(generated_output, 0, 1)
                             output_logvar = net.last_conv_var(out) if params['learn_decoder_variance']['status'] else None
 
                             if params['combined_prediction']:
@@ -866,10 +1074,14 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                             test_results[:,i,] = generated_output.squeeze().to(torch.device('cpu')).numpy()
                             test_results_deterministic[i,] = deterministic_output.squeeze().to(torch.device('cpu')).numpy()
                             test_loss[i] = loss.item()
-                    del  test_set , test_raw, test_obs, m, deterministic_output,  generated_output , ds_test, obs_test, cond_mu, cond_var, cond_std, basic_unet
+                    del  test_set , test_raw, test_obs, m, deterministic_output,  generated_output , ds_test, obs_test, basic_unet, mu, log_var
+                    try:
+                        del cond_mu, cond_var, cond_std
+                    except:
+                        pass
                     gc.collect()
                     torch.cuda.empty_cache() 
-                    ###################################################### has to be eddited for large ensembles!! #####################################################################
+                    ###################################################### reverse preprocessing steps #####################################################################
                     results_shape[:] = test_results[:]
                     results_shape_deterministic[:] = test_results_deterministic[:]
 
@@ -954,21 +1166,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                     gc.collect()
                     torch.cuda.empty_cache()                     
                      
-                else:
-                    if lead_time is not None:
-                        nameSave = f"MODEL_final_V{params['version']}_198101-{int(ds_raw_ensemble_mean.time[-lead_time])}_epoch_{epochs + checkpoint_restart_epoch}.pth"
-                    else:
-                        nameSave = f"MODEL_final_V{params['version']}_198101-{int(ds_raw_ensemble_mean.time[-1])}_epoch_{epochs + checkpoint_restart_epoch}.pth"
-                    # Save locally
-                    torch.save( net.state_dict(),results_dir + '/' + nameSave)
-                    try:
-                        ls_checkpoints = glob.glob(results_dir + '/Checkpoints/' + nameSave.split('_epoch')[0] + '*.pth')
-                        for link in ls_checkpoints:
-                                os.remove(link)             
-                    except:
-                        pass
 
-                    break
             if len(monthly_results) >0 :
                 # if lead_time is None:
                     xr.concat(monthly_results, dim = 'time').to_netcdf(path=Path(results_dir, f'nn_adjusted_ENS_{test_year}_{run+1}.nc', mode='w'))
@@ -1011,70 +1209,93 @@ def torch_normal_sampling( mu, std, num_samples = 1, truncated_dist = None, mult
                 z =  Normal(mu, std).rsample(sample_shape=(num_samples,))
         return z
     
+def beta_finder(step, num_batches, beta ):
+    if type(beta) == dict:
+        if beta['num_epochs_hold'] is None:
+            range_epochs = (beta['num_epoch_warmup'])*num_batches
+            return beta['start'] + (beta['end'] - beta['start']) * min((step /range_epochs), 1)
+        else:
+
+            range_epochs =   (beta['num_epoch_warmup'] + beta['num_epochs_hold'])*num_batches                              
+            cycle_pos = step % range_epochs
+            return  beta['start'] + (beta['end'] - beta['start']) * min ((cycle_pos / (beta['num_epoch_warmup']*num_batches)),1)
+    else:
+        return beta
+
+
+
+                  
 
 if __name__ == "__main__":
 
-  
-    n_years =  5 # last n years to test consecutively
+    test_years = [2021]
+    n_years =  2 # last n years to test consecutively
     lead_months = 12
     lead_time = None ## None for training using all available lead_times as indicated ny lead_months
     n_runs = 1  # number of training runs
-    
+    n_validation_years = 3
 
     params = {
-        "model": cVAE,
-        "path_to_deterministic" : '/space/hall7/sitestore/eccc/crd/cccma/users/rpg002/output/SI/Full/results/NASA/UNet2/run_set_3_convnext/N5_M12_F12_v1.1_1x1_North_lr0.001_batch100_e50_LNone_bilinear', 
+        "model": VAE,
+        "path_to_deterministic" : '/space/hall7/sitestore/eccc/crd/cccma/users/rpg002/output/SI/Full/results/NASA/UNet2/run_set_final_convnext/N2_M12_VAL3_F12_v1.1_North_lr0.001_batch25x1_e100_equalweights_NPSproj_cosine_lr_scheduler_bilinear', 
         "freeze_deterministic" : True,
         "learn_decoder_variance" : dict( status= False,  offline = True, epochs = 100), 
-        'learn_decoder_sampler' : dict( status= True,  noise_std =1, decoder_sample_size = 100), 
-        "time_features": ['month_sin','month_cos', 'imonth_sin', 'imonth_cos','land_mask'],
+        'learn_decoder_sampler' : dict( status= True,  noise_std =1, decoder_sample_size = 10, noise_injection_level = 'Full'), 
+        "time_features": ['month_sin','month_cos', 'lead_time'],
         "obs_clim" : False,
-        "ensemble_features": False, ## PG
         'ensemble_list' : None, ## PG
         'ensemble_mode' : 'Mean',
         "epochs": 50,
-        "batch_size": 5,
-        "reg_scale" : None,
+        "batch_size": 2,
+        "grad_accumulation_steps" : 2,  # default 1
         "beta" : 1,
         "optimizer": torch.optim.Adam,
-        "lr": 0.0001 ,
+        "lr": 0.00001 ,
         "loss_function" :'MSE',
-        "loss_region": None,
         "subset_dims": 'North',   ## North or South or Global
         'active_grid' : False,
         'multi_ress_loss_kernel_size' : None,
         'low_ress_loss_kernel_size' : None,
         'equal_weights' : True,
         'masked_weights' : True,
-        "decoder_kernel_size" : 1, ## only for (Reg)CNN
         "L2_reg": 0,
-        'lr_scheduler' : False,
+        'lr_scheduler' : True,
         'VAE_latent_size' : 1000,
         'VAE_MLP_encoder' : True,
         'scale_factor_channels' : None,
+        'LocallyConnected' : False,
         'BVAE' : 50,
         'loss_reduction' : 'mean' , # mean or sum
         'combined_prediction' : False,
-        'hybrid_weight' :   None, ### CVAE weight
-        'skip_VAE_added_dim' : True,
-        'saved_checkpoint_dir' : 'same',   # None, 'same', or dir to model
-        
+        'hybrid_weight' : None, ### CVAE weight
+        'skip_VAE_added_dim' : False,
+        'saved_checkpoint_dir' : 'Same',   # None, 'Same', or dir to model
+        'earlystoppingbuffer' : 5, ## buffer number
+        "target_ensemble_bootstrap" : False, # False or True
+        "clamped" : True
     }
+
+    if params['lr_scheduler']:
+        params['num_warmup_epchs'] = 2
+        params['min_lr'] = 0.0
 
 
 
     params['version'] =  1.1  ### 1 , 2 ,3 , 'IceExtent'
     params['forecast_range_months'] = 12
-    params['beta'] =  0.1 #dict(start = 0, end =0.1, start_epoch = 1 , end_epoch = params['epochs'])  
+    params['beta'] =  dict(start = 0, end =0.01, num_epoch_warmup = 10,  num_epochs_hold = None) #params['epochs'])  
 
     obs_ref = 'NASA'
-    NPSProj = False
+    NPSProj = True
     
-    out_dir_x  = f'/space/hall7/sitestore/eccc/crd/cccma/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_1_convnext'
+    out_dir_x  = f'/space/hall7/sitestore/eccc/crd/cccma/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_final_convnext'
     Path(out_dir_x + '/failed_cases').mkdir(parents=True, exist_ok=True)
-    
+
     if type(params['beta']) == dict:
-        beta_arg = 'Banealing'
+        if params['beta']['num_epochs_hold'] is not None:
+            beta_arg = 'CycBanealing'
+        else:
+            beta_arg = 'Banealing'
     else:
         beta_arg = f'B{params["beta"]}'
         
@@ -1082,11 +1303,19 @@ if __name__ == "__main__":
     print( f'Training lead_time {lead_time} ...')
 
     if params['hybrid_weight'] is not None:
-        model_type = 'CGNhybrid'
+        model_type = 'GNhybrid'
     else:
-        model_type = 'CVAE'
+        model_type = 'VAE'
+    if 'ensemble_error' in params['time_features']:
+        model_type = model_type + '2'
+
+    if params['model'] == cVAE :
+        model_type = 'C' +  model_type 
+
     if params['skip_VAE_added_dim']:
         model_type = 'skip-' + model_type
+    if params['LocallyConnected']:
+        model_type = model_type + '-LC2D'
 
     if params['learn_decoder_variance']['status']:
         assert params['learn_decoder_sampler']['status'] is False
@@ -1098,14 +1327,20 @@ if __name__ == "__main__":
 
     if params['learn_decoder_sampler']['status']:
         assert params['learn_decoder_variance']['status'] is False
-        model_type = model_type + f'-DecoderSamplerV07-{params["learn_decoder_sampler"]["decoder_sample_size"]}'
+        model_type = model_type + f'-DecoderSamplerV31-{params["learn_decoder_sampler"]["decoder_sample_size"]}-{params["learn_decoder_sampler"]["noise_injection_level"]}'
 
-
+    if test_years is not None:
+        nyears = f'{min(test_years)}-{max(test_years)}'
+    else:
+        nyears = n_years
 
     if lead_time is None:
-        out_dir    = f'{out_dir_x}/N{n_years}_M{lead_months}'
+        out_dir    = f'{out_dir_x}/N{nyears}_M{lead_months}_VAL{n_validation_years}'
     else:
-        out_dir    = f'{out_dir_x}/N{n_years}_LT{lead_time}'
+        out_dir    = f'{out_dir_x}/N{nyears}_LT{lead_time}_VAL{n_validation_years}'
+
+    if params['target_ensemble_bootstrap']:
+        out_dir = out_dir + f"_target_btstrp"
     
     out_dir = out_dir + f'_F{params["forecast_range_months"]}_v{params["version"]}_*_{beta_arg}_Cscale{params["scale_factor_channels"]}_{model_type}_{params["BVAE"]}_LS{params["VAE_latent_size"]}'
 
@@ -1116,13 +1351,11 @@ if __name__ == "__main__":
     out_dir = out_dir + '_NPSproj' if NPSProj else out_dir + '_1x1'
 
     if params['lr_scheduler']:
-        out_dir = out_dir + '_lr_scheduler'
-        params['start_factor'] = 1.0
-        params['end_factor'] = 0.1
-        params['total_iters'] = 25
+        out_dir = out_dir + '_cosine_lr_scheduler'
 
-
-    out_dir  = out_dir + f'_{params["subset_dims"]}_lr{params["lr"]}_batch{params["batch_size"]}_e{params["epochs"]}_maskfeautures_equalweights'
+    if type(params["grad_accumulation_steps"]) != int:
+        params["grad_accumulation_steps"] = 1
+    out_dir  = out_dir + f'_{params["subset_dims"]}_lr{params["lr"]}_batch{params["batch_size"]}x{params["grad_accumulation_steps"]}_e{params["epochs"]}_equalweights'
 
     if params['subset_dims'] == 'Global':
         params['subset_dimensions'] = None
@@ -1134,25 +1367,38 @@ if __name__ == "__main__":
     if params['combined_prediction']:
         out_dir = out_dir + '_combined'  
     if params['multi_ress_loss_kernel_size'] is not None:
-        out_dir = out_dir + f'_multiressloss{params["multi_ress_loss_kernel_size"]}'
+        out_dir = out_dir + f'_multi_ress_loss{params["multi_ress_loss_kernel_size"]}'
     if params['low_ress_loss_kernel_size'] is not None:
          out_dir = out_dir + f'_low_ress_loss{params["low_ress_loss_kernel_size"]}'
     if not params['masked_weights']:
         out_dir = out_dir + '_weightsnonmaked'  
+
     if params['path_to_deterministic'] is not None:
-        if 'low_ress_loss' in params['path_to_deterministic']:
+        if 'low_ress' in params['path_to_deterministic']:
             num = params['path_to_deterministic'].split('low_ress_loss')[1]
             out_dir = out_dir + f'_pretrainedUNETlowress{num}'
-        elif 'multi_ress_loss' in params['path_to_deterministic']:
+        elif 'multi_ress' in params['path_to_deterministic']:
             num = params['path_to_deterministic'].split('multi_ress_loss')[1]
             out_dir = out_dir + f'_pretrainedUNETmultiress{num}'  
         else:
             out_dir = out_dir + '_pretrainedUNET'   
         if not params['freeze_deterministic']:
              out_dir = out_dir + 'notforzen'
+             
+    if params['saved_checkpoint_dir'] is None:
+        params['saved_checkpoint_dir'] = 'None'
+    
+    if params['loss_reduction'].lower == 'sum':
+        out_dir = out_dir + f'_MSESUM'
+    
+    if params['L2_reg'] > 0 :
+        out_dir = out_dir + f'_WD{params["L2_reg"]}'
+    if params['clamped']:
+        out_dir = out_dir + f'_clamped'
 
-    if params['saved_checkpoint_dir'] != 'same':
-        if params['saved_checkpoint_dir'] is not None:
+    
+    if params['saved_checkpoint_dir'].lower() != 'same':
+        if params['saved_checkpoint_dir'] != 'None':
             out_dir = out_dir + '_FromCheckPoint'
         Path(out_dir).mkdir(parents=True, exist_ok=True)
         Path(out_dir + '/Figures').mkdir(parents=True, exist_ok=True)
@@ -1167,7 +1413,7 @@ if __name__ == "__main__":
         out_dir = out_dir[-1]    
     
     try:
-        run_training(params, n_years=n_years, lead_months=lead_months,lead_time = lead_time, NPSProj  = NPSProj, test_years = None, n_runs=n_runs, results_dir=out_dir, numpy_seed=1, torch_seed=1, save = True)
+        run_training(params, n_years=n_years, n_validation_years =n_validation_years, lead_months=lead_months,lead_time = lead_time, NPSProj  = NPSProj, test_years = test_years, n_runs=n_runs, results_dir=out_dir, numpy_seed=1, torch_seed=1, save = True)
         print(f'Output dir: {out_dir}')
         print('Training done.')
     except Exception as e:
@@ -1175,3 +1421,8 @@ if __name__ == "__main__":
         shutil.move(out_dir, out_dir_x + '/failed_cases')
         print("Terminated due to the follwoing error:\n", e)
         raise  # 
+
+
+
+
+

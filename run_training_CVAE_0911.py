@@ -10,10 +10,10 @@ from torch.distributions import Normal
 import torch
 from torch.utils.data import DataLoader
 from torch.optim import lr_scheduler
-from models.cvae_0717 import cVAE
+from models.cvae_0911 import cVAE
 from losses import WeightedMSE, BCElossKLD #, WeightedMSEKLD, WeightedMSELowRessKLD
 from losses_new import VAElossLowRess, VAEloss
-from preprocessing import align_data_and_targets, create_mask, pole_centric, reverse_pole_centric, segment, reverse_segment, pad_xarray, smoother
+from preprocessing import align_data_and_targets, create_mask, pole_centric, reverse_pole_centric, segment, reverse_segment, pad_xarray, smoother, load_model_data
 from preprocessing import AnomaliesScaler_v1_seasonal, AnomaliesScaler_v2_seasonal, Standardizer, Normalizer, PreprocessingPipeline, calculate_climatology, bias_adj, zeros_mask_gen
 from torch_datasets import XArrayDataset
 import torch.nn as nn
@@ -44,7 +44,10 @@ def run_training(params, n_years, n_validation_years = 0, lead_months = 12, lead
         crs = '1x1'
 
     if obs_ref == 'NASA':
-        data_dir_obs = glob.glob(LOC_OBSERVATIONS_SI+ f'/NASA*{crs}*.nc')[0] 
+        data_dir_obs = glob.glob(LOC_OBSERVATIONS_SI+ f'/NASA/*{crs}*.nc')[0] 
+    elif obs_ref == 'NOAA':
+        assert crs == 'NPS'
+        data_dir_obs = glob.glob(LOC_OBSERVATIONS_SI+ f'/NOAA/*{crs}**interp*.nc')[0] 
     else:
         data_dir_obs = glob.glob(LOC_OBSERVATIONS_SI+ '/uws*.nc')[0]
 
@@ -80,8 +83,6 @@ def run_training(params, n_years, n_validation_years = 0, lead_months = 12, lead
 
     if params['learn_decoder_sampler']['status']:
         assert params['combined_prediction'] is False, 'CRPS does not work on combined output'
-        assert params['multi_ress_loss_kernel_size'] is None, 'CRPS works on grid scale'
-        assert params['low_ress_loss_kernel_size'] is None, 'CRPS works on grid scale'
     else:
         params['learn_decoder_sampler']['noise_std'] = None
         
@@ -114,36 +115,31 @@ def run_training(params, n_years, n_validation_years = 0, lead_months = 12, lead
 
         params['forecast_preprocessing_steps'] = []
         params['observations_preprocessing_steps'] = []
-        ds_in = xr.open_dataset('/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/NASA/Bias_Adjusted/bias_adjusted_North_1983-2020_1x1.nc')['SICN'].clip(0,1)
+        ds_in = xr.open_dataset('/space/hall7/sitestore/eccc/crd/cccma/users/rpg002/output/SI/Full/results/NASA/Bias_Adjusted/bias_adjusted_North_1983-2020_1x1.nc')['SICN'].clip(0,1)
         if ensemble_list is not None:
             raise RuntimeError('With version 3 you are reading the bias adjusted ensemble mean as input. Set ensemble_list to None to proceed.')
 
     else:
+        print("Load forecasts")
+        ds_in = load_model_data(LOC_FORECASTS_SI, obs_ref, crs, ensemble_list, ensemble_mode)
+        if ensemble_mode.lower() == 'mean': 
+            if 'ensemble_error' in params['time_features']:
+                ds_in_std = load_model_data(LOC_FORECASTS_SI, obs_ref, crs, ensemble_list, ensemble_mode = 'std')
+        else:
+            ds_in = ds_in.transpose('time','lead_time','ensembles',...)
 
-        if ensemble_list is not None: ## PG: calculate the mean if ensemble mean is none
-            print("Load forecasts")
-            ls = [xr.open_dataset(glob.glob(LOC_FORECASTS_SI + f'/*_initial_month_{intial_month}_*{crs}*.nc')[0])['SICN'] for intial_month in range(1,13) ]
-            ds_in = xr.concat(ls, dim = 'time').sortby('time').sel(ensembles = ensemble_list)
-            if ensemble_mode == 'Mean': 
-                ds_in = ds_in.mean('ensembles') 
-            else:
-                ds_in = ds_in.transpose('time','lead_time','ensembles',...)
-                print(f'Warning: ensemble_mode is {ensemble_mode}. Training for large ensemble ...')
-
-        else:    ## Load specified members
-            print("Load forecasts") 
-            ls = [xr.open_dataset(glob.glob(LOC_FORECASTS_SI + f'/*_initial_month_{intial_month}_*{crs}*.nc')[0])['SICN'].mean('ensembles').load() for intial_month in range(1,13) ]
-            ds_in = xr.concat(ls, dim = 'time').sortby('time')
-        del ls
     gc.collect()
     ###### handle nan and inf over land ############
      ### land is masked in model data with a large number
     if not NPSProj:
         ds_in = ds_in.where(ds_in<1000,np.nan)
     else:
-        mask_projection = (xr.open_dataset(data_dir_obs)['mask'].rename({'x':'lon','y':'lat'}))[...,:,64:-64]
-        obs_in = (obs_in.rename({'x':'lon','y':'lat'}))[...,:,64:-64]
-        ds_in = (ds_in.rename({'x':'lon','y':'lat'}))[...,:,64:-64]
+        # mask_projection = (xr.open_dataset(data_dir_obs)['mask'].rename({'x':'lon','y':'lat'}))[...,:,64:-64]
+        obs_in = (obs_in.rename({'x':'lon','y':'lat'}))
+        ds_in = (ds_in.rename({'x':'lon','y':'lat'}))
+        if obs_ref == 'NASA':
+            obs_in = obs_in[...,:,64:-64]
+            ds_in = ds_in[...,:,64:-64]
 
 
     land_mask = obs_in.mean('time').where(np.isnan(obs_in.mean('time')),1).fillna(0)
@@ -161,7 +157,7 @@ def run_training(params, n_years, n_validation_years = 0, lead_months = 12, lead
     else:
         ds_in = ds_in.expand_dims('channels', axis=2) 
 
-    ds_raw, obs_raw = align_data_and_targets(ds_in, obs_in, lead_months)  # extract valid lead times and usable years
+    ds_raw, obs_raw = align_data_and_targets(ds_in, obs_in, lead_months, target_ensemble_bootstrap = params['target_ensemble_bootstrap'])  # extract valid lead times and usable years
     del ds_in, obs_in
     gc.collect()
 
@@ -367,7 +363,7 @@ def run_training(params, n_years, n_validation_years = 0, lead_months = 12, lead
                 if params['combined_prediction']:
                     obs = xr.concat([obs, obs_raw.isel(channels = slice(1,2))], dim  = 'channels')  
 
-                step_arguments = {'anomalies' : [lead_time, month]} if 'anomalies' in obs_pipeline.steps else None
+                step_arguments = {'anomalies' : dict(month = month, lead_time = lead_time)} if 'anomalies' in obs_pipeline.steps else None
                 del ds_baseline, obs_baseline, preprocessing_mask_obs, preprocessing_mask_fct
                 gc.collect()
 
@@ -427,10 +423,10 @@ def run_training(params, n_years, n_validation_years = 0, lead_months = 12, lead
                     val_mask = create_mask(ds_validation)
                     mask = train_mask
 
-                train_set = XArrayDataset(ds_train, obs_train, mask=mask, zeros_mask = zeros_mask, in_memory=False, lead_time=lead_time, time_features=time_features, aligned = True,  model = 'UNet2') 
+                train_set = XArrayDataset(ds_train, obs_train, mask=mask, zeros_mask = zeros_mask, in_memory=True, lead_time=lead_time, time_features=time_features, aligned = True,  model = 'UNet2') 
                 dataloader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
                 
-                validation_set = XArrayDataset(ds_validation, obs_validation, mask=val_mask, zeros_mask = zeros_mask, lead_time=lead_time, time_features=time_features, in_memory=False, aligned = True,  model = 'UNet2') 
+                validation_set = XArrayDataset(ds_validation, obs_validation, mask=val_mask, zeros_mask = zeros_mask, lead_time=lead_time, time_features=time_features, in_memory=True, aligned = True,  model = 'UNet2') 
                 dataloader_val = DataLoader(validation_set, batch_size=batch_size, shuffle=False)                   
                 
                 ############################################## Prepare model #######################################
@@ -490,7 +486,7 @@ def run_training(params, n_years, n_validation_years = 0, lead_months = 12, lead
                 
                 net = cVAE(VAE_latent_size = params['VAE_latent_size'], n_channels_x= n_channels_x+ add_feature_dim , sigmoid = sigmoid_activation, NPS_proj = NPSProj, combined_prediction = params['combined_prediction'], VAE_MLP_encoder = params['VAE_MLP_encoder'],
                             scale_factor_channels = params['scale_factor_channels'], skip_VAE_added_dim = params['skip_VAE_added_dim'], saved_deterministic_model = unet, freeze_deterministic = params['freeze_deterministic'],
-                              learn_decoder_variance = params['learn_decoder_variance']['status'], noise_injection_std = params['learn_decoder_sampler']['noise_std'], LocallyConnected= LocallyConnected, device=device)   #temporarily not input to check whether sending the net to device does automatically take care of this
+                              learn_decoder_variance = params['learn_decoder_variance']['status'], noise_injection_std = params['learn_decoder_sampler']['noise_std'], noise_injection_level =  params['learn_decoder_sampler']['noise_injection_level'], LocallyConnected= LocallyConnected, device=device)   #temporarily not input to check whether sending the net to device does automatically take care of this
 
                 if params['saved_checkpoint_dir'] is not None:
                     if params['saved_checkpoint_dir'] == 'Same':
@@ -600,7 +596,7 @@ def run_training(params, n_years, n_validation_years = 0, lead_months = 12, lead
                         else:
                             # criterion = WeightedMSELowRessKLD(weights=weights, device=device, weights_mask = weights_mask, hyperparam=1, reduction=params['loss_reduction'],kernel = params['low_ress_loss_kernel_size'])
                             criterion = VAElossLowRess(weights=weights, device=device, weights_mask = weights_mask, reduction=params['loss_reduction'], 
-                                                        kernel = low_ress_loss_kernel_size, learn_decoder_variance = learn_decoder_variance_training_step)
+                                                        kernel = low_ress_loss_kernel_size, learn_decoder_variance = learn_decoder_variance_training_step, decoder_inject_noise = decoder_inject_noise)
                     
                     # scaler = GradScaler()
                 #################################################### Train/Eval Loop #############################################
@@ -829,7 +825,17 @@ def run_training(params, n_years, n_validation_years = 0, lead_months = 12, lead
 
                         if epoch == 0:
                             best_valScore = epoch_MSE_validation[-1]
+                            best_valScore_GCN = epoch_loss_validation_GCN[-1]
                             earlystopping_counter = 0
+                            if params['saved_checkpoint_dir'] != 'None':
+                                    if test_year*100 + month <= ds_raw_ensemble_mean.time[-1]:
+                                        nameSave = f"MODEL_V{params['version']}_198101-{(test_year - n_validation_years) * 100 + month -1}"
+                                    else:
+                                        if lead_time is not None:
+                                                nameSave = f"MODEL_final_V{params['version']}_198101-{int(ds_raw_ensemble_mean.time[-lead_time]) - n_validation_years * 100}"
+                                        else:
+                                                nameSave = f"MODEL_final_V{params['version']}_198101-{int(ds_raw_ensemble_mean.time[-1] - n_validation_years * 100 )}"    
+                                    torch.save( net.state_dict(), results_dir + '/Checkpoints/' + nameSave + f"_epoch_{epoch + 1 + checkpoint_restart_epoch}.pth")
 
                         del x, y, y_ , m, mu, log_var , cond_mu, cond_log_var, loss, MSE, KLD 
                         gc.collect()
@@ -872,6 +878,7 @@ def run_training(params, n_years, n_validation_years = 0, lead_months = 12, lead
                         if epoch > 0:
                             if epoch_MSE_validation[-1] < best_valScore - ( 0.02 * best_valScore):  # if new score not 5% better than best val score
                                 best_valScore = epoch_MSE_validation[-1]
+                                best_valScore_GCN = epoch_loss_validation_GCN[-1]
                                 earlystopping_counter = 0
                                 if test_year*100 + month <= ds_raw_ensemble_mean.time[-1]:
                                     nameSave = f"MODEL_V{params['version']}_198101-{(test_year - n_validation_years) * 100 + month -1}"
@@ -890,11 +897,20 @@ def run_training(params, n_years, n_validation_years = 0, lead_months = 12, lead
                             else:
                                 if params['earlystoppingbuffer'] is not None:
                                     earlystopping_counter += 1
+                                    if params['version'] == 'IceExtent':
+                                        loss_function = 'BCE' 
+                                    elif learn_decoder_variance_training_step: 
+                                        loss_function = 'LLH'
+                                    elif decoder_inject_noise:
+                                        loss_function = 'CRPS'
+                                    else:
+                                        loss_function = 'MSE' 
+                    
                                     if (earlystopping_counter >= params['earlystoppingbuffer']) and (epoch >= 15 ):  # want to train for at least 20 epochs
                                         print(
-                                            f"Stopping early --> epoch val MSE score {epoch_MSE_validation[-1]} has not decreased over {params['earlystoppingbuffer']} epochs compared to best {best_valScore} ")
+                                            f"Stopping early --> epoch val {loss_function} score {epoch_MSE_validation[-1]} has not decreased over {params['earlystoppingbuffer']} epochs compared to best {best_valScore} ")
                                         with open(Path(results_dir, "training_parameters.txt"), 'a') as f:
-                                            f.write(f"\n Test year {test_year}, stopping early at {epoch + 1 + checkpoint_restart_epoch} --> epoch val MSE score {epoch_MSE_validation[-1]} has not decreased over {params['earlystoppingbuffer']} epochs compared to best {best_valScore}")
+                                            f.write(f"\n Test year {test_year}, stopping early at {epoch + 1 + checkpoint_restart_epoch} --> epoch val {loss_function} score {epoch_MSE_validation[-1]} has not decreased over {params['earlystoppingbuffer']} epochs compared to best {best_valScore}\n")
                                         Early_stop = True
                                         break
 
@@ -922,11 +938,15 @@ def run_training(params, n_years, n_validation_years = 0, lead_months = 12, lead
                     ax.plot(np.arange(1,len(epoch_loss)+1), epoch_MSE_validation, color = 'b', linestyle = 'dashed', label = f'Val {label} only')
                     ax.plot(np.arange(1,len(epoch_loss)+1), epoch_KLD_validation, color = 'g', linestyle = 'dashed', label = 'Val KLD')
 
-                    ax.set_title(f'Train/Val Loss - best val loss : {best_valScore} ') ###
+                    ax.set_title(f'Train/Val Loss - best val loss : {best_valScore} - GCN loss : {best_valScore_GCN}') ###
                     ax.legend()
                     ax.set_xlabel('Epoch')
                     ax.set_ylabel('Loss')
                     plt.show()
+                    try:
+                        os.remove(glob.glob(results_dir+f'/Figures/train_val_loss_198101-{(test_year - n_validation_years )* 100 + month -1}_{training}_epoch_{checkpoint_restart_epoch}_*.png')[0])
+                    except:
+                        pass
                     plt.savefig(results_dir+f'/Figures/train_val_loss_198101-{(test_year - n_validation_years )* 100 + month -1}_{training}_epoch_{checkpoint_restart_epoch}_{len(epoch_loss) + checkpoint_restart_epoch}.png')
                     plt.close()
 
@@ -1001,7 +1021,7 @@ def run_training(params, n_years, n_validation_years = 0, lead_months = 12, lead
                             cond_var = torch.exp(cond_log_var) + 1e-4
                             cond_std = torch.sqrt(cond_var)
 
-                            z =  Normal(cond_mu, cond_std).rsample(sample_shape=(params['BVAE'],)).squeeze().to(device)
+                            z =  Normal(cond_mu, cond_std).rsample(sample_shape=(params['BVAE'],)).squeeze().to(device)    ### should squeeze be there?
                             # z = torch.unflatten(z , dim = -1, sizes = cond_std.shape[-3:])
                             out = net.generation(z, inject_noise = params['learn_decoder_sampler']['status']) + basic_unet.squeeze() 
                             generated_output = net.last_conv(out)
@@ -1176,10 +1196,10 @@ if __name__ == "__main__":
 
     params = {
         "model": cVAE,
-        "path_to_deterministic" :  '/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/NASA/UNet2/run_set_4_convnext/N2_M12_VAL3_F12_v1.1_North_lr0.001_batch100x1_e100_equalweights_1x1_lr_scheduler_bilinear_low_ress_loss4', 
+        "path_to_deterministic" : None, # '/space/hall7/sitestore/eccc/crd/cccma/users/rpg002/output/SI/Full/results/NASA/UNet2/run_set_4_convnext/N2_M12_VAL3_F12_v1.1_North_lr0.001_batch100x1_e100_equalweights_1x1_lr_scheduler_bilinear_low_ress_loss4', 
         "freeze_deterministic" : True,
         "learn_decoder_variance" : dict( status= False,  offline = True, epochs = 100), 
-        'learn_decoder_sampler' : dict( status= False,  noise_std =1, decoder_sample_size = 10), 
+        'learn_decoder_sampler' : dict( status= False,  noise_std =1, decoder_sample_size = 10, noise_injection_level = 'medium'), 
         "time_features": ['month_sin','month_cos', 'lead_time'],
         "obs_clim" : False,
         'ensemble_list' : None, ## PG
@@ -1191,7 +1211,7 @@ if __name__ == "__main__":
         "optimizer": torch.optim.Adam,
         "lr": 0.0001 ,
         "loss_function" :'MSE',
-        "subset_dims": 'North',   ## North or South or Global2
+        "subset_dims": 'North',   ## North or South or Global
         'active_grid' : False,
         'multi_ress_loss_kernel_size' : None,
         'low_ress_loss_kernel_size' : None,
@@ -1208,8 +1228,9 @@ if __name__ == "__main__":
         'combined_prediction' : False,
         'hybrid_weight' :  None, ### CVAE weight
         'skip_VAE_added_dim' : False,
-        'saved_checkpoint_dir' : None,   # None, 'Same', or dir to model
+        'saved_checkpoint_dir' : 'Same',   # None, 'Same', or dir to model
         'earlystoppingbuffer' : 10, ## buffer number
+        "target_ensemble_bootstrap" : True, # False or True
     }
 
 
@@ -1221,7 +1242,9 @@ if __name__ == "__main__":
     obs_ref = 'NASA'
     NPSProj = False
     
-    out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_2_convnext'
+    out_dir_x  = f'/space/hall7/sitestore/eccc/crd/cccma/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_3_convnext'
+    Path(out_dir_x + '/failed_cases').mkdir(parents=True, exist_ok=True)
+    
     if type(params['beta']) == dict:
         beta_arg = 'Banealing'
     else:
@@ -1249,7 +1272,7 @@ if __name__ == "__main__":
 
     if params['learn_decoder_sampler']['status']:
         assert params['learn_decoder_variance']['status'] is False
-        model_type = model_type + f'-DecoderSamplerV17-{params["learn_decoder_sampler"]["decoder_sample_size"]}'
+        model_type = model_type + f'-DecoderSamplerV11-{params["learn_decoder_sampler"]["decoder_sample_size"]}-{params["learn_decoder_sampler"]["noise_injection_level"]}'
 
 
 
@@ -1257,6 +1280,9 @@ if __name__ == "__main__":
         out_dir    = f'{out_dir_x}/N{n_years}_M{lead_months}_VAL{n_validation_years}'
     else:
         out_dir    = f'{out_dir_x}/N{n_years}_LT{lead_time}_VAL{n_validation_years}'
+
+    if params['target_ensemble_bootstrap']:
+        out_dir = out_dir + f"_target_btstrp"
     
     out_dir = out_dir + f'_F{params["forecast_range_months"]}_v{params["version"]}_*_{beta_arg}_Cscale{params["scale_factor_channels"]}_{model_type}_{params["BVAE"]}_LS{params["VAE_latent_size"]}'
 
@@ -1286,16 +1312,19 @@ if __name__ == "__main__":
     if params['combined_prediction']:
         out_dir = out_dir + '_combined'  
     if params['multi_ress_loss_kernel_size'] is not None:
-        out_dir = out_dir + f'_multiressloss{params["multi_ress_loss_kernel_size"]}'
+        out_dir = out_dir + f'_multi_ress_loss{params["multi_ress_loss_kernel_size"]}'
     if params['low_ress_loss_kernel_size'] is not None:
          out_dir = out_dir + f'_low_ress_loss{params["low_ress_loss_kernel_size"]}'
     if not params['masked_weights']:
         out_dir = out_dir + '_weightsnonmaked'  
+
     if params['path_to_deterministic'] is not None:
-        if 'low_ress_loss' in params['path_to_deterministic']:
-            out_dir = out_dir + '_pretrainedUNETlowress'
-        elif 'multi_ress_loss' in params['path_to_deterministic']:
-            out_dir = out_dir + '_pretrainedUNETmultiress'  
+        if 'low_ress' in params['path_to_deterministic']:
+            num = params['path_to_deterministic'].split('low_ress_loss')[1]
+            out_dir = out_dir + f'_pretrainedUNETlowress{num}'
+        elif 'multi_ress' in params['path_to_deterministic']:
+            num = params['path_to_deterministic'].split('multi_ress_loss')[1]
+            out_dir = out_dir + f'_pretrainedUNETmultiress{num}'  
         else:
             out_dir = out_dir + '_pretrainedUNET'   
         if not params['freeze_deterministic']:
@@ -1322,7 +1351,7 @@ if __name__ == "__main__":
         print('Training done.')
     except Exception as e:
         import shutil
-        shutil.rmtree(out_dir)
+        shutil.move(out_dir, out_dir_x + '/failed_cases')
         print("Terminated due to the follwoing error:\n", e)
         raise  # 
 

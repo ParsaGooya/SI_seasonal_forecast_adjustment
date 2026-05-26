@@ -40,7 +40,10 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
     else:
         model_year_ = model_year
 
-    
+    if 'clamped' in model_dir:
+        params['clamped'] = True
+    else:
+        params['clamped'] = False
     try:
         scale_factor_channels = params['scale_factor_channels']
     except:
@@ -62,7 +65,7 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
 
         params['forecast_preprocessing_steps'] = [
             ('anomalies', AnomaliesScaler_v1_seasonal())]
-        params['observations_preprocessing_steps'] = []
+        params['observations_preprocessing_steps'] = [('anomalies', AnomaliesScaler_v2_seasonal())]
         
     else:
         params['forecast_preprocessing_steps'] = []
@@ -101,7 +104,7 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
 
     print("Load forecasts")
     if params['version'] == 3:
-        ds_in = xr.open_dataset('/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/NASA/Bias_Adjusted/bias_adjusted_North_1983-2020_1x1.nc')['SICN']
+        ds_in = xr.open_dataset('/space/hall7/sitestore/eccc/crd/cccma/users/rpg002/output/SI/Full/results/NASA/Bias_Adjusted/bias_adjusted_North_1983-2020_1x1.nc')['SICN']
         #####################################################################################################
         ### if you used Standardizer make sure to pass VAE = True as an argument to the initializer below ###
         if params['version'] == 3:
@@ -116,6 +119,8 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
 
         if params['ensemble_mode'] == 'Mean': ##
             ensemble_features = False
+            if 'ensemble_error' in params['time_features']:
+                ds_in_std = ds_in.std('ensembles')
             ds_in = ds_in.mean('ensembles').load() ##
         else:
             ds_in = ds_in.load().transpose('time','lead_time','ensembles',...)
@@ -124,16 +129,28 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
     ###### handle nan and inf over land ############
     if not NPSProj:
         ds_in = ds_in.where(ds_in<1000,np.nan) ### land is masked in model data with a large number
+        if 'ensemble_error' in params['time_features']:
+            ds_in_std = ds_in_std.where(ds_in_std<1000,np.nan)
     else:
-        mask_projection = (xr.open_dataset(data_dir_obs)['mask'].rename({'x':'lon','y':'lat'}))[...,:,64:-64]
-        observation = (observation.rename({'x':'lon','y':'lat'}))[...,:,64:-64]
-        ds_in = (ds_in.rename({'x':'lon','y':'lat'}))[...,:,64:-64]
+        observation = (observation.rename({'x':'lon','y':'lat'}))
+        ds_in = (ds_in.rename({'x':'lon','y':'lat'}))
+        if 'ensemble_error' in params['time_features']:
+            ds_in_std = (ds_in_std.rename({'x':'lon','y':'lat'}))
+        if obs_ref == 'NASA':
+            observation = observation[...,:,64:-64]
+            ds_in = ds_in[...,:,64:-64]
+            if 'ensemble_error' in params['time_features']:
+               ds_in_std = ds_in_std[...,:,64:-64] 
+
+        
     land_mask = observation.mean('time').where(np.isnan(observation.mean('time')),1).fillna(0)
     model_mask = ds_in.mean('time')[0].where(np.isnan(ds_in.mean('time')[0]),1).fillna(0).drop('lead_time')
     observation = observation.clip(0,1)
     ds_in = ds_in.clip(0,1)
     observation = observation.fillna(0)
     ds_in = ds_in.fillna(0)
+    if 'ensemble_error' in params['time_features']:
+        ds_in_std = ds_in_std.fillna(0)
     ############################################
     obs_in = observation.expand_dims('channels', axis=1)
 
@@ -141,6 +158,9 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
         ds_in = ds_in.expand_dims('channels', axis=3)
     else:
         ds_in = ds_in.expand_dims('channels', axis=2) 
+        if 'ensemble_error' in params['time_features']:
+            ds_in_std = ds_in_std.expand_dims('channels', axis=2)
+            ds_in = xr.concat([ds_in, ds_in_std], dim = 'channels')
 
     min_year = np.min(test_years)*100
     max_year = (np.min(test_years) + 1 )*100 if len(test_years) <2 else (np.max(test_years) + 1)*100
@@ -282,7 +302,7 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
 
     del ds_baseline, obs_baseline, preprocessing_mask_obs, preprocessing_mask_fct
     gc.collect()
-    if params['version']  in [3,1.1]:
+    if params['version']  in [2, 3,1.1]:
         sigmoid_activation = False
     else:
         sigmoid_activation = True
@@ -320,6 +340,8 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
             add_feature_dim = len(time_features)
     if 'land_mask' in time_features:
         add_feature_dim -= 1
+    if 'ensemble_error' in time_features:
+        add_feature_dim -= 1
 
     ########################################### load the model ######################################
     try:
@@ -334,7 +356,7 @@ def predict(fct:xr.DataArray , observation:xr.DataArray , params, lead_months, m
     params['bilinear'] = False if 'bilinear' not in params.keys() else ...
 
     if model in [UNet,UNetLCL,UNet2, UNet_NPS, UNet2_NPS, UNet2_small, UNet2_NPS_small]:
-        net = model(n_channels_x= n_channels_x+ add_feature_dim , bilinear = params['bilinear'], sigmoid = sigmoid_activation, skip_conv = params['skip_conv'], combined_prediction = params['combined_prediction'], LocallyConnected = LocallyConnected)
+        net = model(n_channels_x= n_channels_x+ add_feature_dim , bilinear = params['bilinear'], sigmoid = sigmoid_activation, skip_conv = params['skip_conv'], combined_prediction = params['combined_prediction'], LocallyConnected = LocallyConnected, clamped = params['clamped'] )
     elif model in [ CNN]:
         net = model(n_channels_x + add_feature_dim ,hidden_dims, kernel_size = kernel_size, decoder_kernel_size = decoder_kernel_size, sigmoid = sigmoid_activation )
     elif model in [ RegCNN]: 
@@ -656,7 +678,7 @@ if __name__ == "__main__":
 
     ############################################## Set_up ############################################
 
-    out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/NASA/UNet2/run_set_3_convnext'
+    out_dir_x  = f'/space/hall7/sitestore/eccc/crd/cccma/users/rpg002/output/SI/Full/results/NASA/UNet2/run_set_3_convnext'
     out_dir    = f'{out_dir_x}/N2_M12_VAL3_F12_v1.1_North_lr0.001_batch100_e100_1x1_bilinear_multiressloss4' 
 
 
@@ -686,12 +708,15 @@ if __name__ == "__main__":
 
 
     if obs_ref == 'NASA':
-        data_dir_obs = glob.glob(LOC_OBSERVATIONS_SI+ f'/NASA*{crs}*.nc')[0] 
+        data_dir_obs = glob.glob(LOC_OBSERVATIONS_SI+ f'/NASA/*{crs}*.nc')[0] 
+    elif obs_ref == 'NOAA':
+        assert crs == 'NPS'
+        data_dir_obs = glob.glob(LOC_OBSERVATIONS_SI+ f'/NOAA/*{crs}*.nc')[0] 
     else:
         data_dir_obs = glob.glob(LOC_OBSERVATIONS_SI+ '/uws*.nc')[0]
     
     observation = xr.open_dataset(data_dir_obs)['SICN']
-    ls = [xr.open_dataset(glob.glob(LOC_FORECASTS_SI + f'/*_initial_month_{intial_month}_*{crs}*.nc')[0]) for intial_month in range(1,13) ]
+    ls = [xr.open_dataset(glob.glob(LOC_FORECASTS_SI + f'/{obs_ref}/*_initial_month_{intial_month}_{obs_ref}*{crs}*.nc')[0]) for intial_month in range(1,13) ]
     fct = xr.concat(ls, dim = 'time').sortby('time')
 
     del ls

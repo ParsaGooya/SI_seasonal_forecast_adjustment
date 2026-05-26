@@ -11,13 +11,14 @@ from timm.models.registry import register_model
 class UNet2(nn.Module):
 	
     
-		def __init__( self,  n_channels_x=1 ,  bilinear=False, sigmoid = True,skip_connection = True,  skip_conv = False, combined_prediction = False, LocallyConnected = False ):
+		def __init__( self,  n_channels_x=1 ,  bilinear=False, sigmoid = True,skip_connection = True,  skip_conv = False, combined_prediction = False, LocallyConnected = False , clamped = False):
 			
 			super().__init__()
 			self.n_channels_x = n_channels_x
 			self.bilinear = bilinear
 			self.skip_connection = skip_connection
 			self.combined_prediction = combined_prediction
+			self.clamped = clamped
 			# input  (batch, n_channels_x, 100, 180)
 			
 			self.initial_conv = InitialConv(n_channels_x, 16)
@@ -80,6 +81,9 @@ class UNet2(nn.Module):
 				x = self.up4(x)  # (batch, 16, 100, 180)	
 			
 			x1 = self.last_conv(x)
+			if self.clamped:
+				x1 = torch.clamp(x1, 0, 1)
+
 			if self.combined_prediction:
 				x2 = self.last_conv2(x)
 				return x1, x2
@@ -89,13 +93,14 @@ class UNet2(nn.Module):
 class UNet2_small(nn.Module):
 	
     
-		def __init__( self,  n_channels_x=1 ,  bilinear=False, sigmoid = True,skip_connection = True,  skip_conv = False, combined_prediction = False, LocallyConnected = False ):
+		def __init__( self,  n_channels_x=1 ,  bilinear=False, sigmoid = True,skip_connection = True,  skip_conv = False, combined_prediction = False, LocallyConnected = False, clamped = False ):
 			
 			super().__init__()
 			self.n_channels_x = n_channels_x
 			self.bilinear = bilinear
 			self.skip_connection = skip_connection
 			self.combined_prediction = combined_prediction
+			self.clamped = clamped
 			# input  (batch, n_channels_x, 100, 180)
 			
 			self.initial_conv = InitialConv(n_channels_x, 16)
@@ -158,6 +163,8 @@ class UNet2_small(nn.Module):
 				# x = self.up4(x)  # (batch, 32, 100, 180)	
 
 			x1 = self.last_conv(x)
+			if self.clamped:
+				x1 = torch.clamp(x1, 0, 1)
 			if self.combined_prediction:
 				x2 = self.last_conv2(x)
 				return x1, x2
@@ -168,13 +175,14 @@ class UNet2_small(nn.Module):
 class UNet2_NPS(nn.Module):
 	
     
-		def __init__( self,  n_channels_x=1 ,  bilinear=False, sigmoid = True,skip_connection = True, skip_conv = False, combined_prediction = False, LocallyConnected = False ):
+		def __init__( self,  n_channels_x=1 ,  bilinear=False, sigmoid = True,skip_connection = True, skip_conv = False, combined_prediction = False, LocallyConnected = False , clamped = False):
 			
 			super().__init__()
 			self.n_channels_x = n_channels_x
 			self.bilinear = bilinear
 			self.skip_connection = skip_connection
 			self.combined_prediction = combined_prediction
+			self.clamped = clamped
 			# input  (batch, n_channels_x, 100, 180)
 			
 			self.initial_conv = InitialConv(n_channels_x, 16)
@@ -243,6 +251,8 @@ class UNet2_NPS(nn.Module):
 				x = self.up5(x)  # (batch, 16, 432, 304)				
 			
 			x1 = self.last_conv(x)
+			if self.clamped:
+				x1 = torch.clamp(x1, 0, 1)
 			if self.combined_prediction:
 				x2 = self.last_conv2(x)
 				return x1, x2
@@ -253,13 +263,14 @@ class UNet2_NPS(nn.Module):
 class UNet2_NPS_small(nn.Module):
 	
     
-		def __init__( self,  n_channels_x=1 ,  bilinear=False, sigmoid = True,skip_connection = True, skip_conv = False, combined_prediction = False, LocallyConnected = False ):
+		def __init__( self,  n_channels_x=1 ,  bilinear=False, sigmoid = True,skip_connection = True, skip_conv = False, combined_prediction = False, LocallyConnected = False , clamped = False):
 			
 			super().__init__()
 			self.n_channels_x = n_channels_x
 			self.bilinear = bilinear
 			self.skip_connection = skip_connection
 			self.combined_prediction = combined_prediction
+			self.clamped = clamped
 			# input  (batch, n_channels_x, 100, 180)
 			
 			self.initial_conv = InitialConv(n_channels_x, 16)
@@ -325,6 +336,8 @@ class UNet2_NPS_small(nn.Module):
 				x = self.up4(x)  # (batch, 16, 432, 304)				
 			
 			x1 = self.last_conv(x)
+			if self.clamped:
+				x1 = torch.clamp(x1, 0, 1)
 			if self.combined_prediction:
 				x2 = self.last_conv2(x)
 				return x1, x2

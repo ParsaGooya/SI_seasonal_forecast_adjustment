@@ -44,7 +44,13 @@ def get_coordinate_indices(data, area):
     return coord_indices, coords
 
 
-def align_data_and_targets(data, targets, lead_months):
+def target_ens_btstrp(ds,ensembles_list, seed = 1):
+    random.seed(seed)  # Set the seed for reproducibility
+    random_selection = [ensembles_list[0], *random.choices(ensembles_list[1:], k=ds.shape[0] - 1)]
+    return xr.concat([ds[i].sel(ensembles = random_selection[i]).drop('ensembles') for i in range(ds.shape[0])], dim = 'time')
+
+
+def align_data_and_targets(data, targets, lead_months, target_ensemble_bootstrap = False, std_tensor = None):
 
 
 
@@ -52,26 +58,44 @@ def align_data_and_targets(data, targets, lead_months):
             raise ValueError(f'Maximum available lead months: {int(data.shape[1])}')
     
     data = data.sel(lead_time = np.arange(1, lead_months + 1 ))
+
+    if all([target_ensemble_bootstrap, 'ensembles' in targets.dims]):
+        import random
+        print('bootstraping the target ensemble along lead time dimension ...')
+        ensembles_list = targets.ensembles.values
+        ls = [target_ens_btstrp(targets[ind:ind + lead_months , ...], ensembles_list,  seed = ind) for ind in range(len(targets.time))]  
+    else:
+        ls = [targets[ind:ind + lead_months , ...] for ind in range(len(targets.time))]  
+        if std_tensor is not None:
+            ls_std = [std_tensor[ind:ind + lead_months , ...] for ind in range(len(std_tensor.time))] 
     
-    ls = [targets[ind:ind + lead_months , ...] for ind in range(len(targets.time))]  
     obs =  xr.concat([ds.rename({'time':'lead_time'}).assign_coords(lead_time = np.arange(1,len(ds.time) + 1))  for ds in ls], dim = 'time').assign_coords(time =  [ds.time[0].values for ds in ls])
     obs = obs.transpose('time','lead_time', ...)
 
-    # last_target = targets.time[-1] - lead_months +1 if np.mod(targets.time[-1],100) >= lead_months else targets.time[-1] - 100 - lead_months + 13
-    # if last_target > data.time[-1]:
-    #     obs = obs.where(obs.time <= data.time[-1] , drop = True)
-    # else:
-    #     data = data.where(data.time <= last_target, drop = True)
+    if std_tensor is not None:
+        obs_std =  xr.concat([ds.rename({'time':'lead_time'}).assign_coords(lead_time = np.arange(1,len(ds.time) + 1))  for ds in ls_std], dim = 'time').assign_coords(time =  [ds.time[0].values for ds in ls_std])
+        obs_std = obs_std.transpose('time','lead_time', ...)      
 
-    # return data.where(data <= 1 , 0), obs.sel(time = data.time).where(obs <= 1 , 0)
+    if all([target_ensemble_bootstrap, 'ensembles' not in targets.dims]):
+        import random
+        print('bootstraping the target along lead time dimension by injecting noise...')
+        random.seed(1)
+        if std_tensor is None:
+            noise = np.random.normal(loc=0, scale=0.01, size=obs.shape) * xr.ones_like(obs).where((obs >= 0.05) & (obs <=0.95), 0)
+            obs = obs + noise.where(noise.lead_time > 1, 0)
+        else:
+            noise = np.random.normal(loc=np.zeros(obs.shape), scale=obs_std)    
+            obs = obs + noise  
+        obs = obs.clip(0,1)
+        del noise
 
-    if data.time[-1] >= obs.time[-1]:
-        data = data.where( data.time <= obs.time[-1], drop = True)
+    min_time = max(data.time.min(),  obs.time.min())
+    max_time = min(data.time.max(),  obs.time.max())
 
-    else:  
-        obs = obs.where( obs.time <= data.time[-1], drop = True)
-    
-    obs = obs.where( (obs.time >= data.time.min()) & (obs.time <= data.time.max()) , drop = True)
+    data = data.where( (data.time <= max_time) & (data.time >= min_time) , drop = True)
+    obs = obs.where( (obs.time <= max_time) & (obs.time >= min_time) , drop = True)
+
+
     return data, obs
 
 
@@ -329,74 +353,101 @@ class AnomaliesScaler_v1:
 
 
 class AnomaliesScaler_v1_seasonal:
-    def __init__(self, dim='time', global_weights = None) -> None:
+    def __init__(self, dim=['time'], standardize = None, VAE = False) -> None:
         self.mean = None
         self.dim=dim
-        self.global_weights = global_weights
+        self.standardize = standardize
+        self.VAE = VAE
     
     def fit(self, data, mask=None):
         self.data = data
         if 'ensembles' in data.dims: ## PG: if ensemble exists in the dimentions. Note that we always pass a map like data to this function. Even if it is flattened, we first write back to maps.
-            self.large_ensemble = True
-            axis = [self.dim, 'ensembles'] ## PG: Tell the object to average over both years and ensembles for calculating anomalies.
+            self.ensemble_dim = data.dims.index("ensembles")
+            axis = [*self.dim, 'ensembles'] ## PG: Tell the object to average over both years and ensembles for calculating anomalies.
         else:
+            self.ensemble_dim = None
             axis = self.dim
+        
+
      
         if mask is not None:
             self.data = self.data.where(~mask)
 
         self.mean = xr.concat([self.data.isel(time = np.arange(0,len(self.data.time),12) + init_month).mean(axis) for init_month in range(12) ], dim = 'init_month').assign_coords(init_month = np.arange(1,13)).transpose('init_month', ...)
-        
-        if self.global_weights is not None:
-            self.mean = (self.mean * self.global_weights).sum(['lat','lon']) /  (self.global_weights).sum(['lat','lon'])
+        if any(['lat' in self.dim, 'lon' in self.dim]):
+                self.mean = self.mean.expand_dims({'lat' : len(self.data.lat),'lon': len(self.data.lon)}).transpose(..., 'lat', 'lon')
+        if self.standardize:
+            self.std = xr.concat([self.data.isel(time = np.arange(0,len(self.data.time),12) + init_month).std(axis) for init_month in range(12) ], dim = 'init_month').assign_coords(init_month = np.arange(1,13)).transpose('init_month', ...)
+            if any(['lat' in self.dim, 'lon' in self.dim]):
+                    self.std = self.std.expand_dims({'lat' : len(self.data.lat),'lon': len(self.data.lon)}).transpose(..., 'lat', 'lon')
         del self.data
         return self
 
     def transform(self, data):
 
-        shape = data.dims
+        dims = data.dims
         data_anomalies = data.copy()
         if 'ensembles' in data.dims: ## PG: if ensemble exists in the dimentions.
             data_anomalies = data_anomalies.transpose('ensembles', ...) ## PG: move ensemble dim to axis = 0 so that we can substract the mean that averaged over both years and ensembles
  
-        climatology = np.concatenate([self.mean[:len(data_anomalies.time[ind:ind+12])].data for ind in range(0,len(data_anomalies.time),12)], axis = 0)
-        if self.global_weights is not None:
-            climatology = np.broadcast_to(climatology[...,None,None], data_anomalies.shape)
-
+        climatology = np.concatenate([self.mean[:len(data_anomalies.time[ind:ind+12])].data for ind in range(0,len(data.time),12)], axis = 0)
         data_anomalies = data_anomalies - climatology
+
+        if self.standardize:
+            climatology_std = np.concatenate([self.std[:len(data_anomalies.time[ind:ind+12])].data for ind in range(0,len(data.time),12)], axis = 0)
+            data_anomalies = data_anomalies/climatology_std
+            data_anomalies = data_anomalies.where(~np.isinf(data_anomalies)).fillna(0)
         
-        return data_anomalies.transpose(*shape) ## PG: Move ensemble back to the original axis.
+        return data_anomalies.transpose(*dims) ## PG: Move ensemble back to the original axis.
     
     def inverse_transform(self, data, month, lead_time):
+        if self.VAE:
+            if self.ensemble_dim is not None:
+                self.ensemble_dim = self.ensemble_dim + 1
+
+        if self.ensemble_dim is not None:
+            transpose = (self.ensemble_dim, *np.delete(np.arange(len(data.shape)), self.ensemble_dim))
+            transpose_back = np.argsort(transpose)
+            data = data.tranpose(transpose)  
         
-        shape = data.shape
-        climatology = self.mean[month  - 1 : month - 1 + data.shape[0]].data
+        T = data.shape[0]
+
+        climatology = np.concatenate([self.mean.data for ind in range(0,T,12)], axis = 0)
+        climatology = climatology[month  - 1 : month - 1 + T]
+        
+        if self.standardize is not None:
+            climatology_std = np.concatenate([self.std.data for ind in range(0,T,12)], axis = 0)
+            climatology_std = climatology_std[month  - 1 : month - 1 + T]
+
         if lead_time is not None:
             climatology = climatology[:,lead_time-1,...]
+            if self.standardize is not None:
+                climatology_std = climatology_std[:,lead_time-1,...]
             
-        if self.global_weights is not None:
-            climatology = np.broadcast_to(climatology[...,None,None], data.shape)
+        if self.standardize is not None:
+            data = data * climatology_std
 
-        try:
-                data_raw = data + climatology
-        except : ## PG: if ensemble exists in the dimentions we need to move it to axis = 0 to be able to add the self.mean.
-                data_raw = data.reshape(data.shape[2],*climatology.shape)
-                data_raw = data_raw + climatology
-        return data_raw.reshape(shape) ## Move ensemble back to its original position
+        data_raw = data + climatology
+        if self.ensemble_dim is not None:
+            data_raw = data_raw.tranpose(transpose_back) 
+
+        return data_raw ## Move ensemble back to its original position
 
 
 class AnomaliesScaler_v2_seasonal:
-    def __init__(self, dim='time', global_weights = None) -> None:
+    def __init__(self, dim=['time'], standardize = None, VAE = False) -> None:
         self.mean = None
         self.dim=dim
-        self.global_weights = global_weights
+        self.standardize = standardize
+        self.VAE = VAE
     
     def fit(self, data, mask=None):
         self.data = data
         if 'ensembles' in data.dims: ## PG: if ensemble exists in the dimentions. Note that we always pass a map like data to this function. Even if it is flattened, we first write back to maps.
-            self.large_ensemble = True
-            axis = [self.dim, 'ensembles'] ## PG: Tell the object to average over both years and ensembles for calculating anomalies.
+            self.ensemble_dim = data.dims.index("ensembles")
+            axis = [*self.dim, 'ensembles'] ## PG: Tell the object to average over both years and ensembles for calculating anomalies.
         else:
+            self.ensemble_dim = None
             axis = self.dim
      
         if mask is not None:
@@ -404,43 +455,67 @@ class AnomaliesScaler_v2_seasonal:
 
         self.mean = xr.concat([self.data.isel(time = np.arange(0,len(self.data.time),12) + init_month).mean(axis) for init_month in range(12) ], dim = 'init_month').assign_coords(init_month = np.arange(1,13)).transpose('init_month', ...).isel(lead_time = 0)
         self.mean = xr.concat([self.mean for _ in range(len(self.data.lead_time))], dim = 'lead_time').transpose('init_month','lead_time',...)
-        if self.global_weights is not None:
-            self.mean = (self.mean * self.global_weights).sum(['lat','lon']) /  (self.global_weights).sum(['lat','lon'])
+        if any(['lat' in self.dim, 'lon' in self.dim]):
+                self.mean = self.mean.expand_dims({'lat' : len(self.data.lat),'lon': len(self.data.lon)}).transpose(..., 'lat', 'lon')
+       
+        if self.standardize:
+            self.std = xr.concat([self.data.isel(time = np.arange(0,len(self.data.time),12) + init_month).std(axis) for init_month in range(12) ], dim = 'init_month').assign_coords(init_month = np.arange(1,13)).transpose('init_month', ...).isel(lead_time = 0)
+            self.std = xr.concat([self.std for _ in range(len(self.data.lead_time))], dim = 'lead_time').transpose('init_month','lead_time',...)
+            if any(['lat' in self.dim, 'lon' in self.dim]):
+                    self.std = self.std.expand_dims({'lat' : len(self.data.lat),'lon': len(self.data.lon)}).transpose(..., 'lat', 'lon')
+       
         del self.data
         return self
 
     def transform(self, data):
 
-        shape = data.dims
+        dims = data.dims
         data_anomalies = data.copy()
         if 'ensembles' in data.dims: ## PG: if ensemble exists in the dimentions.
             data_anomalies = data_anomalies.transpose('ensembles', ...) ## PG: move ensemble dim to axis = 0 so that we can substract the mean that averaged over both years and ensembles
  
-        climatology = np.concatenate([self.mean[:len(data_anomalies.time[ind:ind+12])].data for ind in range(0,len(data_anomalies.time),12)], axis = 0)
-        if self.global_weights is not None:
-            climatology = np.broadcast_to(climatology[...,None,None], data_anomalies.shape)
-
+        climatology = np.concatenate([self.mean[:len(data_anomalies.time[ind:ind+12])].data for ind in range(0,len(data.time),12)], axis = 0)
         data_anomalies = data_anomalies - climatology
+
+        if self.standardize:
+            climatology_std = np.concatenate([self.std[:len(data_anomalies.time[ind:ind+12])].data for ind in range(0,len(data.time),12)], axis = 0)
+            data_anomalies = data_anomalies/climatology_std
+            data_anomalies = data_anomalies.where(~np.isinf(data_anomalies)).fillna(0)
         
-        return data_anomalies.transpose(*shape) ## PG: Move ensemble back to the original axis.
+        return data_anomalies.transpose(*dims) ## PG: Move ensemble back to the original axis.
     
     def inverse_transform(self, data, month, lead_time):
+        if self.VAE:
+            if self.ensemble_dim is not None:
+                self.ensemble_dim = self.ensemble_dim + 1
+
+        if self.ensemble_dim is not None:
+            transpose = (self.ensemble_dim, *np.delete(np.arange(len(data.shape)), self.ensemble_dim))
+            transpose_back = np.argsort(transpose)
+            data = data.tranpose(transpose)  
         
-        shape = data.shape
-        climatology = self.mean[month  - 1 : month - 1 + data.shape[0]].data
+        T = data.shape[0]
 
-        if data.shape[1] == 1:
-            climatology = climatology[:,0,...]
+        climatology = np.concatenate([self.mean.data for ind in range(0,T,12)], axis = 0)
+        climatology = climatology[month  - 1 : month - 1 + T]
+        
+        if self.standardize is not None:
+            climatology_std = np.concatenate([self.std.data for ind in range(0,T,12)], axis = 0)
+            climatology_std = climatology_std[month  - 1 : month - 1 + T]
 
-        if self.global_weights is not None:
-            climatology = np.broadcast_to(climatology[...,None,None], data.shape)
+        if lead_time is not None:
+            climatology = climatology[:,lead_time-1,...]
+            if self.standardize is not None:
+                climatology_std = climatology_std[:,lead_time-1,...]
 
-        try:
-                data_raw = data + climatology
-        except : ## PG: if ensemble exists in the dimentions we need to move it to axis = 0 to be able to add the self.mean.
-                data_raw = data.reshape(data.shape[2],*climatology.shape)
-                data_raw = data_raw + climatology
-        return data_raw.reshape(shape) ## Move ensemble back to its original position
+        if self.standardize is not None:
+            data = data * climatology_std
+
+        data_raw = data + climatology
+        if self.ensemble_dim is not None:
+            data_raw = data_raw.tranpose(transpose_back) 
+
+        return data_raw ## Move ensemble back to its original position
     
 
 
@@ -619,7 +694,7 @@ class Standardizer:
         if self.axis is not None:
             if type(data) == np.ndarray:
                 self.transpose = (*self.axis, *np.delete(np.arange(len(data.shape)), self.axis))
-                self.transpose_back = self.transpose
+                self.transpose_back =  tuple(np.argsort(self.transpose))
             else:
                 self.transpose = tuple([data.dims[i] for i in (*self.axis, *np.delete(np.arange(len(data.shape)), self.axis))])
                 self.transpose_back = data.dims
@@ -634,7 +709,7 @@ class Standardizer:
         data_transposed = data.transpose(*self.transpose)
         data_standardized = (data_transposed - self.mean) / self.std
 
-        if self.axis is None:
+        if self.axis is not None:
             if type(data) == np.ndarray:
                 data_standardized[np.isinf(data_standardized)] = 0
             else:
@@ -646,19 +721,22 @@ class Standardizer:
 
     def inverse_transform(self, data):
         if self.VAE:
-            data_ = data[0]
+            data_shape = data.shape[1:]
         else:
-            data_ = data
+            data_shape = data.shape
         if self.axis is None:
-            transpose_ =  np.arange(len(data_.shape))
+            transpose_ =  np.arange(len(data_shape))
+            transpose_back_ = transpose_
         else:
-            transpose_ =  (*self.axis, *np.delete(np.arange(len(data_.shape)), self.axis))
+            transpose_ =  (*self.axis, *np.delete(np.arange(len(data_shape)), self.axis))
+            transpose_back_ = tuple(np.argsort(transpose_))
         if self.VAE:
             transpose_ = (0, *transpose_)
+            transpose_back = (0, *transpose_back_)
         data_transposed = data.transpose(*transpose_)
         data_raw = data_transposed * self.std + self.mean
 
-        return data_raw.transpose(*transpose_)
+        return data_raw.transpose(*transpose_back)
 
 
 class Normalizer:
@@ -913,3 +991,23 @@ def extract_params(model_dir):
                 else:
                     params[key] = value
     return params
+
+
+def  load_model_data(LOC_FORECASTS_SI, obs_ref = 'NASA', crs = 'NPSproj', ensemble_list = None, ensemble_mode = 'Mean', var = 'SICN'):
+        if ensemble_list is None:
+            if ensemble_mode.lower() == 'mean':
+                ls = [xr.open_dataset(glob.glob(LOC_FORECASTS_SI + f'/{obs_ref}/*_initial_month_{intial_month}_*{crs}*_LE.nc')[0])[var].mean('ensembles') for intial_month in range(1,13) ]
+            elif ensemble_mode.lower() == 'std':
+                ls = [xr.open_dataset(glob.glob(LOC_FORECASTS_SI + f'/{obs_ref}/*_initial_month_{intial_month}_{obs_ref}*{crs}*_LE.nc')[0])[var].std('ensembles') for intial_month in range(1,13) ]
+            else:
+                ls = [xr.open_dataset(glob.glob(LOC_FORECASTS_SI + f'/{obs_ref}/*_initial_month_{intial_month}_{obs_ref}*{crs}*_LE.nc')[0])[var] for intial_month in range(1,13) ]
+                print(f'Warning: ensemble_mode is {ensemble_mode}. Training for large ensemble ...')
+        else:
+            if ensemble_mode.lower() == 'mean':
+                ls = [xr.open_dataset(glob.glob(LOC_FORECASTS_SI + f'/{obs_ref}/*_initial_month_{intial_month}_{obs_ref}*{crs}*_LE.nc')[0])[var].sel(ensembles = ensemble_list).mean('ensembles') for intial_month in range(1,13) ]
+            elif ensemble_mode.lower() == 'std':
+                ls = [xr.open_dataset(glob.glob(LOC_FORECASTS_SI + f'/{obs_ref}/*_initial_month_{intial_month}_{obs_ref}*{crs}*_LE.nc')[0])[var].sel(ensembles = ensemble_list).std('ensembles') for intial_month in range(1,13) ]
+            else:
+                ls = [xr.open_dataset(glob.glob(LOC_FORECASTS_SI + f'/{obs_ref}/*_initial_month_{intial_month}_{obs_ref}*{crs}*_LE.nc')[0])[var].sel(ensembles = ensemble_list) for intial_month in range(1,13) ]
+                print(f'Warning: ensemble_mode is {ensemble_mode}. Training for large ensemble ...')
+        return xr.concat(ls, dim = 'time').sortby('time')

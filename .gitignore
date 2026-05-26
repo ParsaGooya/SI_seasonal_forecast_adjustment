@@ -170,26 +170,29 @@ data_prep.ipynb
 Jobs/
 
 models/cvae_0127.py
-run_training_CVAE_0127.py
+models/cvae_0226.py
+models/cvae_0417.py
+models/cvae_0707.py
+models/cvae_0717.py
+models/cvae_0911.py
+models/cvae_0911_DetRes.py
+models/cvae_1001.py
 
 
 BashHelloJob.err
 BashHelloJob.out
-mjob.sh
-mjob2.sh
-output.txt
-output2.txt
-qstat.txt
+*.sh
+*.txt
 
-run_training_CVAE_0226_offlineres_2.py
-run_training_CVAE_0226_offlineres.py
+
 assim_data_prep.py
 
-models/cvae_0417.py
-run_training_CVAE_0417.py
-run_training_CVAE_0417_parallel.py
-run_training_CVAE_0717_assimilation.py
-run_training_CVAE_0717_parallel_assimilation.py
+run_training_CVAE_0127.py
+run_training_CVAE_0226*.py
+run_training_CVAE_0417*.py
+run_training_CVAE_0717*.py
+run_training_CVAE.py
+run_training_AE.py
 
-test_Reinel.ipynb
-test_parallel.ipynb
+
+

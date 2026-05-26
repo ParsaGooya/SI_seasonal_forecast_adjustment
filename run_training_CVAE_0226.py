@@ -13,7 +13,7 @@ from torch.optim import lr_scheduler
 from models.cvae_0226 import cVAE
 from losses import WeightedMSE, BCElossKLD #, WeightedMSEKLD, WeightedMSELowRessKLD
 from losses_new import VAElossLowRess, VAEloss
-from preprocessing import align_data_and_targets, create_mask, pole_centric, reverse_pole_centric, segment, reverse_segment, pad_xarray, smoother
+from preprocessing import align_data_and_targets, create_mask, pole_centric, reverse_pole_centric, segment, reverse_segment, pad_xarray, smoother, load_model_data
 from preprocessing import AnomaliesScaler_v1_seasonal, AnomaliesScaler_v2_seasonal, Standardizer, Normalizer, PreprocessingPipeline, calculate_climatology, bias_adj, zeros_mask_gen
 from torch_datasets import XArrayDataset
 import torch.nn as nn
@@ -100,27 +100,19 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
 
         params['forecast_preprocessing_steps'] = []
         params['observations_preprocessing_steps'] = []
-        ds_in = xr.open_dataset('/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/NASA/Bias_Adjusted/bias_adjusted_North_1983-2020_1x1.nc')['SICN'].clip(0,1)
+        ds_in = xr.open_dataset('/space/hall7/sitestore/eccc/crd/cccma/users/rpg002/output/SI/Full/results/NASA/Bias_Adjusted/bias_adjusted_North_1983-2020_1x1.nc')['SICN'].clip(0,1)
         if ensemble_list is not None:
             raise RuntimeError('With version 3 you are reading the bias adjusted ensemble mean as input. Set ensemble_list to None to proceed.')
 
     else:
+        print("Load forecasts")
+        ds_in = load_model_data(LOC_FORECASTS_SI, obs_ref, crs, ensemble_list, ensemble_mode)
+        if ensemble_mode.lower() == 'mean': 
+            if 'ensemble_error' in params['time_features']:
+                ds_in_std = load_model_data(LOC_FORECASTS_SI, obs_ref, crs, ensemble_list, ensemble_mode = 'std')
+        else:
+            ds_in = ds_in.transpose('time','lead_time','ensembles',...)
 
-        if ensemble_list is not None: ## PG: calculate the mean if ensemble mean is none
-            print("Load forecasts")
-            ls = [xr.open_dataset(glob.glob(LOC_FORECASTS_SI + f'/*_initial_month_{intial_month}_*{crs}*.nc')[0])['SICN'] for intial_month in range(1,13) ]
-            ds_in = xr.concat(ls, dim = 'time').sortby('time').sel(ensembles = ensemble_list)
-            if ensemble_mode == 'Mean': 
-                ds_in = ds_in.mean('ensembles') 
-            else:
-                ds_in = ds_in.transpose('time','lead_time','ensembles',...)
-                print(f'Warning: ensemble_mode is {ensemble_mode}. Training for large ensemble ...')
-
-        else:    ## Load specified members
-            print("Load forecasts") 
-            ls = [xr.open_dataset(glob.glob(LOC_FORECASTS_SI + f'/*_initial_month_{intial_month}_*{crs}*.nc')[0])['SICN'].mean('ensembles').load() for intial_month in range(1,13) ]
-            ds_in = xr.concat(ls, dim = 'time').sortby('time')
-        del ls
     gc.collect()
     ###### handle nan and inf over land ############
      ### land is masked in model data with a large number
@@ -357,7 +349,7 @@ def run_training(params, n_years, lead_months, lead_time = None, NPSProj = False
                 if params['combined_prediction']:
                     obs = xr.concat([obs, obs_raw.isel(channels = slice(1,2))], dim  = 'channels')  
 
-                step_arguments = {'anomalies' : [lead_time, month]} if 'anomalies' in obs_pipeline.steps else None
+                step_arguments = {'anomalies' : dict(month = month, lead_time = lead_time)} if 'anomalies' in obs_pipeline.steps else None
                 del ds_baseline, obs_baseline, preprocessing_mask_obs, preprocessing_mask_fct
                 gc.collect()
 
@@ -864,7 +856,7 @@ if __name__ == "__main__":
 
     params = {
         "model": cVAE,
-        "path_to_deterministic" : None, #'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/NASA/UNet2/run_set_3_convnext/N5_M12_F12_v1.1_1x1_North_lr0.001_batch100_e50_LNone_bilinear_low_ress_loss16', 
+        "path_to_deterministic" : None, #'/space/hall7/sitestore/eccc/crd/cccma/users/rpg002/output/SI/Full/results/NASA/UNet2/run_set_3_convnext/N5_M12_F12_v1.1_1x1_North_lr0.001_batch100_e50_LNone_bilinear_low_ress_loss16', 
         "freeze_deterministic" : True,
         "learned_decoder_variance" : True, 
         "time_features": ['month_sin','month_cos', 'imonth_sin', 'imonth_cos','land_mask'],
@@ -910,7 +902,9 @@ if __name__ == "__main__":
     obs_ref = 'NASA'
     NPSProj = False
     
-    out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_1_convnext'
+    out_dir_x  = f'/space/hall7/sitestore/eccc/crd/cccma/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_1_convnext'
+    Path(out_dir_x + '/failed_cases').mkdir(parents=True, exist_ok=True)
+    
     if type(params['beta']) == dict:
         beta_arg = 'Banealing'
     else:

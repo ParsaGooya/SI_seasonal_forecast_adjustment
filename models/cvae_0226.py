@@ -48,7 +48,7 @@ class cVAE(nn.Module):
             self.prior = prior_recognition_NPS(n_channels_x + num_obs_channels, sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder, scale_factor_channels = scale_factor_channels)
             self.generation = generation_NPS(sigmoid = sigmoid, VAE_latent_size = VAE_latent_size, VAE_MLP_encoder = VAE_MLP_encoder, scale_factor_channels = scale_factor_channels, skip_VAE_added_dim = skip_VAE_added_dim)	
 		
-        if saved_deterministic_model:
+        if saved_deterministic_model is not None:
             self.last_conv = saved_deterministic_model.last_conv
             if freeze_deterministic:
                 for param in self.last_conv.parameters():

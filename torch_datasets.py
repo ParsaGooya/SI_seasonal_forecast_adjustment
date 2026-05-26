@@ -65,7 +65,7 @@ class XArrayDataset(Dataset):
             msin = np.sin(2 * np.pi * target_month/12.0)
             mcos = np.cos(2 * np.pi * target_month/12.0)
             self.time_features = np.stack([lt, msin, mcos, isin, icos], axis=1)
-            self.time_features = self.time_features[:, [feature_indices[k] for k in time_features if k not in ['active_mask', 'full_ice_mask', 'land_mask']],...]
+            self.time_features = self.time_features[:, [feature_indices[k] for k in time_features if k not in ['active_mask', 'full_ice_mask', 'land_mask', 'ensemble_error']],...]
             if self.time_features.shape[1] == 0:
                 self.use_time_features = False
                 self.time_features = None
@@ -292,7 +292,7 @@ class ConvLSTMDataset(Dataset):
             isin = np.sin(2 * np.pi * init_month/12.0)
             icos = np.cos(2 * np.pi * init_month/12.0)
             self.time_features = np.stack([y,msin, mcos, isin, icos], axis=1)
-            self.time_features = self.time_features[:, [feature_indices[k] for k in time_features if k not in ['active_mask', 'full_ice_mask', 'land_mask']],...]
+            self.time_features = self.time_features[:, [feature_indices[k] for k in time_features if k not in ['active_mask', 'full_ice_mask', 'land_mask', 'ensemble_error']],...]
         else:
             self.use_time_features = False
 

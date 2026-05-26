@@ -88,7 +88,7 @@ def run_training(params, n_years, lead_time, n_runs=1, results_dir=None, numpy_s
 
         params['forecast_preprocessing_steps'] = []
         params['observations_preprocessing_steps'] = []
-        ds_in = xr.open_dataset('/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/NASA/Bias_Adjusted/bias_adjusted_North_1983-2020.nc')['SICN']
+        ds_in = xr.open_dataset('/space/hall7/sitestore/eccc/crd/cccma/users/rpg002/output/SI/Full/results/NASA/Bias_Adjusted/bias_adjusted_North_1983-2020.nc')['SICN']
         if ensemble_list is not None:
             raise RuntimeError('With version 2 you are reading the bias adjusted ensemble mean as input. Set ensemble_list to None to proceed.')
 
@@ -96,7 +96,7 @@ def run_training(params, n_years, lead_time, n_runs=1, results_dir=None, numpy_s
 
         if ensemble_list is not None: ## PG: calculate the mean if ensemble mean is none
             print("Load forecasts")
-            ls = [xr.open_dataset(glob.glob(LOC_FORECASTS_SI + f'/*_initial_month_{intial_month}_*.nc')[0])['SICN'] for intial_month in range(1,13) ]
+            ls = [xr.open_dataset(glob.glob(LOC_FORECASTS_SI + f'/*_initial_month_{intial_month}_{obs_ref}*.nc')[0])['SICN'] for intial_month in range(1,13) ]
             ds_in = xr.concat(ls, dim = 'time').sortby('time').sel(ensembles = ensemble_list)
             if ensemble_mode == 'Mean': 
                 ds_in = ds_in.mean('ensembles') 
@@ -106,7 +106,7 @@ def run_training(params, n_years, lead_time, n_runs=1, results_dir=None, numpy_s
 
         else:    ## Load specified members
             print("Load forecasts") 
-            ls = [xr.open_dataset(glob.glob(LOC_FORECASTS_SI + f'/*_initial_month_{intial_month}_*.nc')[0])['SICN'] for intial_month in range(1,13) ]
+            ls = [xr.open_dataset(glob.glob(LOC_FORECASTS_SI + f'/*_initial_month_{intial_month}_{obs_ref}*.nc')[0])['SICN'] for intial_month in range(1,13) ]
             ds_in = xr.concat(ls, dim = 'time').mean('ensembles').sortby('time')
    
     ###### handle nan and inf over land ############
@@ -322,7 +322,7 @@ def run_training(params, n_years, lead_time, n_runs=1, results_dir=None, numpy_s
                 # if 'standardize' in ds_pipeline.steps:
                 #     obs_pipeline.add_fitted_preprocessor(ds_pipeline.get_preprocessors('standardize'), 'standardize')
                 obs = obs_pipeline.transform(obs_raw)
-                step_arguments = {'anomalies' : [lead_time, month]} if 'anomalies' in obs_pipeline.steps else None
+                step_arguments = {'anomalies' : dict(month = month, lead_time = lead_time)} if 'anomalies' in obs_pipeline.steps else None
 
                 if params['version']  in [3, 'PatternsOnly']:
                     sigmoid_activation = False
@@ -671,7 +671,8 @@ if __name__ == "__main__":
     obs_ref = 'NASA'
 
     
-    out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_1'
+    out_dir_x  = f'/space/hall7/sitestore/eccc/crd/cccma/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_1'
+    Path(out_dir_x + '/failed_cases').mkdir(parents=True, exist_ok=True)
     out_dir    = f'{out_dir_x}/N{n_years}_LT{lead_time}_F{params["forecast_range_months"]}_v{params["version"]}'
 
     if params['lr_scheduler']:
@@ -706,7 +707,7 @@ if __name__ == "__main__":
         print('Training done.')
     except Exception as e:
         import shutil
-        shutil.rmtree(out_dir)
+        shutil.move(out_dir, out_dir_x + '/failed_cases')
         print("Terminated due to the follwoing error:\n", e)
         raise  # 
 

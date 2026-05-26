@@ -944,7 +944,7 @@ def run_training(params, n_years, n_validation_years = 0, lead_months = 12, lead
 
 if __name__ == "__main__":
 
-    test_years = [2021]
+    test_years = [2019]
     n_years =  2 # last n years to test consecutively
     lead_months = 12
     lead_time = None ## None for training using all available lead_times as indicated ny lead_months
@@ -962,7 +962,7 @@ if __name__ == "__main__":
         "batch_size": 25,
         "grad_accumulation_steps" : 1,  # default 1
         "optimizer": torch.optim.Adam,
-        "lr": 0.001 ,
+        "lr": 0.0001 ,
         "loss_function" :'MSE',
         "subset_dims": 'North',   ## North or South or Global
         'active_grid' : False,
@@ -989,13 +989,13 @@ if __name__ == "__main__":
         params['min_lr'] = 0.0
 
 
-    params['version'] =  2  ### 1 , 2 ,3, 'IceExtent'
+    params['version'] =  1.1  ### 1 , 2 ,3, 'IceExtent'
     params['forecast_range_months'] = 12
 
-    obs_ref = 'NASA'
+    obs_ref = 'NOAA'
     NPSProj = True
     
-    out_dir_x  = f'/space/hall7/sitestore/eccc/crd/cccma/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_final_convnext'
+    out_dir_x  = f'/space/hall7/sitestore/eccc/crd/cccma/users/rpg002/output/SI/Full/results/{obs_ref}/{params["model"].__name__}/run_set_final_convnext_interp'
     Path(out_dir_x + '/failed_cases').mkdir(parents=True, exist_ok=True)
     
 
